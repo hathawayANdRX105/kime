@@ -203,6 +203,61 @@ impl Dict {
         }
         Ok(())
     }
+
+    /// 缩写前缀查询：`initials` 是声母序列（"nh"），匹配所有以该串开头的 abbrev。
+    /// 校验：initials 仅允许 a-z；空串 → 空 vec。
+    /// 排序 freq DESC, text ASC，LIMIT 限条。
+    pub fn lookup_abbrev(&self, initials: &str, limit: usize) -> Result<Vec<Candidate>> {
+        if initials.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !initials.bytes().all(|b| b.is_ascii_lowercase()) {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("{}%", initials);
+        let mut stmt = self.conn.prepare(
+            "SELECT text, pinyin, freq FROM phrase
+             WHERE abbrev LIKE ?1
+             ORDER BY freq DESC, text ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok(Candidate {
+                text: row.get(0)?,
+                pinyin: row.get(1)?,
+                freq: row.get::<_, i64>(2)? as u64,
+                ai: false,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 用户词前 N：user=1 行按 freq DESC, text ASC（engine 个性化排序用）。
+    pub fn top_user(&self, limit: usize) -> Result<Vec<Candidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT text, pinyin, freq FROM phrase
+             WHERE user = 1
+             ORDER BY freq DESC, text ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(Candidate {
+                text: row.get(0)?,
+                pinyin: row.get(1)?,
+                freq: row.get::<_, i64>(2)? as u64,
+                ai: false,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

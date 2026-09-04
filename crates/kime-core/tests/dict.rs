@@ -199,3 +199,110 @@ fn dict_empty_reading_returns_empty() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn dict_lookup_abbrev_matches_prefix_and_orders_by_freq() {
+    let path = tmp_db_path("abbrev_prefix");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+
+    // Fixture rows: 你好 nh/5000, 世界 sj/9999, 我们 wm/4000, 测试 cs/3000, 无频列 wpl/0.
+    d.import(fixture_path()).expect("import fixture");
+
+    // "n" is a prefix of "nh" → only "你好" matches; full-pinyin rows are excluded.
+    let hits = d.lookup_abbrev("n", 10).expect("abbrev n");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].freq, 5000);
+
+    // "w" is a prefix of both "wm" (我们) and "wpl" (无频列) → 2 rows ordered freq DESC.
+    let hits_w = d.lookup_abbrev("w", 10).expect("abbrev w");
+    assert_eq!(hits_w.len(), 2);
+    assert_eq!(hits_w[0].text, "我们");
+    assert_eq!(hits_w[0].freq, 4000);
+    assert_eq!(hits_w[1].text, "无频列");
+    assert_eq!(hits_w[1].freq, 0);
+
+    // Exact match "nh" still works.
+    let hits_nh = d.lookup_abbrev("nh", 10).expect("abbrev nh");
+    assert_eq!(hits_nh.len(), 1);
+    assert_eq!(hits_nh[0].text, "你好");
+
+    // No match → empty vec.
+    let hits_none = d.lookup_abbrev("z", 10).expect("abbrev z");
+    assert!(hits_none.is_empty());
+
+    // limit caps the result.
+    let hits_lim = d.lookup_abbrev("w", 1).expect("abbrev w limit");
+    assert_eq!(hits_lim.len(), 1);
+    assert_eq!(hits_lim[0].text, "我们");
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dict_lookup_abbrev_does_not_affect_full_pinyin_lookup() {
+    let path = tmp_db_path("abbrev_iso");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+    d.import(fixture_path()).expect("import fixture");
+
+    // abbrev queries are an isolated path; full-pinyin lookup is unchanged.
+    let full = d
+        .lookup(&["ni".into(), "hao".into()], 10)
+        .expect("full lookup");
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].text, "你好");
+
+    // And abbrev("n") returns the same row, confirming cross-path consistency.
+    let abbr = d.lookup_abbrev("nh", 10).expect("abbrev nh");
+    assert_eq!(abbr.len(), 1);
+    assert_eq!(abbr[0].text, "你好");
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dict_top_user_returns_only_user_rows() {
+    let path = tmp_db_path("top_user");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+    d.import(fixture_path()).expect("import fixture");
+
+    // Before any learn() call, no user rows exist → top_user is empty.
+    let empty = d.top_user(10).expect("top_user empty");
+    assert!(empty.is_empty());
+
+    // learn() inserts user=1 rows; bumping existing rows keeps user=0.
+    d.learn(&["ta".into()], "它").expect("learn new");
+    d.learn(&["ni".into(), "hao".into()], "你好")
+        .expect("learn existing");
+    d.learn(&["ta".into()], "它").expect("learn bump");
+
+    let user_rows = d.top_user(10).expect("top_user");
+    // Only "它" was inserted as a user row; "你好" stays user=0 (import).
+    assert_eq!(user_rows.len(), 1);
+    assert_eq!(user_rows[0].text, "它");
+    assert_eq!(user_rows[0].freq, 2); // bump from learn "它" twice
+    assert!(!user_rows[0].ai);
+
+    // limit clamps to the requested count.
+    let clamped = d.top_user(0).expect("top_user limit 0");
+    assert!(clamped.is_empty());
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dict_lookup_abbrev_empty_or_non_a_z_returns_empty() {
+    let path = tmp_db_path("abbrev_empty");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+    d.import(fixture_path()).expect("import fixture");
+
+    assert!(d.lookup_abbrev("", 10).expect("abbrev empty").is_empty());
+    assert!(d.lookup_abbrev("N", 10).expect("abbrev upper").is_empty());
+    assert!(d.lookup_abbrev("n1", 10).expect("abbrev digit").is_empty());
+    assert!(d.lookup_abbrev("n h", 10).expect("abbrev space").is_empty());
+
+    let _ = fs::remove_file(&path);
+}

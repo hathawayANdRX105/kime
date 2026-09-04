@@ -96,6 +96,7 @@ name = "kime-cli"
 version = "0.1.0"
 dependencies = [
  "kime-core",
+ "kime-shuangpin",
 ]
 
 [[package]]

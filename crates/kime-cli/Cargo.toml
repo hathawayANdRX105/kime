@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 kime-core = { path = "../kime-core" }
+kime-shuangpin = { path = "../kime-shuangpin" }

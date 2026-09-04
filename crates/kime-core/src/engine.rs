@@ -49,16 +49,26 @@ pub struct Engine {
     letters: String,
     /// 最近一次查询得到的候选；commit / clear 时一并清空。
     candidates: Vec<Candidate>,
+    /// 双拼解码表（如小鹤/自然码），用于 shuangpin 模式
+    sp: Option<kime_shuangpin::Table>,
+    /// 当前候选对应的读音序列，commit 时用于学习
+    last_reading: Vec<String>,
+    /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
+    preedit: String,
 }
 
 impl Engine {
     pub fn new(dict: Dict, config: Config) -> Self {
+        let shuangpin = config.shuangpin;
         Self {
             dict,
             config,
             chinese: true,
             letters: String::new(),
             candidates: Vec::new(),
+            sp: shuangpin.map(kime_shuangpin::Table::new),
+            last_reading: Vec::new(),
+            preedit: String::new(),
         }
     }
 
@@ -67,9 +77,9 @@ impl Engine {
         self.chinese
     }
 
-    /// 当前 preedit：未上屏拼音串（如 "niha"）
+    /// 当前 preedit：未上屏拼音串（双拼=解码后拼音，全拼=letters）
     pub fn preedit(&self) -> &str {
-        &self.letters
+        &self.preedit
     }
 
     /// 当前读音的全部候选（内部 cap ~50，freq 降序）
@@ -122,15 +132,21 @@ impl Engine {
         if k.ch.is_none() && k.code == KEY_ESC {
             self.letters.clear();
             self.candidates.clear();
+            self.last_reading.clear();
+            self.preedit.clear();
             return Outcome::Consumed;
         }
 
         // Space — 无候选时放行；有候选时上屏首选并清空。
         if k.ch.is_none() && k.code == KEY_SPACE {
             if let Some(top) = self.candidates.first().cloned() {
+                let text = top.text.clone();
+                let _ = self.dict.learn(&self.last_reading, &text);
                 self.letters.clear();
                 self.candidates.clear();
-                return Outcome::Commit(top.text);
+                self.last_reading.clear();
+                self.preedit.clear();
+                return Outcome::Commit(text);
             }
             return Outcome::Ignored;
         }
@@ -148,9 +164,13 @@ impl Engine {
                 if (1..=9).contains(&d) {
                     let idx = (d - 1) as usize;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
+                        let text = cand.text.clone();
+                        let _ = self.dict.learn(&self.last_reading, &text);
                         self.letters.clear();
                         self.candidates.clear();
-                        return Outcome::Commit(cand.text);
+                        self.last_reading.clear();
+                        self.preedit.clear();
+                        return Outcome::Commit(text);
                     }
                     return Outcome::Ignored;
                 }
@@ -161,24 +181,68 @@ impl Engine {
         Outcome::Ignored
     }
 
-    /// 候选查询：把累积的 letters 切成「合法音节序列 + 半截尾部」，
-    /// 半截尾部永远来自最优切分的最后一个音节，
-    /// 让 "niha" / "nih" / "nihao" 都能落到正确的 pinyin 前缀上。
+    /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
+    /// 兜底 lookup_abbrev。维护 self.last_reading 与 self.preedit。
     fn refresh_candidates(&mut self) {
         if self.letters.is_empty() {
             self.candidates.clear();
+            self.last_reading.clear();
+            self.preedit.clear();
             return;
         }
 
+        // 双拼模式
+        if let Some(ref table) = self.sp {
+            let len = self.letters.len();
+            if len % 2 == 0 {
+                // 偶长：完整解码
+                match table.to_syllables(&self.letters) {
+                    Ok(syllables) => {
+                        self.last_reading = syllables.clone();
+                        self.preedit = syllables.join("");
+                        self.candidates = self
+                            .dict
+                            .lookup_prefix(&syllables, "", 50)
+                            .unwrap_or_default();
+                    }
+                    Err(_) => {
+                        // 解码失败（非法键对/非字母）-> 清空候选与读音
+                        self.candidates.clear();
+                        self.last_reading.clear();
+                        self.preedit = self.letters.clone();
+                    }
+                }
+            } else {
+                // 奇长：前 len-1 解码，最后一个字母作 tail 前缀
+                let prefix = &self.letters[..len - 1];
+                let tail = &self.letters[len - 1..];
+                match table.to_syllables(prefix) {
+                    Ok(syllables) => {
+                        self.last_reading = syllables.clone();
+                        self.preedit = format!("{}{}", syllables.join(""), tail);
+                        self.candidates = self
+                            .dict
+                            .lookup_prefix(&syllables, tail, 50)
+                            .unwrap_or_default();
+                    }
+                    Err(_) => {
+                        self.candidates.clear();
+                        self.last_reading.clear();
+                        self.preedit = self.letters.clone();
+                    }
+                }
+            }
+            return;
+        }
+
+        // 全拼模式（原有逻辑 + abbrev 兜底）
         let segs = segment(&self.letters);
         let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.into_iter().next()
         {
-            // 最优切分：永远把最后一个音节当半截尾部。
             let mut r = reading;
             let tail = r.pop().unwrap_or_default();
             (r, tail)
         } else {
-            // 全串都切不出合法音节：找最长合法前缀 head，tail 取剩余字母。
             let mut found: Option<(Vec<String>, String)> = None;
             for i in (1..self.letters.len()).rev() {
                 let head_segs = segment(&self.letters[..i]);
@@ -189,19 +253,29 @@ impl Engine {
             }
             match found {
                 Some((r, t)) => (r, t),
-                None => {
-                    // 哪怕一个音节都不存在（如 "x"），尝试单字符尾兜底查询。
-                    (Vec::new(), self.letters.clone())
-                }
+                None => (Vec::new(), self.letters.clone()),
             }
         };
 
-        let limit = 50;
-        // ponytail: dict 错时不暴露 IO 错误 — 静默清空候选；壳不会感知错误。
-        self.candidates = self
+        self.last_reading = reading.clone();
+        self.preedit = self.letters.clone();
+
+        // 先尝试正常前缀查询
+        let mut cands = self
             .dict
-            .lookup_prefix(&reading, &tail, limit)
+            .lookup_prefix(&reading, &tail, 50)
             .unwrap_or_default();
+
+        // 若切分失败（reading 为空）或候选为空，回退到缩写查询
+        if reading.is_empty() || cands.is_empty() {
+            if let Ok(ab) = self.dict.lookup_abbrev(&self.letters, 50) {
+                cands = ab;
+            }
+            // abbrev 兜底时 last_reading 置空 —— 缩写行 learn 用它自己的行
+            self.last_reading.clear();
+        }
+
+        self.candidates = cands;
     }
 
     /// M5: AI 候选合入当前列表。后台线程完成后由壳回调（仍在主线程执行）
@@ -213,9 +287,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kime_shuangpin::Scheme;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
     fn tmp_db(suffix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "kime_engine_{}_{}_{}.sqlite",
@@ -280,6 +354,33 @@ mod tests {
         (engine, db, yaml)
     }
 
+    fn engine_with_shuangpin_fixture() -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+        let db = tmp_db("shuangpin");
+        let yaml = fixture_yaml_path();
+        let _dict = Dict::open(&db).expect("open dict");
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES
+               ('ni''hao','你好',5000,'nh',0),
+               ('ni''hou','泥猴', 100,'nh',0),
+               ('shi''jie','世界',9999,'sj',0),
+               ('a',     '安',  8000,'a', 0),
+               ('a''a',  '啊啊',   1,'a', 0),
+               ('ni''hao','你好',5000,'h%',0),
+               ('ni''hao','你好',5000,'x',0);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let dict = Dict::open(&db).expect("reopen dict for lookups");
+        let config = Config {
+            dict_path: db.to_string_lossy().to_string(),
+            shuangpin: Some(Scheme::Xiaohe),
+            ai_endpoint: None,
+        };
+        let engine = Engine::new(dict, config);
+        (engine, db, yaml)
+    }
     fn k(ch: char) -> Key {
         Key {
             ch: Some(ch),
@@ -308,6 +409,148 @@ mod tests {
             ctrl: false,
             alt: false,
         }
+    }
+
+    #[test]
+    fn shuangpin_even_length_input() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        // 小鹤码 nihc -> ni + hao
+        for c in "nihc".chars() {
+            e.key(k(c));
+        }
+        // preedit 应为拼音 "nihao"
+        assert_eq!(e.preedit(), "nihao");
+        // last_reading 应为 ["ni", "hao"]
+        assert_eq!(e.last_reading, vec!["ni".to_string(), "hao".to_string()]);
+        // 候选应含 "你好"
+        let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
+        assert!(cs.contains(&"你好".to_string()));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn shuangpin_odd_length_input() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        // nih -> ni + "h" 尾部前缀
+        for c in "nih".chars() {
+            e.key(k(c));
+        }
+        // preedit 应为拼音 "ni" + tail "h"
+        assert_eq!(e.preedit(), "nih");
+        // last_reading 应为 ["ni"]
+        assert_eq!(e.last_reading, vec!["ni".to_string()]);
+        // tail "h" 应触发 "ha" 前缀匹配，候选应含 "你好"
+        let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
+        assert!(cs.contains(&"你好".to_string()));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn shuangpin_decode_error_clears_candidates() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        // 非法的双拼码，比如 "abc"（奇数长度 -> 错误）
+        for c in "abc".chars() {
+            e.key(k(c));
+        }
+        // 解码错误时，candidate 应清空，preedit 保持原字母
+        assert!(e.candidates().is_empty());
+        assert_eq!(e.preedit(), "abc");
+        // last_reading 应为空（引擎清空状态）
+        assert!(e.last_reading.is_empty());
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn digit_selection_triggers_learn_and_reorders_candidates() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nih".chars() {
+            e.key(k(c));
+        }
+        // 1 选词 "你好"，应触发 learn -> 候选顺��序变化
+        let outcome = e.key(k('1'));
+        match outcome {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit(你好), got {:?}", other),
+        }
+        // 再查询，确保排序已更新（用户词频率更高）
+        let mut e2 = Engine::new(Dict::open(&db).unwrap(), Config::default());
+        for c in "nih".chars() {
+            e2.key(k(c));
+        }
+        // 现在 "你好" 频率高，排在第一
+        assert_eq!(e2.candidates().first().unwrap().text, "你好");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn space_selection_triggers_learn_and_clears() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nih".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.preedit().is_empty());
+        assert!(e.candidates().is_empty());
+        // 学习后再次查询，用户词频率更高
+        let mut e2 = Engine::new(Dict::open(&db).unwrap(), Config::default());
+        for c in "nih".chars() {
+            e2.key(k(c));
+        }
+        assert_eq!(e2.candidates().first().unwrap().text, "你好");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn full_pinyin_abbrev_fallback() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        // 打 "nh" -> abbrev 匹配 "nh" 对应 "你好"/"泥猴"
+        for c in "nh".chars() {
+            e.key(k(c));
+        }
+        // abbrev 兜底时 last_reading 应清空
+        assert!(e.last_reading.is_empty());
+        // 候选应含 "你好"
+        let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
+        assert!(cs.contains(&"你好".to_string()));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn english_mode_disables_shuangpin() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        e.key(shift_k(KEY_LEFTSHIFT)); // 切换到英文模式
+                                       // 英文模式下所有按键 Ignored，所有状态清空
+        assert!(!e.chinese());
+        assert!(e.preedit().is_empty());
+        assert!(e.candidates().is_empty());
+        // 测试字母按键 Ignored
+        assert_eq!(e.key(k('a')), Outcome::Ignored);
+        // 测试数字按键 Ignored
+        assert_eq!(e.key(k('1')), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn shuangpin_preedit_shows_decoded_pinyin() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        // 打 "nihc" -> 小鹤解码 nihao
+        for c in "nihc".chars() {
+            e.key(k(c));
+        }
+        // preedit 应为解码出的拼音 "nihao"，而不是原字母 "nihc"
+        assert_eq!(e.preedit(), "nihao");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
     }
 
     #[test]

@@ -18,9 +18,9 @@
 
 ## M2 — 双拼 + 学习
 
-- [ ] 双拼码表（kime-shuangpin）：小鹤、自然码 → 转拼音走同一管线（纯查表）
-- [ ] 用户词/词频自学习：选词写回 `user_phrase`，bump freq 影响排序
-- [ ] 自定义缩写映射（个人习惯短语）
+- [x] 双拼码表（kime-shuangpin）：小鹤、自然码 → 转拼音走同一管线（纯查表）——401×2 全量 round-trip
+- [x] 用户词/词频自学习：选词写回 `phrase`(user=1)，bump freq 影响排序
+- [x] 自定义缩写映射（个人习惯短语）——`Dict::lookup_abbrev` 兜底查询；自定义词条插入待 M4（需 UX 决策）
 
 验收：单元测试覆盖码表 round-trip + 词频 bump 改变排序；kime-cli 里双拼键出拼音候选。
 
