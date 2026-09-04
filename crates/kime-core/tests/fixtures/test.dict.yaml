@@ -1,0 +1,10 @@
+---
+name: test.dict
+sort: by_weight
+version: "1"
+...
+你好	ni hao	5000
+我们	wo men	4000
+世界	shi jie	9999
+测试	ce shi	3000
+无频列	wu pin lie

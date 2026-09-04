@@ -15,6 +15,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        todo!("M1: dict_path 默认 ~/.local/share/kime/dict.sqlite3")
+        // ponytail: HOME unset on Windows/CI runners — fall back so the engine
+        // is always constructible in tests.
+        let dict_path = std::env::var("HOME")
+            .ok()
+            .map(|h| format!("{}/.local/share/kime/dict.sqlite3", h))
+            .unwrap_or_else(|| ".kime-dict.sqlite3".to_string());
+        Self {
+            dict_path,
+            shuangpin: None,
+            ai_endpoint: None,
+        }
     }
 }
