@@ -1,0 +1,9 @@
+[package]
+name = "kime-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+kime-pinyin = { path = "../kime-pinyin" }
+kime-shuangpin = { path = "../kime-shuangpin" }

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kime-pinyin",
+    "crates/kime-shuangpin",
+    "crates/kime-core",
+    "crates/kime-cli",
+    "crates/platform-wayland",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

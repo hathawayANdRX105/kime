@@ -1,0 +1,9 @@
+[package]
+name = "platform-wayland"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kime-core = { path = "../kime-core" }
+# M3 实现时加：wayland-client、wayland-protocols-misc（input_method_v2，已核实）、
+# smithay-client-toolkit（layer-shell 候选窗）、cosmic-text（CJK 渲染）

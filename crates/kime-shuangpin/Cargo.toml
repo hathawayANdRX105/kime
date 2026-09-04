@@ -1,0 +1,7 @@
+[package]
+name = "kime-shuangpin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kime-pinyin = { path = "../kime-pinyin" }
