@@ -6,21 +6,23 @@
 use std::env;
 
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, Proxy, WEnum,
+    globals::{registry_queue_init, GlobalList, GlobalListContents},
     protocol::{
         wl_keyboard::KeyState,
-        wl_registry::{WlRegistry, Event as RegistryEvent},
+        wl_registry::{Event as RegistryEvent, WlRegistry},
     },
-    globals::{registry_queue_init, GlobalListContents, GlobalList},
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_keyboard_grab_v2::{
+        Event as ZwpInputMethodKeyboardGrabEvent, ZwpInputMethodKeyboardGrabV2,
+    },
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_input_method_v2::{ZwpInputMethodV2, Event as ZwpInputMethodEvent},
-    zwp_input_method_keyboard_grab_v2::{ZwpInputMethodKeyboardGrabV2, Event as ZwpInputMethodKeyboardGrabEvent},
+    zwp_input_method_v2::{Event as ZwpInputMethodEvent, ZwpInputMethodV2},
 };
 
-use kime_core::{Engine, Key, Outcome, config::Config};
 use kime_core::dict::Dict;
+use kime_core::{config::Config, Engine, Key, Outcome};
 
 fn log(msg: &str) {
     eprintln!("[zwp-spike] {}", msg);
@@ -56,10 +58,16 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let RegistryEvent::Global { name, interface, version } = event {
+        if let RegistryEvent::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             log(&format!("Global: {} v{} ({})", name, version, interface));
             if interface == "zwp_input_method_manager_v2" && version >= 1 {
-                let mgr = _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, _qh, ()) as _;
+                let mgr =
+                    _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, _qh, ()) as _;
                 state.input_method_manager = Some(mgr);
                 log(&format!("bound input method manager name={}", name));
             }
@@ -142,7 +150,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            ZwpInputMethodKeyboardGrabEvent::Key { key, state: key_state, .. } => {
+            ZwpInputMethodKeyboardGrabEvent::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
                 if !matches!(key_state, WEnum::Value(KeyState::Pressed)) {
                     return;
                 }
@@ -220,8 +232,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     globals.contents().with_list(|list| {
         for global in list {
             if global.interface == "zwp_input_method_manager_v2" && global.version >= 1 {
-                log(&format!("Found initial global: {} v{} ({})", global.name, global.version, global.interface));
-                let mgr = globals.registry().bind::<ZwpInputMethodManagerV2, (), AppState>(global.name, 1, &qh, ()) as _;
+                log(&format!(
+                    "Found initial global: {} v{} ({})",
+                    global.name, global.version, global.interface
+                ));
+                let mgr = globals
+                    .registry()
+                    .bind::<ZwpInputMethodManagerV2, (), AppState>(global.name, 1, &qh, ())
+                    as _;
                 app.input_method_manager = Some(mgr);
                 log("bound input method manager from initial burst");
             }
