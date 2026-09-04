@@ -6,12 +6,12 @@
 
 `kime-pinyin` + `kime-core`，零平台依赖。
 
-- [ ] 拼音音节切分：~410 合法音节表，DP 切分（`xian` → xi'an / xian 两义都出）
-- [ ] 词库 loader：rime-ice `.dict.yaml`（TSV 体）→ SQLite
+- [x] 拼音音节切分：~410 合法音节表，DP 切分（`xian` → xi'an / xian 两义都出）——401 条，长优先 DFS
+- [x] 词库 loader：rime-ice `.dict.yaml`（TSV 体）→ SQLite
   - 表：`phrase(pinyin, text, freq, abbrev)`，pinyin=音节带 `'` 连接，abbrev=声母缩写（nh → n'h）
   - 双索引 + LIMIT N by freq
-- [ ] 查询：精确 + 前缀，top-N
-- [ ] kime-cli REPL：stdin 逐行输入 → 打印 top-10 候选（本期的可运行检查）
+- [x] 查询：精确 + 前缀，top-N（`Dict::lookup` / `Dict::lookup_prefix`）
+- [x] kime-cli REPL：stdin 逐行输入 → 打印 top-10 候选（本期的可运行检查）
 
 验收：`cargo test`（切分/loader/查询）+ kime-cli 出候选。
 依赖检查：rime-ice license 先核。

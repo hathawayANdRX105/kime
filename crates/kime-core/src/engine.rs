@@ -171,7 +171,8 @@ impl Engine {
         }
 
         let segs = segment(&self.letters);
-        let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.into_iter().next() {
+        let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.into_iter().next()
+        {
             // 最优切分：永远把最后一个音节当半截尾部。
             let mut r = reading;
             let tail = r.pop().unwrap_or_default();
@@ -220,7 +221,10 @@ mod tests {
             "kime_engine_{}_{}_{}.sqlite",
             suffix,
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = fs::remove_file(&path);
         path
@@ -244,7 +248,10 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "kime_engine_yaml_{}_{}.yaml",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::write(&p, fixture_yaml()).unwrap();
         p
@@ -271,7 +278,7 @@ mod tests {
         let dict = Dict::open(&db).expect("reopen dict for lookups");
         let engine = Engine::new(dict, Config::default());
         (engine, db, yaml)
-     }
+    }
 
     fn k(ch: char) -> Key {
         Key {
@@ -480,8 +487,16 @@ mod tests {
             e.key(k(c));
         }
         let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
-        assert!(cs.contains(&"安".to_string()), "a should match 安, got {:?}", cs);
-        assert!(cs.contains(&"啊啊".to_string()), "a should match 啊啊, got {:?}", cs);
+        assert!(
+            cs.contains(&"安".to_string()),
+            "a should match 安, got {:?}",
+            cs
+        );
+        assert!(
+            cs.contains(&"啊啊".to_string()),
+            "a should match 啊啊, got {:?}",
+            cs
+        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

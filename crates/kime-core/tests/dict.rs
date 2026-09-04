@@ -83,7 +83,9 @@ fn dict_import_skips_yaml_header_and_tolerates_missing_freq() {
     assert_eq!(n, 2, "header skipped, 2 TSV rows inserted");
 
     // Row without a frequency column → freq defaults to 0, abbrev still built.
-    let hits = d.lookup(&["wu".into(), "pin".into(), "lie".into()], 10).unwrap();
+    let hits = d
+        .lookup(&["wu".into(), "pin".into(), "lie".into()], 10)
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].freq, 0);
 

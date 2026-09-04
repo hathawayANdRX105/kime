@@ -15,15 +15,14 @@
 //!
 //! 主路延迟（P99 < 20ms）由这里的索引形状保证。
 
-use std::path::Path;
+use rusqlite::{params, Connection, Error as SqliteError, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use rusqlite::{params, Connection, Error as SqliteError, Result};
+use std::path::Path;
 
 fn io_to_sqlite(e: std::io::Error) -> SqliteError {
     SqliteError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
-
 
 /// 候选词 — 全链路统一货币：dict 查询产出、engine 排序翻页、AI 层追加
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +55,6 @@ impl Dict {
              );
              CREATE INDEX IF NOT EXISTS idx_phrase_pinyin  ON phrase(pinyin);
              CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);",
-
         )?;
         Ok(Self { conn })
     }
@@ -66,7 +64,6 @@ impl Dict {
         let f = File::open(dict_yaml).map_err(io_to_sqlite)?;
 
         let reader = BufReader::new(f);
-
 
         // Skip YAML front-matter: everything before (and including) the first "..." line.
         let mut lines = reader.lines().map_while(Result::ok);
@@ -101,10 +98,7 @@ impl Dict {
 
             let syllables: Vec<&str> = pinyin.split_whitespace().collect();
             let joined = syllables.join("'");
-            let abbrev: String = syllables
-                .iter()
-                .filter_map(|s| s.chars().next())
-                .collect();
+            let abbrev: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
 
             let added = tx.execute(
                 "INSERT OR IGNORE INTO phrase(pinyin, text, freq, abbrev, user)
@@ -222,7 +216,10 @@ mod tests {
             "kime_dict_lp_{}_{}_{}.sqlite",
             suffix,
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = fs::remove_file(&path);
         path
@@ -232,7 +229,10 @@ mod tests {
         let yaml = std::env::temp_dir().join(format!(
             "kime_dict_lp_yaml_{}_{}.yaml",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = tmp_db("seed");
         fs::write(&yaml, dict_yaml).unwrap();
@@ -289,9 +289,7 @@ mod tests {
         assert_eq!(hits2[0].text, "你好");
 
         // tail 不匹配 → 0
-        let hits3 = d
-            .lookup_prefix(&["ni".into()], "z", 10)
-            .expect("prefix z");
+        let hits3 = d.lookup_prefix(&["ni".into()], "z", 10).expect("prefix z");
         assert!(hits3.is_empty());
 
         cleanup(&db, &yaml);
