@@ -1,12 +1,205 @@
-//! M3: input-method-v2 平台壳。
+//! M3: input-method-v2 平台壳。简单 spike：grab keyboard，按啥 commit 啥。
 //!
-//! 流程：input_method_manager_v2 activate → grab_keyboard →
-//! 按键 → `kime_core::Engine::key` →
-//! preedit_string / 候选窗（layer-shell + cosmic-text）→ commit_string 上屏。
-//! spike 顺序：先「按啥 commit 啥」在 mango 跑通，再接 Engine。
-//!
-//! XWayland 应用不支持（input-method-v2 只管原生 wayland），已知并接受。
+//! 运行：WAYLAND_DISPLAY=wayland-1 ./target/debug/platform-wayland [--seat <name>]
+//! 退出：Esc 按下
 
-fn main() {
-    todo!("M3: wayland-client + wayland-protocols-misc::input_method_v2")
+use std::env;
+
+use wayland_client::{
+    Connection, Dispatch, QueueHandle, Proxy, WEnum,
+    protocol::{
+        wl_keyboard::KeyState,
+        wl_registry::{WlRegistry, Event as RegistryEvent},
+    },
+    globals::{registry_queue_init, GlobalListContents, GlobalList},
+};
+use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+    zwp_input_method_v2::{ZwpInputMethodV2, Event as ZwpInputMethodEvent},
+    zwp_input_method_keyboard_grab_v2::{ZwpInputMethodKeyboardGrabV2, Event as ZwpInputMethodKeyboardGrabEvent},
+};
+
+fn log(msg: &str) {
+    eprintln!("[zwp-spike] {}", msg);
+}
+
+struct AppState {
+    input_method_manager: Option<ZwpInputMethodManagerV2>,
+    input_method: Option<ZwpInputMethodV2>,
+    should_exit: bool,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            input_method_manager: None,
+            input_method: None,
+            should_exit: false,
+        }
+    }
+}
+
+impl Dispatch<WlRegistry, GlobalListContents> for AppState {
+    fn event(
+        state: &mut Self,
+        _registry: &WlRegistry,
+        event: RegistryEvent,
+        _globals: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let RegistryEvent::Global { name, interface, version } = event {
+            log(&format!("Global: {} v{} ({})", name, version, interface));
+            if interface == "zwp_input_method_manager_v2" && version >= 1 {
+                // bind returns a Proxy directly (no Result), no need for ?
+                let mgr = _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, _qh, ()) as _;
+                state.input_method_manager = Some(mgr);
+                log(&format!("bound input method manager name={}", name));
+            }
+        }
+    }
+}
+
+impl Dispatch<WlRegistry, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _registry: &WlRegistry,
+        _event: <WlRegistry as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpInputMethodManagerV2, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _mgr: &ZwpInputMethodManagerV2,
+        _event: <ZwpInputMethodManagerV2 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpInputMethodV2, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        im: &ZwpInputMethodV2,
+        event: ZwpInputMethodEvent,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ZwpInputMethodEvent::Activate => {
+                log("input_method ACTIVATE");
+                state.input_method = Some(im.clone());
+                // grab_keyboard returns a proxy directly, no ? needed
+                let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(qh, ()) as _;
+                log("grab_keyboard requested");
+            }
+            ZwpInputMethodEvent::Deactivate => {
+                log("input_method DEACTIVATE");
+                state.input_method = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _grab: &ZwpInputMethodKeyboardGrabV2,
+        event: ZwpInputMethodKeyboardGrabEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ZwpInputMethodKeyboardGrabEvent::Key { key, state: key_state, .. } => {
+                // Only process key press events - key_state is WEnum<KeyState>
+                if !matches!(key_state, WEnum::Value(KeyState::Pressed)) {
+                    return;
+                }
+
+                let ch = match key {
+                    1 => '\u{1b}',      // Esc
+                    30..=54 => (b'A' + (key - 30) as u8) as char,  // A-Z
+                    11..=20 => (b'0' + (key - 11) as u8) as char,  // 0-9
+                    57 => ' ',           // Space
+                    28 => '\n',          // Enter
+                    _ => return,
+                };
+
+                if let Some(im) = &state.input_method {
+                    im.commit_string(ch.to_string());
+                    log(&format!("committed char: {}", ch));
+
+                    if ch == '\u{1b}' {
+                        state.should_exit = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    let mut target_seat = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--seat" && i + 1 < args.len() {
+            target_seat = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    if let Some(ref s) = target_seat {
+        log(&format!("目标 seat: {}", s));
+    } else {
+        log("使用默认 seat");
+    }
+
+    let conn = Connection::connect_to_env()?;
+    // Keep globals to access initial burst contents
+    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
+    let qh: QueueHandle<AppState> = event_queue.handle();
+
+    let mut app = AppState::new();
+
+    // Iterate through initial burst to find and bind input method manager.
+    // (burst is stored in GlobalListContents; user handler only sees hotplug)
+    globals.contents().with_list(|list| {
+        for global in list {
+            if global.interface == "zwp_input_method_manager_v2" && global.version >= 1 {
+                log(&format!(
+                    "Found initial global: {} v{} ({})",
+                    global.name, global.version, global.interface
+                ));
+                let mgr = globals
+                    .registry()
+                    .bind::<ZwpInputMethodManagerV2, (), AppState>(global.name, 1, &qh, ())
+                    as _;
+                app.input_method_manager = Some(mgr);
+                log("bound input method manager from initial burst");
+            }
+        }
+    });
+
+    log("开始事件循环...");
+
+    while !app.should_exit {
+        event_queue.blocking_dispatch(&mut app)?;
+    }
+
+    log("正常退出");
+    Ok(())
 }
