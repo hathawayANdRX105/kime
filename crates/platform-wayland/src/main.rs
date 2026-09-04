@@ -19,6 +19,9 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_keyboard_grab_v2::{ZwpInputMethodKeyboardGrabV2, Event as ZwpInputMethodKeyboardGrabEvent},
 };
 
+use kime_core::{Engine, Key, Outcome, config::Config};
+use kime_core::dict::Dict;
+
 fn log(msg: &str) {
     eprintln!("[zwp-spike] {}", msg);
 }
@@ -26,7 +29,10 @@ fn log(msg: &str) {
 struct AppState {
     input_method_manager: Option<ZwpInputMethodManagerV2>,
     input_method: Option<ZwpInputMethodV2>,
+    engine: Option<Engine>,
     should_exit: bool,
+    /// 协议要求：commit(serial) 的 serial = 已收到的 done 事件数
+    im_serial: u32,
 }
 
 impl AppState {
@@ -34,7 +40,9 @@ impl AppState {
         Self {
             input_method_manager: None,
             input_method: None,
+            engine: None,
             should_exit: false,
+            im_serial: 0,
         }
     }
 }
@@ -51,7 +59,6 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         if let RegistryEvent::Global { name, interface, version } = event {
             log(&format!("Global: {} v{} ({})", name, version, interface));
             if interface == "zwp_input_method_manager_v2" && version >= 1 {
-                // bind returns a Proxy directly (no Result), no need for ?
                 let mgr = _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, _qh, ()) as _;
                 state.input_method_manager = Some(mgr);
                 log(&format!("bound input method manager name={}", name));
@@ -97,13 +104,28 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             ZwpInputMethodEvent::Activate => {
                 log("input_method ACTIVATE");
                 state.input_method = Some(im.clone());
-                // grab_keyboard returns a proxy directly, no ? needed
+                let config = Config::default();
+                let dict_path = config.dict_path.clone();
+                if let Ok(dict) = Dict::open(&dict_path) {
+                    state.engine = Some(Engine::new(dict, config));
+                    log("engine initialized");
+                } else {
+                    log("failed to initialize dictionary");
+                }
                 let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(qh, ()) as _;
                 log("grab_keyboard requested");
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
                 state.input_method = None;
+                state.engine = None;
+            }
+            ZwpInputMethodEvent::Done { .. } => {
+                state.im_serial += 1;
+            }
+            ZwpInputMethodEvent::Unavailable => {
+                log("input_method UNAVAILABLE — exiting");
+                state.should_exit = true;
             }
             _ => {}
         }
@@ -121,26 +143,47 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
     ) {
         match event {
             ZwpInputMethodKeyboardGrabEvent::Key { key, state: key_state, .. } => {
-                // Only process key press events - key_state is WEnum<KeyState>
                 if !matches!(key_state, WEnum::Value(KeyState::Pressed)) {
                     return;
                 }
 
                 let ch = match key {
-                    1 => '\u{1b}',      // Esc
-                    30..=54 => (b'A' + (key - 30) as u8) as char,  // A-Z
-                    11..=20 => (b'0' + (key - 11) as u8) as char,  // 0-9
-                    57 => ' ',           // Space
-                    28 => '\n',          // Enter
+                    1 => '\u{1b}',
+                    30..=54 => (b'A' + (key - 30) as u8) as char,
+                    11..=20 => (b'0' + (key - 11) as u8) as char,
+                    57 => ' ',
+                    28 => '\n',
                     _ => return,
                 };
 
-                if let Some(im) = &state.input_method {
-                    im.commit_string(ch.to_string());
-                    log(&format!("committed char: {}", ch));
-
-                    if ch == '\u{1b}' {
-                        state.should_exit = true;
+                if let Some(engine) = &mut state.engine {
+                    let key_struct = Key {
+                        ch: Some(ch),
+                        code: key,
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                    };
+                    match engine.key(key_struct) {
+                        Outcome::Consumed => {
+                            let pe = engine.preedit().to_string();
+                            log(&format!("engine consumed: preedit={}", pe));
+                            if let Some(im) = &state.input_method {
+                                let cursor = pe.len() as i32;
+                                im.set_preedit_string(pe, 0, cursor);
+                                im.commit(state.im_serial);
+                            }
+                        }
+                        Outcome::Commit(text) => {
+                            log(&format!("engine commit: {}", text));
+                            if let Some(im) = &state.input_method {
+                                im.commit_string(text);
+                                im.commit(state.im_serial);
+                            }
+                        }
+                        Outcome::Ignored => {
+                            log("engine ignored (passthrough)");
+                        }
                     }
                 }
             }
@@ -169,25 +212,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let conn = Connection::connect_to_env()?;
-    // Keep globals to access initial burst contents
     let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
     let qh: QueueHandle<AppState> = event_queue.handle();
 
     let mut app = AppState::new();
 
-    // Iterate through initial burst to find and bind input method manager.
-    // (burst is stored in GlobalListContents; user handler only sees hotplug)
     globals.contents().with_list(|list| {
         for global in list {
             if global.interface == "zwp_input_method_manager_v2" && global.version >= 1 {
-                log(&format!(
-                    "Found initial global: {} v{} ({})",
-                    global.name, global.version, global.interface
-                ));
-                let mgr = globals
-                    .registry()
-                    .bind::<ZwpInputMethodManagerV2, (), AppState>(global.name, 1, &qh, ())
-                    as _;
+                log(&format!("Found initial global: {} v{} ({})", global.name, global.version, global.interface));
+                let mgr = globals.registry().bind::<ZwpInputMethodManagerV2, (), AppState>(global.name, 1, &qh, ()) as _;
                 app.input_method_manager = Some(mgr);
                 log("bound input method manager from initial burst");
             }
