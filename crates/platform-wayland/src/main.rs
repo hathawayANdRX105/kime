@@ -23,6 +23,8 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
 
 use kime_core::dict::Dict;
 use kime_core::{config::Config, Engine, Key, Outcome};
+use platform_wayland::window::CandidateWindow;
+use platform_wayland::Candidate as UiCandidate;
 
 fn log(msg: &str) {
     eprintln!("[zwp-spike] {}", msg);
@@ -32,8 +34,8 @@ struct AppState {
     input_method_manager: Option<ZwpInputMethodManagerV2>,
     input_method: Option<ZwpInputMethodV2>,
     engine: Option<Engine>,
+    window: Option<CandidateWindow>,
     should_exit: bool,
-    /// 协议要求：commit(serial) 的 serial = 已收到的 done 事件数
     im_serial: u32,
 }
 
@@ -43,6 +45,7 @@ impl AppState {
             input_method_manager: None,
             input_method: None,
             engine: None,
+            window: None,
             should_exit: false,
             im_serial: 0,
         }
@@ -185,12 +188,32 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                                 im.set_preedit_string(pe, 0, cursor);
                                 im.commit(state.im_serial);
                             }
+                            if let Some(win) = &mut state.window {
+                                let ui: Vec<UiCandidate> = engine
+                                    .candidates()
+                                    .iter()
+                                    .map(|c| UiCandidate {
+                                        text: c.text.clone(),
+                                        pinyin: c.pinyin.clone(),
+                                        freq: c.freq,
+                                        ai: c.ai,
+                                    })
+                                    .collect();
+                                if ui.is_empty() {
+                                    let _ = win.hide();
+                                } else {
+                                    let _ = win.show(&ui, engine.highlight(), engine.preedit());
+                                }
+                            }
                         }
                         Outcome::Commit(text) => {
                             log(&format!("engine commit: {}", text));
                             if let Some(im) = &state.input_method {
                                 im.commit_string(text);
                                 im.commit(state.im_serial);
+                            }
+                            if let Some(win) = &mut state.window {
+                                let _ = win.hide();
                             }
                         }
                         Outcome::Ignored => {
@@ -224,6 +247,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let conn = Connection::connect_to_env()?;
+    if args.iter().any(|a| a == "--show-test") {
+        let mut win = platform_wayland::window::CandidateWindow::new()?;
+        let ui = vec![
+            UiCandidate {
+                text: "你好".into(),
+                pinyin: "ni'hao".into(),
+                freq: 99,
+                ai: false,
+            },
+            UiCandidate {
+                text: "拟好".into(),
+                pinyin: "ni'hao".into(),
+                freq: 50,
+                ai: false,
+            },
+            UiCandidate {
+                text: "泥号".into(),
+                pinyin: "ni'hao".into(),
+                freq: 10,
+                ai: false,
+            },
+        ];
+        win.show(&ui, 0, "nihao")?;
+        std::thread::sleep(std::time::Duration::from_secs(9));
+        win.hide()?;
+        return Ok(());
+    }
+
+    log("开始事件循环...");
     let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
     let qh: QueueHandle<AppState> = event_queue.handle();
 
