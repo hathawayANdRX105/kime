@@ -39,6 +39,28 @@ pub struct Dict {
     conn: Connection,
 }
 
+/// Helper to compute exclusive upper bound for prefix range query.
+/// Returns `None` when the prefix ends with `'z'` because no valid greater string
+/// exists within the allowed alphabet (`'` + `a-z`).
+fn increment_prefix(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.last()?;
+    // If last character is 'z', we cannot increment within the alphabet.
+    if *last == 'z' {
+        return None;
+    }
+    let mut new_chars = chars.clone();
+    let last_idx = new_chars.len() - 1;
+    let c = new_chars[last_idx];
+    if c == '\'' {
+        new_chars[last_idx] = 'a';
+    } else {
+        // c is between 'a' and 'y'
+        let next = ((c as u32) + 1) as u32;
+        new_chars[last_idx] = char::from_u32(next).unwrap_or(c);
+    }
+    Some(new_chars.into_iter().collect())
+}
 impl Dict {
     /// 打开；不存在则建 schema + 索引
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -160,14 +182,15 @@ impl Dict {
         if joined.is_empty() {
             return Ok(Vec::new());
         }
+        // Compute exclusive upper bound for range query
+        let upper_bound = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
         let mut stmt = self.conn.prepare(
             "SELECT text, pinyin, freq FROM phrase
-             WHERE pinyin LIKE ?1
+             WHERE pinyin >= ?1 AND pinyin < ?2
              ORDER BY freq DESC, text ASC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
-        let pattern = format!("{}%", joined);
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        let rows = stmt.query_map(params![joined, upper_bound, limit as i64], |row| {
             Ok(Candidate {
                 text: row.get(0)?,
                 pinyin: row.get(1)?,
@@ -181,8 +204,6 @@ impl Dict {
         }
         Ok(out)
     }
-
-    /// 学习：用户选定 (读音, 词) → bump 用户词频 / 插入用户词
     pub fn learn(&mut self, reading: &[String], text: &str) -> Result<()> {
         if reading.is_empty() {
             return Ok(());

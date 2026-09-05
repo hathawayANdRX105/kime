@@ -333,9 +333,9 @@ impl Engine {
             let mut seen: std::collections::HashSet<String> =
                 cands.iter().map(|c| c.text.clone()).collect();
             let push_variant = |reading: &[String],
-                                    tail: &str,
-                                    seen: &mut std::collections::HashSet<String>,
-                                    cands: &mut Vec<Candidate>| {
+                                tail: &str,
+                                seen: &mut std::collections::HashSet<String>,
+                                cands: &mut Vec<Candidate>| {
                 if let Ok(mut vc) = self.dict.lookup_prefix(reading, tail, 50) {
                     vc.retain(|c| seen.insert(c.text.clone()));
                     cands.extend(vc);

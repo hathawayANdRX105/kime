@@ -134,7 +134,10 @@ impl CandidateWindow {
     /// 创建基于 input_popup 角色的候选窗（新协议路径）
     /// 使用 ZwpInputMethodV2::get_input_popup_surface 直接绑定，无需 configure 握手
     /// 保持现有 shm buffer + render 管线
-    pub fn new_popup(conn: &Connection, im: &ZwpInputMethodV2) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new_popup(
+        conn: &Connection,
+        im: &ZwpInputMethodV2,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (globals, queue) = registry_queue_init::<WinState>(&conn)?;
         let qh = queue.handle();
         let mut state = WinState {
@@ -609,7 +612,12 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for WinState {
     ) {
         use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::Event as PopupEvent;
         match event {
-            PopupEvent::TextInputRectangle { x: _, y: _, width: _, height: _ } => {
+            PopupEvent::TextInputRectangle {
+                x: _,
+                y: _,
+                width: _,
+                height: _,
+            } => {
                 // Store rectangle for potential future use
                 // TODO: use this for positioning if needed
             }
