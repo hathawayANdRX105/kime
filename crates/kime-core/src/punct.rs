@@ -38,7 +38,9 @@ mod tests {
 
     #[test]
     fn punct_map_full_coverage() {
-        let cases: &[char] = &[',', '.', '?', '!', ':', ';', '\\', '_', '^', '(', ')', '<', '>', '[', ']', '~'];
+        let cases: &[char] = &[
+            ',', '.', '?', '!', ':', ';', '\\', '_', '^', '(', ')', '<', '>', '[', ']', '~',
+        ];
         for &c in cases {
             let mapped = map_punct(c);
             assert!(mapped.is_some(), "标点 '{}' 缺失映射", c);

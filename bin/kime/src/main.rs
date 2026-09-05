@@ -94,7 +94,6 @@ fn main() -> ExitCode {
         }
     }
 
-
     let _ = action;
     // REPL
     let dict = match dict_path {
@@ -107,8 +106,10 @@ fn main() -> ExitCode {
         },
         None => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            match Dict::open(PathBuf::from(format!("{}/.local/share/kime/dict.sqlite3", home)))
-            {
+            match Dict::open(PathBuf::from(format!(
+                "{}/.local/share/kime/dict.sqlite3",
+                home
+            ))) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("failed to open default dict: {e}\ntry: kime build-dict --in ... --out ~/.local/share/kime/dict.bin");
@@ -130,52 +131,52 @@ fn main() -> ExitCode {
     }
 
     let stdin = io::stdin();
-            let mut stdout = io::stdout();
-            for line in stdin.lock().lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                let input = line.trim().to_string();
-                if input.is_empty() {
-                    continue;
-                }
-                let mut outcome = None;
-                for c in input.bytes() {
-                    if !(c.is_ascii_lowercase()) {
-                        continue;
-                    }
-                    let key = Key {
-                        ch: Some(c as char),
-                        code: 0,
-                        shift: false,
-                        ctrl: false,
-                        alt: false,
-                    };
-                    outcome = Some(engine.key(key));
-                }
-                let outcome = match outcome {
-                    Some(o) => o,
-                    None => {
-                        let _ = writeln!(stdout, "{}: (非法输入)", input);
-                        continue;
-                    }
-                };
-                let cands = engine.candidates();
-                let preedit = engine.preedit();
-                if cands.is_empty() {
-                    let _ = writeln!(stdout, "{}: (无候选)", input);
-                } else {
-                    let list: Vec<String> = cands
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| format!("{}.{text}", i + 1, text = c.text))
-                        .collect();
-                    let _ = writeln!(stdout, "{preedit}: {}", list.join(" "));
-                }
-                if let Outcome::Commit(text) = outcome {
-                    let _ = writeln!(stdout, "=> {text}");
-                }
-            }
-            ExitCode::SUCCESS
+    let mut stdout = io::stdout();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
         }
+        let mut outcome = None;
+        for c in input.bytes() {
+            if !(c.is_ascii_lowercase()) {
+                continue;
+            }
+            let key = Key {
+                ch: Some(c as char),
+                code: 0,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            };
+            outcome = Some(engine.key(key));
+        }
+        let outcome = match outcome {
+            Some(o) => o,
+            None => {
+                let _ = writeln!(stdout, "{}: (非法输入)", input);
+                continue;
+            }
+        };
+        let cands = engine.candidates();
+        let preedit = engine.preedit();
+        if cands.is_empty() {
+            let _ = writeln!(stdout, "{}: (无候选)", input);
+        } else {
+            let list: Vec<String> = cands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}.{text}", i + 1, text = c.text))
+                .collect();
+            let _ = writeln!(stdout, "{preedit}: {}", list.join(" "));
+        }
+        if let Outcome::Commit(text) = outcome {
+            let _ = writeln!(stdout, "=> {text}");
+        }
+    }
+    ExitCode::SUCCESS
+}

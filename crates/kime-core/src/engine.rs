@@ -8,9 +8,9 @@
 //! 内部流：letters 累积 → [`kime_pinyin::segment`] → [`Dict::lookup_prefix`]
 // → 候选。不做任何 I/O；切分非法时保持旧状态（无声可打即无候选）。
 
-use crate::punct;
 use crate::config::Config;
 use crate::dict::{Candidate, Dict};
+use crate::punct;
 use kime_pinyin::segment;
 
 // evdev keycodes — wayland 原生即此值，平台壳无需翻译。
