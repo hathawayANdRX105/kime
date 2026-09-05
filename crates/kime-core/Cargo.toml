@@ -7,3 +7,9 @@ edition.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 kime-pinyin = { path = "../kime-pinyin" }
 kime-shuangpin = { path = "../kime-shuangpin" }
+fst = "0.4.7"
+memmap2 = "0.9"
+anyhow = "1.0.104"
+
+[dev-dependencies]
+tempfile = "3"

@@ -5,10 +5,14 @@
 //!
 //! 用法：
 //!   kime-cli [--dict PATH] [--import PATH] [--shuangpin xiaohe|ziranma]
+//!   kime-cli --build-dict --in <sqlite> --out <bin>
 //!
 //!   --dict PATH       覆盖 Config 默认词库路径（默认 ~/.local/share/kime/dict.sqlite3）
 //!   --import PATH     启动前一次性导入 rime-ice `.dict.yaml` 到词库
 //!   --shuangpin NAME  启用双拼方案（xiaohe | ziranma）
+//!   --build-dict      构建 FST 二进制词库
+//!   --in PATH         输入 SQLite 词库路径（配合 --build-dict）
+//!   --out PATH        输出 dict.bin 路径（配合 --build-dict）
 //!
 //! REPL：stdin 每行一个拼音串；逐字符喂 ASCII 字母 → 行尾喂一次 Space 键
 //! （`Key{ch:None, code:57}`）取 Commit。每行打印：
@@ -16,8 +20,10 @@
 //!   无候选的非空行打印 `<line>: (无候选)`；空行或 EOF 退出。
 
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
+use kime_core::builder::build;
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::{Engine, Key, Outcome};
@@ -57,13 +63,46 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--build-dict" => {
+                // Consume optional --in / --out flags (order-independent)
+                let mut in_path = String::new();
+                let mut out_path = String::new();
+                while let Some(a) = args.next() {
+                    match a.as_str() {
+                        "--in" => in_path = args.next().unwrap_or_default(),
+                        "--out" => out_path = args.next().unwrap_or_default(),
+                        _ => break,
+                    }
+                }
+                if in_path.is_empty() || out_path.is_empty() {
+                    eprintln!("--build-dict requires --in <sqlite> and --out <bin>");
+                    return ExitCode::from(2);
+                }
+                let start = std::time::Instant::now();
+                match build(Path::new(&in_path), Path::new(&out_path)) {
+                    Ok(count) => {
+                        let elapsed = start.elapsed();
+                        eprintln!(
+                            "Built dict.bin: {} entries, size {} bytes, elapsed {:?}",
+                            count,
+                            std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0),
+                            elapsed
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to build dict: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 return ExitCode::from(2);
             }
         }
     }
-
+    // Normal mode: configure dict and engine
     let mut config = Config::default();
     if let Some(p) = dict_path {
         config.dict_path = p;
@@ -104,7 +143,6 @@ fn main() -> ExitCode {
 
         if line.is_empty() {
             // Empty line: reset engine state, print a blank separator, continue.
-            // Send Esc to drop any in-flight composition.
             if !engine.preedit().is_empty() {
                 let _ = engine.key(Key {
                     ch: None,
@@ -161,6 +199,5 @@ fn main() -> ExitCode {
             let _ = writeln!(stdout, "=> {text}");
         }
     }
-
     ExitCode::SUCCESS
 }

@@ -27,11 +27,13 @@
 //! platform-wayland = M3；merge_ai/predict = M5。详见 ROADMAP.md。
 #![allow(dead_code)] // ponytail: 契约骨架期 todo!() 占位，实现时逐个移除
 
+pub mod builder;
 pub mod config;
 pub mod dict;
 pub mod engine;
 pub mod predict;
-
+pub mod store;
 pub use dict::Candidate;
 pub use engine::{Engine, Key, Outcome};
 pub use kime_shuangpin::Scheme;
+pub use store::FstStore;
