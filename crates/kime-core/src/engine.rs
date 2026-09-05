@@ -8,6 +8,7 @@
 //! 内部流：letters 累积 → [`kime_pinyin::segment`] → [`Dict::lookup_prefix`]
 // → 候选。不做任何 I/O；切分非法时保持旧状态（无声可打即无候选）。
 
+use crate::punct;
 use crate::config::Config;
 use crate::dict::{Candidate, Dict};
 use kime_pinyin::segment;
@@ -194,7 +195,38 @@ impl Engine {
             }
             return Outcome::Ignored;
         }
-
+        // 标点处理：仅中文模式且有映射时生效
+        if let Some(c) = k.ch {
+            if let Some(mapped) = punct::map_punct(c) {
+                if self.letters.is_empty() {
+                    // 情况 A：无预编辑串，直接上屏标点
+                    return Outcome::Commit(mapped.to_string());
+                } else {
+                    // 有预编辑串，检查是否存在候选词
+                    if let Some(top) = self.candidates.first().cloned() {
+                        // 情况 B：顶字上屏，拼接标点
+                        let text = top.text.clone();
+                        let commit_text = format!("{}{}", text, mapped);
+                        let _ = self.dict.learn(&self.last_reading, &text);
+                        self.letters.clear();
+                        self.candidates.clear();
+                        self.last_reading.clear();
+                        self.preedit.clear();
+                        self.page_index = 0;
+                        return Outcome::Commit(commit_text);
+                    } else {
+                        // 情况 C：无候选词，直接上屏并清空
+                        let commit_text = format!("{}{}", self.letters, mapped);
+                        self.letters.clear();
+                        self.candidates.clear();
+                        self.last_reading.clear();
+                        self.preedit.clear();
+                        self.page_index = 0;
+                        return Outcome::Commit(commit_text);
+                    }
+                }
+            }
+        }
         if let Some(c) = k.ch {
             // 字母（含 shift 的大写 → 归一化小写）→ 累积。
             if c.is_ascii_alphabetic() {
