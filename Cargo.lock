@@ -257,7 +257,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kime-cli"
+name = "kime"
 version = "0.1.0"
 dependencies = [
  "kime-core",
@@ -280,6 +280,13 @@ dependencies = [
 [[package]]
 name = "kime-pinyin"
 version = "0.1.0"
+
+[[package]]
+name = "kime-root"
+version = "0.1.0"
+dependencies = [
+ "kime-core",
+]
 
 [[package]]
 name = "kime-shuangpin"

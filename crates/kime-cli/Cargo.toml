@@ -1,8 +1,0 @@
-[package]
-name = "kime-cli"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-kime-core = { path = "../kime-core" }
-kime-shuangpin = { path = "../kime-shuangpin" }

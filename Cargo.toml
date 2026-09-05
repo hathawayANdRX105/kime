@@ -4,10 +4,23 @@ members = [
     "crates/kime-pinyin",
     "crates/kime-shuangpin",
     "crates/kime-core",
-    "crates/kime-cli",
+    "bin/kime",
     "crates/platform-wayland",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[[bench]]
+name = "kime_bench"
+path = "benches/kime_bench.rs"
+harness = false
+
+[package]
+name = "kime-root"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kime-core = { path = "crates/kime-core" }

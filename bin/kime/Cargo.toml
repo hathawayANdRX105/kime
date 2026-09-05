@@ -1,0 +1,12 @@
+[package]
+name = "kime"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kime"
+path = "src/main.rs"
+
+[dependencies]
+kime-core = { path = "../../crates/kime-core" }
+kime-shuangpin = { path = "../../crates/kime-shuangpin" }

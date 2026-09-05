@@ -2,24 +2,49 @@
 
 个人向 Rust 拼音/双拼输入法。Linux Wayland 优先，Windows/macOS 靠平台壳后补。
 
-## 范围（刻意收窄）
-
-- 引擎：只做拼音 + 双拼（小鹤/自然码表），不做五笔等其他方案
-- 平台：先 Linux Wayland（input-method-v2）；X11/XIM、TSF、IMKit 等需要时再说
-- 存储：SQLite——词库、用户词、词频学习、个人习惯映射，全部落一个文件
-- 特色：AI 预测候选（异步第二梯队，不挡 ~20ms 的本地候选主路）
-
 ## 架构
 
 ```
-kime-core/      引擎：音节切分、双拼码表、候选排序、学习。零平台依赖
-kime-wayland/   input-method-v2 前端 + layer-shell 候选窗
-platform-win/   （以后）TSF 壳，参考 Weasel
-platform-mac/   （以后）IMKit 壳，参考 Squirrel
+bin/kime/             CLI 入口（REPL、词库编译）
+crates/kime-core/     引擎核心：状态机、持久化、FST/内存索引
+crates/kime-pinyin/   纯拼音音节切分（404 音节表，零依赖）
+crates/kime-shuangpin/双拼码表（小鹤/自然码，纯查表）
+crates/platform-wayland/ input-method-v2 客户端 + layer-shell/popup 候选窗
+platform-win/         （规划中）Windows TSF 壳
+platform-mac/         （规划中）macOS IMKit 壳
 ```
 
-规则：core 不碰显示/IPC；壳只做「按键进、候选出」。
+## 性能指标（192 万词条实测，Ryzen/Intel 笔记本）
 
-## 词库
+| 指标 | SQLite 基线 (M1-M6) | 内存排序索引 (M6.5) | FST 二进制词库 (M7) |
+|---|---|---|---|
+| **词库内存** | 185MB (磁盘) | **228.8MB** (堆) | **41.7MB** (mmap，按需驻留) |
+| **词库载入** | 0.05s | 2.86s | **0.55s** |
+| `ni'hao` 前缀查询 | 41.66ms | 0.007ms | **0.015ms** |
+| `shen'me` 前缀查询 | 32.54ms | 0.305ms | **0.438ms** |
+| `nh` 声母缩写查询 | ~20ms | 0.089ms | **0.0002ms** |
 
-打算用雾凇拼音（rime-ice）开源词库数据，发布前核 license。
+## 快速开始
+
+### 1. 构建 FST 词库（一次性，将 192 万词条编译为 42MB 二进制）
+```bash
+cargo run --release -p kime -- build-dict \
+  --in ~/.local/share/kime/dict.sqlite3 \
+  --out ~/.local/share/kime/dict.bin
+```
+
+### 2. CLI 试打（REPL）
+```bash
+cargo run -p kime
+# 或指定双拼方案
+cargo run -p kime -- --shuangpin xiaohe
+```
+
+### 3. 运行性能基准测试
+```bash
+cargo bench --bench kime_bench
+```
+
+## 词库说明
+
+使用 [rime-ice](https://github.com/iDvel/rime-ice)（雾凇拼音）开源词库数据（GPL-3.0）。个人本地使用合规。

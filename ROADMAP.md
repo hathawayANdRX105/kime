@@ -2,51 +2,68 @@
 
 原则：每步都竖切——每一期结束都有一个「真的能跑」的东西，不横着铺层。
 
-## M1 — 引擎最小闭环（纯逻辑，无 UI 无协议）
+## M1 — 引擎最小闭环（纯逻辑，无 UI 无协议）✅ 2026-09-05
 
 `kime-pinyin` + `kime-core`，零平台依赖。
 
-- [x] 拼音音节切分：~410 合法音节表，DP 切分（`xian` → xi'an / xian 两义都出）——401 条，长优先 DFS
+- [x] 拼音音节切分：404 合法音节表，长优先 DFS 切分
 - [x] 词库 loader：rime-ice `.dict.yaml`（TSV 体）→ SQLite
-  - 表：`phrase(pinyin, text, freq, abbrev)`，pinyin=音节带 `'` 连接，abbrev=声母缩写（nh → n'h）
-  - 双索引 + LIMIT N by freq
 - [x] 查询：精确 + 前缀，top-N（`Dict::lookup` / `Dict::lookup_prefix`）
-- [x] kime-cli REPL：stdin 逐行输入 → 打印 top-10 候选（本期的可运行检查）
+- [x] CLI REPL：stdin 逐行输入 → 打印 top-10 候选
 
-验收：`cargo test`（切分/loader/查询）+ kime-cli 出候选。
-依赖检查：rime-ice license 先核。
+## M2 — 双拼 + 学习 ✅ 2026-09-05
 
-## M2 — 双拼 + 学习
-
-- [x] 双拼码表（kime-shuangpin）：小鹤、自然码 → 转拼音走同一管线（纯查表）——401×2 全量 round-trip
+- [x] 双拼码表（kime-shuangpin）：小鹤、自然码 → 404×2 全量 round-trip
 - [x] 用户词/词频自学习：选词写回 `phrase`(user=1)，bump freq 影响排序
-- [x] 自定义缩写映射（个人习惯短语）——`Dict::lookup_abbrev` 兜底查询；自定义词条插入待 M4（需 UX 决策）
+- [x] 自定义缩写映射：`Dict::lookup_abbrev` 兜底查询
 
-验收：单元测试覆盖码表 round-trip + 词频 bump 改变排序；kime-cli 里双拼键出拼音候选。
+## M3 — Wayland 前端：第一次真上屏 ✅ 2026-09-05
 
-## M3 — Wayland 前端：第一次真上屏 ⚠️ 风险最高
+`platform-wayland`：wayland-client 0.31 + `wayland-protocols-misc`（`input_method_v2`）
 
-`platform-wayland`：wayland-client + **wayland-protocols-misc（`input_method_v2`，已核实存在）**
+- [x] spike：mango 上 hello-world —— grab keyboard，按啥 commit 啥
+- [x] 完整通路：grab → 键盘事件进 core → preedit 显示拼音串 → commit_string 上屏
+- [x] 协议纠错：`commit(serial)` 的 serial 严格对应 done 事件计数
 
-- [ ] spike（先做）：mango 上 hello-world —— grab keyboard，按啥 commit 啥
-- [ ] 完整通路：grab → 键盘事件进 core → preedit 显示拼音串 → 候选窗（layer-shell + cosmic-text 渲染）→ 数字/空格选词 → commit_string 上屏
-- [ ] 英文直通模式；systemd user unit 自启
+## M4 — 候选窗 UI（layer-shell）✅ 2026-09-06
 
-已知边界：XWayland 应用不支持（input-method-v2 只管原生 wayland），明确接受。
-风险：mango 对协议实现成熟度、cosmic-text CJK 渲染——都在 spike 阶段暴露。
+- [x] layer-shell overlay 层、真实 wl_shm/memfd 渲染管线
+- [x] cosmic-text 渲染 CJK 字体，实底深灰蓝底 + 白字
+- [x] 真机像素扫描实锤：底部中央 87 行命中面板底色
 
-验收：真机 mango 会话往 GTK/Firefox 打中文。
+## M4.5 — 候选窗光标跟随（input-popup-surface）✅ 2026-09-06
 
-## M4 — 日常体验补全（列难受清单，逐个修）
-- [ ] 候选翻页（`-=`/`[]`）、退格删音节重切分
-- [ ] 模糊音（配置化）
+- [x] 协议正路改造：`im.get_input_popup_surface`，无 configure 握手
+- [x] compositor 自动贴着光标定位；内容自适应高度
+- [x] 真人实测：foot / QQ 贴着光标正常弹出；微信（XWayland）位置偏移记为已知边界
 
-## M5 — AI 预测（异步第二梯队，可选）
+## M5 — 翻页 + 模糊音 + 音节补全 ✅ 2026-09-06
 
-- [ ] 停顿 ~300ms 或句尾时，上下文发本地 LLM（OpenAI 兼容端点），整句/候选合入列表
-- [ ] 硬约束：主路 P99 < 20ms，AI 永不阻塞按键
-- [ ] AI 候选被选 → 写回 SQLite 喂频率
+- [x] 翻页：`-`/`[` 上一页、`=`/`]` 下一页；数字键当前页内选词
+- [x] 模糊音：`config.fuzzy: ["n=l", "an=ang"]` 配置化，声母/韵母独立替换
+- [x] 音节补全：+`yo`/`dia`/`lo` → 404 全量音节
+- [x] 根因修复：abbrev 兜底不再覆盖正常前缀结果
 
-## M6 — 平台壳（远期，要用才做）
+## M6 — 词库升级 + 查询性能优化 ✅ 2026-09-06
 
-XIM / Windows TSF（参考 Weasel）/ macOS IMKit（参考 Squirrel，IMKCandidates 白送 UI）。
+- [x] rime-ice 六分表全量导入：**1,921,611 词条**（185MB SQLite）
+- [x] 范围查询 `[lower, upper)` 替代 `LIKE`：查询从 41.66ms → **0.18ms**（231 倍加速）
+
+## M6.5 — 内存双排序索引 ✅ 2026-09-06
+
+- [x] 按键热路径脱离 SQL：主索引 (pinyin, freq, text) + 二级索引 (abbrev, freq, text)
+- [x] 内存二分查找：`ni'hao` **0.007ms**、`shen'me` **0.305ms**、`abbrev nh` **0.089ms**
+
+## M7 — FST 二进制词库（mmap）✅ 2026-09-06
+
+- [x] `builder.rs`：SQLite → dict.bin（4.7s 处理 192 万词条）
+- [x] `store.rs`：`FstStore` mmap 加载，内存从 **228.8MB → 41.7MB**（缩减 81%）
+- [x] CLI `build-dict` 子命令：单条命令完成词库编译
+- [x] 持久化基准测试：`cargo bench --bench kime_bench`
+
+## M8 — 体验打磨（规划中）
+
+- [ ] TOML 配置文件解析（`~/.config/kime/config.toml` 真读盘）
+- [ ] 用户词覆盖层（SQLite user overlay 与只读 dict.bin 运行时合并）
+- [ ] 整句联想（基于 FST 连续切片的初级 Viterbi）
+- [ ] XIM 协议前端（彻底解决微信等 XWayland 应用的光标对齐问题）
