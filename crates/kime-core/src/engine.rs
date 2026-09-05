@@ -503,8 +503,7 @@ mod tests {
         let config = Config {
             dict_path: db.to_string_lossy().to_string(),
             shuangpin: Some(Scheme::Xiaohe),
-            ai_endpoint: None,
-            fuzzy: Vec::new(),
+            ..Config::default()
         };
         let engine = Engine::new(dict, config);
         (engine, db, yaml)

@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 kime-pinyin = { path = "../kime-pinyin" }
+serde = { version = "1.0", features = ["derive"] }

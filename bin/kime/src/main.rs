@@ -125,7 +125,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    let mut engine = Engine::new(dict, Config::default());
+    let mut engine = Engine::new(dict, Config::load());
     if let Some(sp) = shuangpin {
         let _ = sp;
     }
