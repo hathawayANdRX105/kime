@@ -13,12 +13,28 @@ use wayland_client::{
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2;
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::render::{Candidate, Renderer};
 
 const WIDTH: u32 = 420;
 const HEIGHT: u32 = 380;
+
+enum LayerSurface {
+    Layer(zwlr_layer_surface_v1::ZwlrLayerSurfaceV1),
+    Popup(ZwpInputPopupSurfaceV2),
+}
+
+impl LayerSurface {
+    fn destroy(&self) {
+        match self {
+            LayerSurface::Layer(ls) => ls.destroy(),
+            LayerSurface::Popup(ls) => ls.destroy(),
+        }
+    }
+}
 
 struct WinState {
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
@@ -34,7 +50,7 @@ pub struct CandidateWindow {
     queue: EventQueue<WinState>,
     qh: QueueHandle<WinState>,
     state: WinState,
-    layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    layer_surface: Option<LayerSurface>,
     surface: Option<WlSurface>,
     buffer: Option<WlBuffer>,
     /// memfd fd、mmap 指针与映射长度
@@ -44,7 +60,8 @@ pub struct CandidateWindow {
 
 impl CandidateWindow {
     /// 连接 compositor，burst 绑定 layer_shell + wl_shm
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    /// 用于 --show-test：无活动 IM 也能跑
+    pub fn new_layer() -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::connect_to_env()?;
         let (globals, queue) = registry_queue_init::<WinState>(&conn)?;
         let qh = queue.handle();
@@ -114,6 +131,80 @@ impl CandidateWindow {
         })
     }
 
+    /// 创建基于 input_popup 角色的候选窗（新协议路径）
+    /// 使用 ZwpInputMethodV2::get_input_popup_surface 直接绑定，无需 configure 握手
+    /// 保持现有 shm buffer + render 管线
+    pub fn new_popup(conn: &Connection, im: &ZwpInputMethodV2) -> Result<Self, Box<dyn std::error::Error>> {
+        let (globals, queue) = registry_queue_init::<WinState>(&conn)?;
+        let qh = queue.handle();
+        let mut state = WinState {
+            layer_shell: None,
+            shm: None,
+            compositor: None,
+            configure_serial: None,
+            configured: false,
+            closed: false,
+        };
+
+        globals.contents().with_list(|list| {
+            for g in list {
+                match g.interface.as_str() {
+                    "wl_compositor" if g.version >= 4 => {
+                        state.compositor =
+                            Some(globals.registry().bind::<WlCompositor, _, WinState>(
+                                g.name,
+                                g.version.min(4),
+                                &qh,
+                                (),
+                            ));
+                    }
+                    "wl_shm" if g.version >= 1 => {
+                        let shm = globals.registry().bind::<wl_shm::WlShm, _, WinState>(
+                            g.name,
+                            1,
+                            &qh,
+                            (),
+                        );
+                        state.shm = Some(shm);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if state.compositor.is_none() {
+            return Err("compositor 未暴露".into());
+        }
+        if state.shm.is_none() {
+            return Err("shm 未暴露".into());
+        }
+
+        let compositor = state.compositor.as_ref().unwrap();
+        let surface = compositor.create_surface(&qh, ());
+        // 通过 IME 连接获取 input_popup_surface
+        let layer_surface = im.get_input_popup_surface(&surface, &qh, ()) as _;
+        // 直接设置角色，无需 configure 握手
+        surface.commit();
+
+        let mut renderer = Renderer::new();
+        // 初始化缓冲区（与 layer-shell 路径共享逻辑）
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+        let shm = state.shm.as_ref().unwrap();
+        let buffer = Self::ensure_buffer_static(shm, &qh, w, h)?;
+        let map = Self::ensure_mmap_static(&buffer, w, h)?;
+
+        Ok(Self {
+            conn: conn.clone(),
+            queue,
+            qh,
+            state,
+            layer_surface: Some(LayerSurface::Popup(layer_surface)),
+            surface: Some(surface),
+            buffer: Some(buffer),
+            map: Some(map),
+            renderer,
+        })
+    }
+
     /// 显示候选窗（建窗 + 渲染 + 上屏），自轮询 configure 握手
     pub fn show(
         &mut self,
@@ -121,35 +212,82 @@ impl CandidateWindow {
         highlight: usize,
         preedit: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.layer_surface.is_none() {
-            self.create_layer_surface()?;
-        }
-        // 等 configure（最多 3 轮 roundtrip）
-        for _ in 0..3 {
-            if self.state.configured {
-                break;
-            }
-            self.queue.roundtrip(&mut self.state)?;
-        }
-        let serial = self
-            .state
-            .configure_serial
-            .ok_or("layer surface configure 未到达")?;
-        self.layer_surface.as_ref().unwrap().ack_configure(serial);
+        // 计算动态高度：base 24 + preedit行 30 + candidates * 34 (最多10个)
+        let preedit_h = if preedit.is_empty() { 0 } else { 30 };
+        let candidate_count = candidates.len().min(10);
+        let h = 24 + preedit_h + candidate_count * 34;
+        let (w, h) = (WIDTH as usize, h);
 
-        // 渲染到 mmap → attach → commit
-        if self.layer_surface.is_none() {
-            self.create_layer_surface()?;
-        }
-        // 等 configure（最多 5 轮 roundtrip）
-        for i in 0..5 {
-            if self.state.configured {
-                break;
+        match &self.layer_surface {
+            Some(LayerSurface::Layer(_)) => {
+                // layer-shell 路径需要 configure 握手
+                if self.layer_surface.is_none() {
+                    self.create_layer_surface()?;
+                }
+                // 等 configure（最多 3 轮 roundtrip）
+                for _ in 0..3 {
+                    if self.state.configured {
+                        break;
+                    }
+                    self.queue.roundtrip(&mut self.state)?;
+                }
+                let serial = self
+                    .state
+                    .configure_serial
+                    .ok_or("layer surface configure 未到达")?;
+                if let Some(LayerSurface::Layer(ls)) = &self.layer_surface {
+                    ls.ack_configure(serial);
+                }
+                // 渲染到 mmap → attach → commit
+                if self.layer_surface.is_none() {
+                    self.create_layer_surface()?;
+                }
+                // 等 configure（最多 5 轮 roundtrip）
+                for i in 0..5 {
+                    if self.state.configured {
+                        break;
+                    }
+                    self.queue.roundtrip(&mut self.state)?;
+                    eprintln!("[win] roundtrip {} configured={}", i, self.state.configured);
+                }
             }
-            self.queue.roundtrip(&mut self.state)?;
-            eprintln!("[win] roundtrip {} configured={}", i, self.state.configured);
+            Some(LayerSurface::Popup(_)) => {
+                // input-popup-surface 不需要 configure 握手
+            }
+            None => {
+                // 两种路径都需要创建 surface
+                if self.layer_surface.is_none() {
+                    self.create_layer_surface()?;
+                }
+                // 等 configure（最多 3 轮 roundtrip）
+                for _ in 0..3 {
+                    if self.state.configured {
+                        break;
+                    }
+                    self.queue.roundtrip(&mut self.state)?;
+                }
+                let serial = self
+                    .state
+                    .configure_serial
+                    .ok_or("layer surface configure 未到达")?;
+                if let Some(LayerSurface::Layer(ls)) = &self.layer_surface {
+                    ls.ack_configure(serial);
+                }
+                // 渲染到 mmap → attach → commit
+                if self.layer_surface.is_none() {
+                    self.create_layer_surface()?;
+                }
+                // 等 configure（最多 5 轮 roundtrip）
+                for i in 0..5 {
+                    if self.state.configured {
+                        break;
+                    }
+                    self.queue.roundtrip(&mut self.state)?;
+                    eprintln!("[win] roundtrip {} configured={}", i, self.state.configured);
+                }
+            }
         }
-        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+
         self.ensure_buffer(w, h)?;
         // render.rs 写内存 RGBA；shm Argb8888 内存序是 B,G,R,A → 原地换 R/B
         {
@@ -163,7 +301,7 @@ impl CandidateWindow {
         }
         let surface = self.surface.as_ref().unwrap();
         surface.attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
-        surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
+        surface.damage(0, 0, WIDTH as i32, h as i32);
         surface.commit();
         self.queue.roundtrip(&mut self.state)?;
         Ok(())
@@ -213,7 +351,7 @@ impl CandidateWindow {
         surface.commit();
 
         self.surface = Some(surface);
-        self.layer_surface = Some(layer_surface);
+        self.layer_surface = Some(LayerSurface::Layer(layer_surface));
         Ok(())
     }
 
@@ -264,6 +402,91 @@ impl CandidateWindow {
         self.buffer = Some(buffer);
         self.map = Some((fd, map_ptr, size));
         Ok(())
+    }
+}
+
+// 静态辅助函数：用于 new_popup 路径（不需要 self）
+impl CandidateWindow {
+    fn ensure_buffer_static(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<WinState>,
+        w: usize,
+        h: usize,
+    ) -> Result<WlBuffer, Box<dyn std::error::Error>> {
+        let size = w * h * 4;
+        let fd = unsafe {
+            libc::memfd_create(
+                b"kime-candidates\0".as_ptr() as *const i8,
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err("memfd_create failed".into());
+        }
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
+            return Err("ftruncate failed".into());
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err("mmap failed".into());
+        }
+        let map_ptr = ptr as *mut u8;
+        let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let pool = shm.create_pool(fd_borrowed, size as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        Ok(buffer)
+    }
+
+    fn ensure_mmap_static(
+        buffer: &WlBuffer,
+        w: usize,
+        h: usize,
+    ) -> Result<(i32, *mut u8, usize), Box<dyn std::error::Error>> {
+        let size = w * h * 4;
+        // 创建新的 memfd 用于 mmap（因为 WlBuffer 不暴露 pool fd）
+        let fd = unsafe {
+            libc::memfd_create(
+                b"kime-candidates-map\0".as_ptr() as *const i8,
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err("memfd_create failed".into());
+        }
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
+            return Err("ftruncate failed".into());
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err("mmap failed".into());
+        }
+        Ok((fd, ptr as *mut u8, size))
     }
 }
 
@@ -369,6 +592,26 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WinState {
             LsEvent::Closed => {
                 state.closed = true;
                 state.configured = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpInputPopupSurfaceV2, ()> for WinState {
+    fn event(
+        state: &mut Self,
+        _surface: &ZwpInputPopupSurfaceV2,
+        event: <ZwpInputPopupSurfaceV2 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::Event as PopupEvent;
+        match event {
+            PopupEvent::TextInputRectangle { x: _, y: _, width: _, height: _ } => {
+                // Store rectangle for potential future use
+                // TODO: use this for positioning if needed
             }
             _ => {}
         }

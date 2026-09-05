@@ -6,7 +6,7 @@
 use std::env;
 
 use wayland_client::{
-    globals::{registry_queue_init, GlobalList, GlobalListContents},
+    globals::{registry_queue_init, GlobalListContents},
     protocol::{
         wl_keyboard::KeyState,
         wl_registry::{Event as RegistryEvent, WlRegistry},
@@ -58,8 +58,8 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         _registry: &WlRegistry,
         event: RegistryEvent,
         _globals: &GlobalListContents,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
     ) {
         if let RegistryEvent::Global {
             name,
@@ -70,7 +70,7 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
             log(&format!("Global: {} v{} ({})", name, version, interface));
             if interface == "zwp_input_method_manager_v2" && version >= 1 {
                 let mgr =
-                    _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, _qh, ()) as _;
+                    _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, qh, ()) as _;
                 state.input_method_manager = Some(mgr);
                 log(&format!("bound input method manager name={}", name));
             }
@@ -108,7 +108,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
         im: &ZwpInputMethodV2,
         event: ZwpInputMethodEvent,
         _: &(),
-        _: &Connection,
+        conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
         match event {
@@ -125,11 +125,26 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 }
                 let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(qh, ()) as _;
                 log("grab_keyboard requested");
+                // 使用 input-popup-surface 创建候选窗
+                match CandidateWindow::new_popup(conn, im) {
+                    Ok(window) => {
+                        log("创建 popup 候选窗成功");
+                        state.window = Some(window);
+                    }
+                    Err(e) => {
+                        log(&format!("创建 popup 候选窗失败: {}", e));
+                    }
+                }
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
                 state.input_method = None;
                 state.engine = None;
+                // 隐藏 popup 候选窗
+                if let Some(win) = &mut state.window {
+                    let _ = win.hide();
+                }
+                state.window = None;
             }
             ZwpInputMethodEvent::Done { .. } => {
                 state.im_serial += 1;
@@ -252,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = Connection::connect_to_env()?;
     if args.iter().any(|a| a == "--show-test") {
-        let mut win = platform_wayland::window::CandidateWindow::new()?;
+        let mut win = CandidateWindow::new_layer()?;
         let ui = vec![
             UiCandidate {
                 text: "你好".into(),
