@@ -11,6 +11,8 @@ pub struct Config {
     pub shuangpin: Option<Scheme>,
     /// OpenAI 兼容端点；None = 关闭 AI 预测
     pub ai_endpoint: Option<String>,
+    /// 模糊音替换对（"zh=z"、"n=l"、"an=ang"）；空 = 关闭
+    pub fuzzy: Vec<String>,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             dict_path,
             shuangpin: None,
             ai_endpoint: None,
+            fuzzy: Vec::new(),
         }
     }
 }

@@ -162,18 +162,22 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     return;
                 }
 
+                // 功能键：ch=None、code 透传，翻页/退格等由 engine 按 code 分派；
+                // 未匹配的可打印映射直接丢弃（spike 时代遗留行为保留）
+                let is_page_key = matches!(key, 12 | 13 | 26 | 27);
                 let ch = match key {
-                    1 => '\u{1b}',
-                    30..=54 => (b'A' + (key - 30) as u8) as char,
-                    11..=20 => (b'0' + (key - 11) as u8) as char,
-                    57 => ' ',
-                    28 => '\n',
+                    1 => Some('\u{1b}'),
+                    30..=54 => Some((b'A' + (key - 30) as u8) as char),
+                    11..=20 => Some((b'0' + (key - 11) as u8) as char),
+                    57 => Some(' '),
+                    28 => Some('\n'),
+                    _ if is_page_key => None,
                     _ => return,
                 };
 
                 if let Some(engine) = &mut state.engine {
                     let key_struct = Key {
-                        ch: Some(ch),
+                        ch,
                         code: key,
                         shift: false,
                         ctrl: false,

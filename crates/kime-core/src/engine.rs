@@ -18,6 +18,13 @@ const KEY_BACKSPACE: u32 = 14;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_SPACE: u32 = 57;
+const KEY_MINUS: u32 = 12;
+const KEY_EQUAL: u32 = 13;
+const KEY_LEFTBRACE: u32 = 26;
+const KEY_RIGHTBRACE: u32 = 27;
+
+/// 每页候选数
+const PAGE_SIZE: usize = 10;
 
 /// 平台无关最小按键。壳负责从 wayland / TSF / IMKit 换算进来。
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +52,9 @@ pub struct Engine {
     dict: Dict,
     config: Config,
     chinese: bool,
+    page_index: usize,
+    /// 模糊音替换表（"zh" → "z" 等），Config::fuzzy 解析产物
+    fuzzy_map: std::collections::HashMap<String, String>,
     /// 当前累积的拼音串（如 "niha"）
     letters: String,
     /// 最近一次查询得到的候选；commit / clear 时一并清空。
@@ -56,10 +66,18 @@ pub struct Engine {
     /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
     preedit: String,
 }
-
 impl Engine {
     pub fn new(dict: Dict, config: Config) -> Self {
         let shuangpin = config.shuangpin;
+        let mut fuzzy_map = std::collections::HashMap::new();
+        for entry in &config.fuzzy {
+            match entry.split_once('=') {
+                Some((a, b)) if !a.is_empty() && !b.is_empty() => {
+                    fuzzy_map.insert(a.to_string(), b.to_string());
+                }
+                _ => eprintln!("[kime] 忽略非法模糊音配置: {:?}", entry),
+            }
+        }
         Self {
             dict,
             config,
@@ -69,32 +87,33 @@ impl Engine {
             sp: shuangpin.map(kime_shuangpin::Table::new),
             last_reading: Vec::new(),
             preedit: String::new(),
+            page_index: 0,
+            fuzzy_map,
         }
     }
-
     /// 中/英文模式（英文模式所有键 Ignored 直通）
     pub fn chinese(&self) -> bool {
         self.chinese
     }
 
-    /// 当前 preedit：未上屏拼音串（双拼=解码后拼音，全拼=letters）
+    /// 当前 preedit：未上屏拼音串（如 "niha"）
     pub fn preedit(&self) -> &str {
         &self.preedit
+    }
+
+    /// (当前页, 页大小) — 候选窗布局用
+    pub fn page(&self) -> (usize, usize) {
+        (self.page_index, PAGE_SIZE)
+    }
+
+    /// 当前页首候选的全局索引（候选窗反色渲染用）
+    pub fn highlight(&self) -> usize {
+        self.page_index * PAGE_SIZE
     }
 
     /// 当前读音的全部候选（内部 cap ~50，freq 降序）
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
-    }
-
-    /// (当前页, 页大小) — 候选窗布局用；M1 恒 (0, 10)
-    pub fn page(&self) -> (usize, usize) {
-        (0, 10)
-    }
-
-    /// 当前高亮候选索引（候选窗渲染用）；M1 恒 0
-    pub fn highlight(&self) -> usize {
-        0
     }
 
     /// 唯一入口。字母累积 / 退格删音节 / 数字选词 / 空格首选 / shift 中英切换
@@ -125,6 +144,7 @@ impl Engine {
             }
             self.letters.pop();
             self.refresh_candidates();
+            self.page_index = 0;
             return Outcome::Consumed;
         }
 
@@ -134,6 +154,29 @@ impl Engine {
             self.candidates.clear();
             self.last_reading.clear();
             self.preedit.clear();
+            self.page_index = 0;
+            return Outcome::Consumed;
+        }
+
+        // 翻页：-/LEFTBRACE 上一页，=/RIGHTBRACE 下一页（无候选 Ignored，越界钳位）
+        if k.ch.is_none()
+            && matches!(
+                k.code,
+                KEY_MINUS | KEY_EQUAL | KEY_LEFTBRACE | KEY_RIGHTBRACE
+            )
+        {
+            if self.candidates.is_empty() {
+                return Outcome::Ignored;
+            }
+            let total_pages = self.candidates.len().div_ceil(PAGE_SIZE);
+            match k.code {
+                KEY_MINUS | KEY_LEFTBRACE => {
+                    self.page_index = self.page_index.saturating_sub(1);
+                }
+                _ => {
+                    self.page_index = (self.page_index + 1).min(total_pages - 1);
+                }
+            }
             return Outcome::Consumed;
         }
 
@@ -146,6 +189,7 @@ impl Engine {
                 self.candidates.clear();
                 self.last_reading.clear();
                 self.preedit.clear();
+                self.page_index = 0;
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
@@ -159,10 +203,10 @@ impl Engine {
                 self.refresh_candidates();
                 return Outcome::Consumed;
             }
-            // 数字 1-9 选词。
+            // 数字 1-9：当前页内选词（全局索引 = 页*10 + 数字-1）。
             if let Some(d) = c.to_digit(10) {
                 if (1..=9).contains(&d) {
-                    let idx = (d - 1) as usize;
+                    let idx = self.page_index * PAGE_SIZE + (d - 1) as usize;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
                         let _ = self.dict.learn(&self.last_reading, &text);
@@ -170,6 +214,7 @@ impl Engine {
                         self.candidates.clear();
                         self.last_reading.clear();
                         self.preedit.clear();
+                        self.page_index = 0;
                         return Outcome::Commit(text);
                     }
                     return Outcome::Ignored;
@@ -180,7 +225,23 @@ impl Engine {
         // 其它（标点、功能键等）→ 放行给宿主。
         Outcome::Ignored
     }
+}
 
+/// 对一个音节/尾部串应用模糊替换表：前缀匹配（声母）与后缀匹配（韵母）各生成一路变体。
+fn fuzzy_expand(map: &std::collections::HashMap<String, String>, s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (from, to) in map {
+        if s.starts_with(from.as_str()) && !s.starts_with(to.as_str()) {
+            out.push(format!("{}{}", to, &s[from.len()..]));
+        }
+        if s.ends_with(from.as_str()) && !s.ends_with(to.as_str()) {
+            out.push(format!("{}{}", &s[..s.len() - from.len()], to));
+        }
+    }
+    out
+}
+
+impl Engine {
     /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
     /// 兜底 lookup_abbrev。维护 self.last_reading 与 self.preedit。
     fn refresh_candidates(&mut self) {
@@ -260,18 +321,52 @@ impl Engine {
         self.last_reading = reading.clone();
         self.preedit = self.letters.clone();
 
-        // 先尝试正常前缀查询
-        let mut cands = self
+        // 主路径查询
+        let mut cands: Vec<Candidate> = self
             .dict
             .lookup_prefix(&reading, &tail, 50)
             .unwrap_or_default();
 
-        // 若切分失败（reading 为空）或候选为空，回退到缩写查询
-        if reading.is_empty() || cands.is_empty() {
+        // 模糊音变体：对完整音节与尾部半截串做「首（声母）/尾（韵母）替换」，
+        // 每处替换独立成一路查询，结果按文本去重合并。fuzzy_map 为空时整块跳过。
+        if !self.fuzzy_map.is_empty() {
+            let mut seen: std::collections::HashSet<String> =
+                cands.iter().map(|c| c.text.clone()).collect();
+            let mut push_variant = |reading: &[String],
+                                    tail: &str,
+                                    seen: &mut std::collections::HashSet<String>,
+                                    cands: &mut Vec<Candidate>| {
+                if let Ok(mut vc) = self.dict.lookup_prefix(reading, tail, 50) {
+                    vc.retain(|c| seen.insert(c.text.clone()));
+                    cands.extend(vc);
+                }
+            };
+            // 完整音节变体
+            for (i, syl) in reading.iter().enumerate() {
+                for v in fuzzy_expand(&self.fuzzy_map, syl) {
+                    let mut variant = reading.clone();
+                    variant[i] = v;
+                    push_variant(&variant, &tail, &mut seen, &mut cands);
+                    if cands.len() >= 50 {
+                        break;
+                    }
+                }
+            }
+            // 尾部（半截或完整）变体
+            for v in fuzzy_expand(&self.fuzzy_map, &tail) {
+                push_variant(&reading, &v, &mut seen, &mut cands);
+                if cands.len() >= 50 {
+                    break;
+                }
+            }
+            cands.truncate(50);
+        }
+
+        // 若主路径与模糊路径都无候选，回退到缩写查询
+        if cands.is_empty() {
             if let Ok(ab) = self.dict.lookup_abbrev(&self.letters, 50) {
                 cands = ab;
             }
-            // abbrev 兜底时 last_reading 置空 —— 缩写行 learn 用它自己的行
             self.last_reading.clear();
         }
 
@@ -377,6 +472,7 @@ mod tests {
             dict_path: db.to_string_lossy().to_string(),
             shuangpin: Some(Scheme::Xiaohe),
             ai_endpoint: None,
+            fuzzy: Vec::new(),
         };
         let engine = Engine::new(dict, config);
         (engine, db, yaml)
@@ -754,6 +850,202 @@ mod tests {
         }
         assert_eq!(e.preedit(), "xq");
         assert!(e.candidates().is_empty(), "xq should have no candidates");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+    // --- M5: 翻页 + 页内选词 ---
+    fn fixture_many_ni() -> (std::path::PathBuf, std::path::PathBuf) {
+        let db = tmp_db("page");
+        let yaml = std::env::temp_dir().join(format!("kime_page_{}.yaml", std::process::id()));
+        std::fs::write(&yaml, "").unwrap();
+        let dict = Dict::open(&db).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for i in 0..25 {
+            conn.execute(
+                "INSERT OR IGNORE INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?, ?, ?, 'n', 0)",
+                rusqlite::params![format!("ni'{}", i), format!("词{}", i), 1000 - i as i64],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (db, yaml)
+    }
+
+    #[test]
+    fn page_navigation_clamps_and_page_local_digits() {
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        assert!(e.candidates().len() >= 20);
+        assert_eq!(e.page(), (0, 10));
+        // 上一页越界钳位
+        assert_eq!(e.key(code_k(KEY_MINUS)), Outcome::Consumed);
+        assert_eq!(e.page(), (0, 10));
+        // 下一页
+        assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
+        assert_eq!(e.page(), (1, 10));
+        // 页内数字 2 → 全局第 12 个候选
+        let out = e.key(k('2'));
+        match out {
+            Outcome::Commit(t) => assert_eq!(t, "词11"),
+            other => panic!("expected commit, got {:?}", other),
+        }
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn page_digit_beyond_page_is_ignored() {
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        // 第 0 页只有 10 个候选：数字 9 有效，但先翻到最后一页（25 条 → 第 2 页只有 5 个）
+        e.key(code_k(KEY_EQUAL));
+        e.key(code_k(KEY_EQUAL));
+        let last_page = e.page();
+        assert_eq!(last_page, (2, 10));
+        // 页内索引 8 超过最后页剩余 5 个 → Ignored
+        assert_eq!(e.key(k('9')), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn page_resets_on_commit_and_esc() {
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        e.key(code_k(KEY_EQUAL));
+        assert_eq!(e.page(), (1, 10));
+        e.key(code_k(KEY_ESC));
+        assert_eq!(e.page(), (0, 10));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn paging_without_candidates_is_ignored() {
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+        assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    // --- M5: 模糊音 ---
+    const FUZZY_YAML: &str =
+        "---\n...\n里\tli\t800\n凉\tliang\t700\n饭\tfan\t900\n翻\tfang\t600\n你\tni\t5000\n";
+
+    #[test]
+    fn fuzzy_empty_config_is_baseline() {
+        let db = tmp_db("fz0");
+        let yaml = std::env::temp_dir().join("kime_fz0.yaml");
+        std::fs::write(&yaml, FUZZY_YAML).unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        let texts: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"你"));
+        assert!(!texts.contains(&"里"), "无模糊配置时不应命中 li 词");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn fuzzy_initial_n_to_l_matches_li_words() {
+        let db = tmp_db("fz1");
+        let yaml = std::env::temp_dir().join("kime_fz1.yaml");
+        std::fs::write(&yaml, FUZZY_YAML).unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let cfg = Config {
+            fuzzy: vec!["n=l".to_string()],
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        let texts: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"你"));
+        assert!(texts.contains(&"里"), "fuzzy n=l 应命中 li 词");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn fuzzy_final_an_to_ang_matches_fang() {
+        let db = tmp_db("fz2");
+        let yaml = std::env::temp_dir().join("kime_fz2.yaml");
+        std::fs::write(&yaml, FUZZY_YAML).unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let cfg = Config {
+            fuzzy: vec!["an=ang".to_string()],
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
+        for c in "fan".chars() {
+            e.key(k(c));
+        }
+        let texts: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"饭"));
+        assert!(texts.contains(&"翻"), "fuzzy an=ang 应命中 fang 词");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn fuzzy_invalid_entries_ignored() {
+        let db = tmp_db("fz3");
+        let yaml = std::env::temp_dir().join("kime_fz3.yaml");
+        std::fs::write(&yaml, FUZZY_YAML).unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let cfg = Config {
+            fuzzy: vec!["xyz".to_string(), "=x".to_string(), "x=".to_string()],
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        assert!(e.candidates().len() > 0, "非法配置不影响正常查询");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn fuzzy_dedupe_across_paths() {
+        let db = tmp_db("fz4");
+        let yaml = std::env::temp_dir().join("kime_fz4.yaml");
+        // 同一文本同时有 ni / li 两行（前缀互不包含）→ 主路与模糊路都命中但只出现一次
+        std::fs::write(&yaml, "---\n...\n泥\tni\t600\n泥\tli\t500\n你\tni\t900\n").unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let cfg = Config {
+            fuzzy: vec!["n=l".to_string()],
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        let count = e.candidates().iter().filter(|c| c.text == "泥").count();
+        assert_eq!(count, 1, "去重：同一文本只出现一次");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
