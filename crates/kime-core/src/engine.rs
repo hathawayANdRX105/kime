@@ -332,7 +332,7 @@ impl Engine {
         if !self.fuzzy_map.is_empty() {
             let mut seen: std::collections::HashSet<String> =
                 cands.iter().map(|c| c.text.clone()).collect();
-            let mut push_variant = |reading: &[String],
+            let push_variant = |reading: &[String],
                                     tail: &str,
                                     seen: &mut std::collections::HashSet<String>,
                                     cands: &mut Vec<Candidate>| {
