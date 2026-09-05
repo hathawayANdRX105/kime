@@ -272,18 +272,20 @@ fn dict_top_user_returns_only_user_rows() {
     let empty = d.top_user(10).expect("top_user empty");
     assert!(empty.is_empty());
 
-    // learn() inserts user=1 rows; bumping existing rows keeps user=0.
+    // learn() 把词条提升为 user=1（自学习语义）：新插入与已导入 bump 都是 user 行。
     d.learn(&["ta".into()], "它").expect("learn new");
     d.learn(&["ni".into(), "hao".into()], "你好")
         .expect("learn existing");
     d.learn(&["ta".into()], "它").expect("learn bump");
 
     let user_rows = d.top_user(10).expect("top_user");
-    // Only "它" was inserted as a user row; "你好" stays user=0 (import).
-    assert_eq!(user_rows.len(), 1);
-    assert_eq!(user_rows[0].text, "它");
-    assert_eq!(user_rows[0].freq, 2); // bump from learn "它" twice
-    assert!(!user_rows[0].ai);
+    // "它"（新插入）与 "你好"（导入后 learn 提升）都是 user 行
+    assert_eq!(user_rows.len(), 2);
+    assert_eq!(user_rows[0].text, "你好"); // freq 5000 + 1 bump
+    assert_eq!(user_rows[0].freq, 5001);
+    assert_eq!(user_rows[1].text, "它");
+    assert_eq!(user_rows[1].freq, 2); // bump from learn "它" twice
+    assert!(!user_rows[1].ai);
 
     // limit clamps to the requested count.
     let clamped = d.top_user(0).expect("top_user limit 0");
