@@ -32,6 +32,7 @@ pub mod config;
 pub mod dict;
 pub mod engine;
 pub mod predict;
+pub mod punct;
 pub mod store;
 pub use dict::Candidate;
 pub use engine::{Engine, Key, Outcome};
