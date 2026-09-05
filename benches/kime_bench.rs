@@ -20,7 +20,10 @@ fn main() {
             return;
         }
     };
-    println!("1. SQLite 载入 + 内存双索引: {:.3}s", t0.elapsed().as_secs_f64());
+    println!(
+        "1. SQLite 载入 + 内存双索引: {:.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     // 2. 精确前缀查询 (ni'hao)
     let queries = [
@@ -36,7 +39,10 @@ fn main() {
         for _ in 0..n {
             let _ = dict.lookup_prefix(syllables, tail, 10);
         }
-        println!("2. 查询 [{label}]: {:.4}ms/次", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        println!(
+            "2. 查询 [{label}]: {:.4}ms/次",
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
     }
 
     // 3. 缩写查询 (nh)
@@ -45,7 +51,10 @@ fn main() {
     for _ in 0..n {
         let _ = dict.lookup_abbrev("nh", 10);
     }
-    println!("3. 缩写查询 [nh]: {:.4}ms/次", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "3. 缩写查询 [nh]: {:.4}ms/次",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // 4. FST 查询 (如果存在)
     if Path::new(bin_path).exists() {
@@ -65,7 +74,10 @@ fn main() {
             for _ in 0..n {
                 let _ = store.lookup_prefix(syllables, tail, 10);
             }
-            println!("   FST [{label}]: {:.4}ms/次", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+            println!(
+                "   FST [{label}]: {:.4}ms/次",
+                t.elapsed().as_secs_f64() * 1000.0 / n as f64
+            );
         }
     } else {
         println!("4. FST 未就绪（无 /tmp/kime_dict.bin），跳过");

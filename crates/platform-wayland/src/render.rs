@@ -87,7 +87,7 @@ impl Renderer {
         }
         // Draw border first (will be overlaid by text)
         // Use subtle gray-blue (#4C566A) or accented #5E81AC
-        draw_border(buf, width, height, 0x5E81ACFFu32);
+        Self::draw_border(buf, width, height, 0x5E81ACFFu32);
 
         // Build text with line breaks: preedit (small) + numbered candidates
         let mut text = String::new();
@@ -141,7 +141,13 @@ impl Renderer {
     }
 
     /// Update metrics based on actual content height for compact sizing.
-    pub fn update_metrics(&mut self, _buf: &mut [u8], _width: usize, candidates: &[Candidate], preedit: &str) {
+    pub fn update_metrics(
+        &mut self,
+        _buf: &mut [u8],
+        _width: usize,
+        candidates: &[Candidate],
+        preedit: &str,
+    ) {
         // Calculate required height: base 24px + preedit 30px + each candidate 28px line height
         let preedit_h = if preedit.is_empty() { 0 } else { 30 };
         let candidate_h = candidates.len().min(10) * 28; // tighter line height
@@ -174,7 +180,7 @@ impl Renderer {
         // Only draw border if we have candidates (empty render should be uniform)
         if !candidates.is_empty() {
             // Draw border after background
-            draw_border(buf, width, height, 0x4C566AFFu32); // #4C566A gray-blue
+            Self::draw_border(buf, width, height, 0x4C566AFFu32); // #4C566A gray-blue
         }
 
         // Build text with line breaks: preedit (small) + numbered candidates
@@ -310,11 +316,21 @@ mod tests {
     fn test_renderer_compact_sizing() {
         let mut renderer = Renderer::new();
         let candidates = vec![
-            Candidate { text: "测试".to_string(), pinyin: "ce shi".to_string(), freq: 1, ai: false },
-            Candidate { text: "结果".to_string(), pinyin: "jie guo".to_string(), freq: 2, ai: false },
+            Candidate {
+                text: "测试".to_string(),
+                pinyin: "ce shi".to_string(),
+                freq: 1,
+                ai: false,
+            },
+            Candidate {
+                text: "结果".to_string(),
+                pinyin: "jie guo".to_string(),
+                freq: 2,
+                ai: false,
+            },
         ];
         let mut buf = vec![0u8; 380 * 380 * 4]; // Compact width, square height
-        // Test compact rendering
+                                                // Test compact rendering
         let result = renderer.draw_candidates_compact(&mut buf, 380, 380, &candidates, 0, "输入");
         assert!(result.is_ok());
         // Verify border exists (non-zero pixels on edges)
@@ -322,21 +338,40 @@ mod tests {
             // Top row
             buf[0..4].iter().any(|&b| b != 0x00),
             // Bottom row
-            buf[(379 * 380 * 4)..(379 * 380 * 4 + 4)].iter().any(|&b| b != 0x00),
+            buf[(379 * 380 * 4)..(379 * 380 * 4 + 4)]
+                .iter()
+                .any(|&b| b != 0x00),
             // Left column middle
-            buf[(190 * 380 * 4)..(190 * 380 * 4 + 4)].iter().any(|&b| b != 0x00),
+            buf[(190 * 380 * 4)..(190 * 380 * 4 + 4)]
+                .iter()
+                .any(|&b| b != 0x00),
             // Right column middle
-            buf[(190 * 380 * 4 + 4 * 379)..(190 * 380 * 4 + 4 * 380)].iter().any(|&b| b != 0x00),
+            buf[(190 * 380 * 4 + 4 * 379)..(190 * 380 * 4 + 4 * 380)]
+                .iter()
+                .any(|&b| b != 0x00),
         ];
-        assert!(border_pixels.iter().any(|&b| b), "Compact render missing border");
+        assert!(
+            border_pixels.iter().any(|&b| b),
+            "Compact render missing border"
+        );
     }
 
     #[test]
     fn test_renderer_highlight_border() {
         let mut renderer = Renderer::new();
         let candidates = vec![
-            Candidate { text: "第一个".to_string(), pinyin: "di yi ge".to_string(), freq: 1, ai: false },
-            Candidate { text: "第二个".to_string(), pinyin: "di er ge".to_string(), freq: 2, ai: false },
+            Candidate {
+                text: "第一个".to_string(),
+                pinyin: "di yi ge".to_string(),
+                freq: 1,
+                ai: false,
+            },
+            Candidate {
+                text: "第二个".to_string(),
+                pinyin: "di er ge".to_string(),
+                freq: 2,
+                ai: false,
+            },
         ];
         let mut buf = vec![0u8; 380 * 380 * 4];
         let result = renderer.draw_candidates_compact(&mut buf, 380, 380, &candidates, 1, "预编辑");
@@ -353,9 +388,9 @@ mod tests {
         // Check a few pixels near the highlighted item (2nd row)
         let row_offset = 1 * 380 * 4;
         let sample_pixels = &buf[row_offset..row_offset + 20];
-        let has_highlight = sample_pixels.chunks_exact(4).any(|px| {
-            px[0] == rh && px[1] == gh && px[2] == bh && px[3] == ah
-        });
+        let has_highlight = sample_pixels
+            .chunks_exact(4)
+            .any(|px| px[0] == rh && px[1] == gh && px[2] == bh && px[3] == ah);
         assert!(has_highlight, "Highlight border not rendered");
     }
 }
