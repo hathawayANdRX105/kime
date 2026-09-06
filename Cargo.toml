@@ -6,6 +6,7 @@ members = [
     "crates/kime-core",
     "bin/kime",
     "crates/platform-wayland",
+    "crates/platform-x11",
 ]
 
 [workspace.package]
