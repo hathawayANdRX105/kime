@@ -489,8 +489,18 @@ impl Engine {
     }
 
     /// M5: AI 候选合入当前列表。后台线程完成后由壳回调（仍在主线程执行）
-    pub fn merge_ai(&mut self, _ai: Vec<Candidate>) {
-        todo!("M5")
+    pub fn merge_ai(&mut self, ai: Vec<Candidate>) {
+        let mut seen = std::collections::HashSet::new();
+        // 先加入现有候选文本集合
+        for c in &self.candidates {
+            seen.insert(c.text.clone());
+        }
+        // 去重合并 AI 候选
+        for c in ai {
+            if seen.insert(c.text.clone()) {
+                self.candidates.push(c);
+            }
+        }
     }
 }
 
@@ -1168,6 +1178,45 @@ mod tests {
         }
         let count = e.candidates().iter().filter(|c| c.text == "泥").count();
         assert_eq!(count, 1, "去重：同一文本只出现一次");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn llm_merge_adds_candidates() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        let original_len = e.candidates().len();
+        
+        let ai = vec![
+            Candidate { text: "你好世界".to_string(), pinyin: "ni'hao".to_string(), freq: 1, ai: true },
+        ];
+        e.merge_ai(ai);
+        
+        assert_eq!(e.candidates().len(), original_len + 1);
+        assert!(e.candidates().iter().any(|c| c.text == "你好世界" && c.ai));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn llm_dedupe_existing() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        let original_len = e.candidates().len();
+        
+        // Merge a candidate that already exists
+        let ai = vec![
+            Candidate { text: "你好".to_string(), pinyin: "ni'hao".to_string(), freq: 1, ai: true },
+        ];
+        e.merge_ai(ai);
+        
+        // Should not add duplicate
+        assert_eq!(e.candidates().len(), original_len);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
