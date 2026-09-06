@@ -1,0 +1,16 @@
+[package]
+name = "platform-x11"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kime-core = { path = "../kime-core" }
+x11rb = { version = "0.14", features = ["allow-unsafe-code"] }
+parking_lot = "0.12"
+[lib]
+name = "platform_x11"
+path = "src/lib.rs"
+
+[[bin]]
+name = "platform-x11"
+path = "src/main.rs"
