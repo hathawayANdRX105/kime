@@ -16,14 +16,14 @@
 //! 主路延迟（P99 < 20ms）由这里的索引形状保证。
 
 use rusqlite::{params, Connection, Error as SqliteError, Result};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn io_to_sqlite(e: std::io::Error) -> SqliteError {
     SqliteError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
-
 /// 候选词 — 全链路统一货币：dict 查询产出、engine 排序翻页、AI 层追加
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -56,6 +56,8 @@ pub struct Dict {
     index: Vec<IndexEntry>,
     /// 二级索引：同一批条目按 (abbrev ASC, freq DESC, text ASC) 排序——abbrev 前缀二分用
     abbrev_index: Vec<IndexEntry>,
+    /// 可选的 FST 二进制词库存储
+    store: Option<crate::store::FstStore>,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query.
@@ -80,8 +82,19 @@ fn increment_prefix(prefix: &str) -> Option<String> {
 }
 
 impl Dict {
+    /// Helper to compute binary dict path alongside DB path
+    fn dict_bin_path(db_path: &Path) -> PathBuf {
+        let parent = if db_path.is_absolute() {
+            db_path.parent().unwrap_or_else(|| Path::new(""))
+        } else {
+            Path::new(".")
+        };
+        parent.join("dict.bin")
+    }
+
     /// 打开；不存在则建 schema + 索引
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
@@ -96,26 +109,43 @@ impl Dict {
              CREATE INDEX IF NOT EXISTS idx_phrase_pinyin  ON phrase(pinyin);
              CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);",
         )?;
-        // Load memory index from existing DB
-        let mut stmt = conn.prepare(
-            "SELECT pinyin, text, freq, abbrev, user FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC",
-        )?;
-        let rows = stmt.query_map(params![], |row| {
-            Ok(IndexEntry {
-                pinyin: row.get(0)?,
-                text: row.get(1)?,
-                freq: row.get(2)?,
-                abbrev: row.get(3)?,
-                user: row.get(4)?,
-            })
-        })?;
-        let mut index: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        index.sort_by(|a, b| {
-            a.pinyin
-                .cmp(&b.pinyin)
-                .then_with(|| b.freq.cmp(&a.freq))
-                .then_with(|| a.text.cmp(&b.text))
-        });
+        // Try to load FST binary if present alongside DB
+        let bin_path = Self::dict_bin_path(path);
+        let mut store: Option<crate::store::FstStore> = None;
+        if bin_path.exists() {
+            match crate::store::FstStore::open(&bin_path) {
+                Ok(s) => {
+                    store = Some(s);
+                }
+                Err(e) => {
+                    eprintln!("FST load failed {:?}, falling back to SQLite index", e);
+                }
+            }
+        }
+        // If no FST or load failed, load existing index from SQLite
+        let mut index: Vec<IndexEntry> = Vec::new();
+        if store.is_none() {
+            let mut stmt = conn.prepare(
+                "SELECT pinyin, text, freq, abbrev, user FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC",
+            )?;
+            let rows = stmt.query_map(params![], |row| {
+                Ok(IndexEntry {
+                    pinyin: row.get(0)?,
+                    text: row.get(1)?,
+                    freq: row.get(2)?,
+                    abbrev: row.get(3)?,
+                    user: row.get(4)?,
+                })
+            })?;
+            index = rows.collect::<Result<Vec<_>, _>>()?;
+            // Sort just in case DB order changed
+            index.sort_by(|a, b| {
+                a.pinyin
+                    .cmp(&b.pinyin)
+                    .then_with(|| b.freq.cmp(&a.freq))
+                    .then_with(|| a.text.cmp(&b.text))
+            });
+        }
         let mut abbrev_index = index.clone();
         abbrev_index.sort_by(|a, b| {
             a.abbrev
@@ -123,11 +153,11 @@ impl Dict {
                 .then_with(|| b.freq.cmp(&a.freq))
                 .then_with(|| a.text.cmp(&b.text))
         });
-        drop(stmt);
         Ok(Self {
             conn,
             index,
             abbrev_index,
+            store,
         })
     }
 
@@ -209,8 +239,35 @@ impl Dict {
         if reading.is_empty() {
             return Ok(Vec::new());
         }
+        if let Some(store) = &self.store {
+            let base = store.lookup_prefix(reading, "", limit);
+            let joined = reading.join("'");
+            let mut stmt = self.conn.prepare(
+                "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND pinyin = ?1 ORDER BY freq DESC, text ASC",
+            )?;
+            let user_candidates: Vec<Candidate> = stmt
+                .query_map(params![joined], |row| {
+                    Ok(Candidate {
+                        text: row.get(0)?,
+                        pinyin: row.get(1)?,
+                        freq: row.get::<_, i64>(2)? as u64,
+                        ai: false,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut merged: HashMap<String, Candidate> = HashMap::new();
+            for cand in base {
+                merged.entry(cand.text.clone()).or_insert(cand);
+            }
+            for cand in user_candidates {
+                merged.insert(cand.text.clone(), cand);
+            }
+            let mut candidates: Vec<Candidate> = merged.into_values().collect();
+            candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+            candidates.truncate(limit);
+            return Ok(candidates);
+        }
         let joined = reading.join("'");
-        // 等值区间：pinyin 相同的条目在索引中连续；partition_point 定位起点
         let start = self.index.partition_point(|e| e.pinyin < joined);
         let mut candidates = Vec::new();
         for entry in &self.index[start..] {
@@ -231,15 +288,46 @@ impl Dict {
 
     /// 前缀查询：完整音节 `syllables` 后面接未完成的 `tail`，返回 freq 降序前 N 候选。
     ///
-    /// 拼出模式串 = `syllables.join("'")` (+ `'` + tail 当 tail 非空)。
-    /// LIKE 匹配以此开头的 pinyin，附加 `%` 通配后续音节。
-    /// 模式只含 `a-z` 与 `'`；LIKE 通配符仅出现在尾部，无 escape 风险。
+    /// 当 `store` 存在时，先从 FST 获取基底候选词，再从 SQLite `phrase` 表查询 `user = 1`（或高频自学习）的用户词。
+    /// 动态合并：用户词若已在基底中存在，以用户词频覆盖；新词插入；去重后按 `(freq DESC, text ASC)` 排序并截取 `limit`。
+    /// 当 `store` 为 `None` 时，保持原有纯内存 Vec 查询。
     pub fn lookup_prefix(
         &self,
         syllables: &[String],
         tail: &str,
         limit: usize,
     ) -> Result<Vec<Candidate>> {
+        if self.store.is_none() {
+            // 回退到纯内存查询
+            let mut joined = syllables.join("'");
+            if !tail.is_empty() {
+                if !joined.is_empty() {
+                    joined.push('\'');
+                }
+                joined.push_str(tail);
+            }
+            if joined.is_empty() {
+                return Ok(Vec::new());
+            }
+            let upper_bound = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
+            let lower_idx = self.index.partition_point(|e| e.pinyin < joined);
+            let upper_idx = self.index.partition_point(|e| e.pinyin < upper_bound);
+            let slice = &self.index[lower_idx..upper_idx];
+            let mut candidates: Vec<Candidate> = slice
+                .iter()
+                .map(|e| Candidate {
+                    text: e.text.clone(),
+                    pinyin: e.pinyin.clone(),
+                    freq: e.freq as u64,
+                    ai: false,
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+            candidates.truncate(limit);
+            return Ok(candidates);
+        }
+
+        // FST 模式：先从 FST 查询基底候选词
         let mut joined = syllables.join("'");
         if !tail.is_empty() {
             if !joined.is_empty() {
@@ -251,27 +339,36 @@ impl Dict {
             return Ok(Vec::new());
         }
         let upper_bound = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
-        // Find range [lower, upper)
-        let lower_idx = self.index.partition_point(|e| e.pinyin < joined);
-        let upper_idx = self.index.partition_point(|e| e.pinyin < upper_bound);
-        let slice = &self.index[lower_idx..upper_idx];
-        let mut candidates: Vec<Candidate> = slice
-            .iter()
-            .map(|e| Candidate {
-                text: e.text.clone(),
-                pinyin: e.pinyin.clone(),
-                freq: e.freq as u64,
-                ai: false,
-            })
-            .collect();
+        let store = self.store.as_ref().unwrap();
+        let base_candidates = store.lookup_prefix(syllables, tail, limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND pinyin >= ?1 AND pinyin < ?2 ORDER BY freq DESC, text ASC",
+        )?;
+        let user_candidates: Vec<Candidate> = stmt
+            .query_map(params![joined, upper_bound], |row| {
+                Ok(Candidate {
+                    text: row.get(0)?,
+                    pinyin: row.get(1)?,
+                    freq: row.get::<_, i64>(2)? as u64,
+                    ai: false,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        // 合并：用户词覆盖基底词，新词插入，去重
+        let mut merged: HashMap<String, Candidate> = HashMap::new();
+        for cand in base_candidates {
+            merged.entry(cand.text.clone()).or_insert(cand);
+        }
+        for cand in user_candidates {
+            merged.insert(cand.text.clone(), cand);
+        }
+        let mut candidates: Vec<Candidate> = merged.into_values().collect();
         candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
         candidates.truncate(limit);
         Ok(candidates)
     }
 
-    /// 缩写前缀查询：`initials` 是声母序列（"nh"），匹配所有以该串开头的 abbrev。
-    /// 校验：initials 仅允许 a-z；空串 → 空 vec。
-    /// 排序 freq DESC, text ASC，LIMIT 限条。
+    /// 声母缩写查询
     pub fn lookup_abbrev(&self, initials: &str, limit: usize) -> Result<Vec<Candidate>> {
         if initials.is_empty() {
             return Ok(Vec::new());
@@ -279,28 +376,59 @@ impl Dict {
         if !initials.bytes().all(|b| b.is_ascii_lowercase()) {
             return Ok(Vec::new());
         }
-        // 二级索引按 (abbrev ASC, freq DESC, text ASC) 排序——二分定位前缀区间。
-        // abbrev 是纯 a-z，上界 = 前缀末字符 +1（z 由调用方短路）。
-        let lower = self
-            .abbrev_index
-            .partition_point(|e| e.abbrev.as_str() < initials);
-        let upper_char = (initials.as_bytes()[initials.len() - 1] + 1) as char;
-        let upper_prefix = format!("{}{}", &initials[..initials.len() - 1], upper_char);
-        let upper = self
-            .abbrev_index
-            .partition_point(|e| e.abbrev.as_str() < upper_prefix.as_str());
-        let slice = &self.abbrev_index[lower..upper];
-        let mut candidates: Vec<Candidate> = slice
-            .iter()
-            .map(|e| Candidate {
-                text: e.text.clone(),
-                pinyin: e.pinyin.clone(),
-                freq: e.freq as u64,
-                ai: false,
-            })
-            .collect();
-        candidates.truncate(limit);
-        Ok(candidates)
+        if let Some(store) = &self.store {
+            // FST 模式：使用 FST 的 abbrev 索引
+            let candidates = store.lookup_abbrev(initials, limit);
+            // 补充用户词覆盖
+            let mut stmt = self.conn.prepare(
+                "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND abbrev >= ?1 AND abbrev < ?2 ORDER BY freq DESC, text ASC",
+            )?;
+            let upper_char = (initials.as_bytes()[initials.len() - 1] + 1) as char;
+            let upper_prefix = format!("{}{}", &initials[..initials.len() - 1], upper_char);
+            let user_candidates: Vec<Candidate> = stmt
+                .query_map(params![initials, upper_prefix], |row| {
+                    Ok(Candidate {
+                        text: row.get(0)?,
+                        pinyin: row.get(1)?,
+                        freq: row.get::<_, i64>(2)? as u64,
+                        ai: false,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut merged: HashMap<String, Candidate> = HashMap::new();
+            for cand in candidates {
+                merged.entry(cand.text.clone()).or_insert(cand);
+            }
+            for cand in user_candidates {
+                merged.insert(cand.text.clone(), cand);
+            }
+            let mut merged_vec: Vec<Candidate> = merged.into_values().collect();
+            merged_vec.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+            merged_vec.truncate(limit);
+            Ok(merged_vec)
+        } else {
+            // 回退到内存 abbrev_index
+            let lower = self
+                .abbrev_index
+                .partition_point(|e| e.abbrev.as_str() < initials);
+            let upper_char = (initials.as_bytes()[initials.len() - 1] + 1) as char;
+            let upper_prefix = format!("{}{}", &initials[..initials.len() - 1], upper_char);
+            let upper = self
+                .abbrev_index
+                .partition_point(|e| e.abbrev.as_str() < upper_prefix.as_str());
+            let slice = &self.abbrev_index[lower..upper];
+            let mut candidates: Vec<Candidate> = slice
+                .iter()
+                .map(|e| Candidate {
+                    text: e.text.clone(),
+                    pinyin: e.pinyin.clone(),
+                    freq: e.freq as u64,
+                    ai: false,
+                })
+                .collect();
+            candidates.truncate(limit);
+            Ok(candidates)
+        }
     }
 
     /// 用户词前 N：user=1 行按 freq DESC, text ASC（engine 个性化排序用）。
@@ -316,7 +444,6 @@ impl Dict {
                 ai: false,
             })
             .collect();
-        // Apply freq DESC, text ASC ordering and limit
         candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
         candidates.truncate(limit);
         Ok(candidates)
@@ -330,38 +457,40 @@ impl Dict {
         let joined = reading.join("'");
         let abbrev: String = reading.iter().filter_map(|s| s.chars().next()).collect();
         let abbrev = abbrev.to_lowercase();
+        let updated = self.conn.execute(
+            "UPDATE phrase SET freq = freq + 1, user = 1 WHERE pinyin = ?1 AND text = ?2",
+            params![joined, text],
+        )?;
+        if updated == 0 {
+            self.conn.execute(
+                "INSERT INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, 1, ?3, 1)",
+                params![joined, text, abbrev],
+            )?;
+        }
+
+        // 如果处于纯内存索引模式，同步维护内存索引
         if let Some(entry) = self
             .index
             .iter_mut()
             .find(|e| e.pinyin == joined && e.text == text)
         {
-            self.conn.execute(
-                "UPDATE phrase SET freq = freq + 1, user = 1 WHERE pinyin = ?1 AND text = ?2",
-                params![joined, text],
-            )?;
             entry.freq += 1;
             entry.user = 1;
-            return Ok(());
+        } else if self.store.is_none() {
+            let new_entry = IndexEntry {
+                pinyin: joined,
+                text: text.to_string(),
+                freq: 1,
+                abbrev,
+                user: 1,
+            };
+            let pos = self.index.partition_point(|e| e.pinyin < new_entry.pinyin);
+            self.index.insert(pos, new_entry.clone());
+            let apos = self
+                .abbrev_index
+                .partition_point(|e| e.abbrev < new_entry.abbrev);
+            self.abbrev_index.insert(apos, new_entry);
         }
-        // Insert new user word
-        self.conn.execute(
-            "INSERT INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, 1, ?3, 1)",
-            params![joined, text, abbrev],
-        )?;
-        // Insert into memory index and keep sorted
-        let new_entry = IndexEntry {
-            pinyin: joined,
-            text: text.to_string(),
-            freq: 1,
-            abbrev,
-            user: 1,
-        };
-        let pos = self.index.partition_point(|e| e.pinyin < new_entry.pinyin);
-        self.index.insert(pos, new_entry.clone());
-        let apos = self
-            .abbrev_index
-            .partition_point(|e| e.abbrev < new_entry.abbrev);
-        self.abbrev_index.insert(apos, new_entry);
         Ok(())
     }
 }
@@ -558,5 +687,48 @@ mod tests {
         }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn test_fst_store_composite_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dict.sqlite3");
+        let bin_path = dir.path().join("dict.bin");
+        let yaml_path = dir.path().join("test.yaml");
+
+        // 1. 初始化 SQLite 词库并导入基础数据
+        fs::write(&yaml_path, "...\n你好\tni hao\t100\n拟好\tni hao\t50\n").unwrap();
+        let mut seed_dict = Dict::open(&db_path).unwrap();
+        seed_dict.import(&yaml_path).unwrap();
+        drop(seed_dict);
+
+        // 2. 编译出 dict.bin
+        let count = crate::builder::build(&db_path, &bin_path).unwrap();
+        assert_eq!(count, 2);
+
+        // 3. 打开复合 Dict，此时应该自动发现并挂载 FST
+        let mut dict = Dict::open(&db_path).unwrap();
+        assert!(dict.store.is_some(), "应当成功加载 FST store");
+
+        // 初始查询：你好 (100) > 拟好 (50)
+        let init_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
+        assert_eq!(init_hits.len(), 2);
+        assert_eq!(init_hits[0].text, "你好");
+
+        // 4. 用户学习：将拟好调频到高频，并新增未录入生词“妮好”
+        for _ in 0..200 {
+            dict.learn(&["ni".into(), "hao".into()], "拟好").unwrap();
+        }
+        dict.learn(&["ni".into(), "hao".into()], "妮好").unwrap();
+
+        // 5. 复合查询：拟好被用户高频置顶，妮好被作为新词查出
+        let updated_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
+        assert_eq!(updated_hits.len(), 3);
+        assert_eq!(updated_hits[0].text, "拟好");
+        assert!(updated_hits.iter().any(|c| c.text == "妮好"));
+
+        // 6. lookup 精确查询也支持覆盖
+        let exact = dict.lookup(&["ni".into(), "hao".into()], 10).unwrap();
+        assert_eq!(exact[0].text, "拟好");
     }
 }
