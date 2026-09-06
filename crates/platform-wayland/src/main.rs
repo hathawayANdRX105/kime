@@ -58,7 +58,7 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         _registry: &WlRegistry,
         event: RegistryEvent,
         _globals: &GlobalListContents,
-        conn: &Connection,
+        _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
         if let RegistryEvent::Global {

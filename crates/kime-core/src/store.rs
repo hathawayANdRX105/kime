@@ -27,17 +27,30 @@ pub struct FstStore {
 
 impl FstStore {
     pub fn open(bin_path: &Path) -> Result<Self> {
-        let file = File::open(bin_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let file = File::open(bin_path)
+            .with_context(|| format!("打开 FST 词库失败: {}", bin_path.display()))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .with_context(|| format!("mmap FST 词库失败: {}", bin_path.display()))?;
         if mmap.len() < 8 || &mmap[..4] != MAGIC {
-            anyhow::bail!("非法 dict.bin magic");
+            anyhow::bail!(
+                "{} 不是合法的 dict.bin（magic 校验失败）",
+                bin_path.display()
+            );
         }
         let fst_len = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
+        if 8 + fst_len > mmap.len() {
+            anyhow::bail!(
+                "{} 头部声明 fst_len={} 超出文件大小 {}",
+                bin_path.display(),
+                fst_len,
+                mmap.len()
+            );
+        }
         let fst_bytes = &mmap[8..8 + fst_len];
         let values_start = 8 + fst_len;
         let values = mmap[values_start..].to_vec();
 
-        let fst = Set::new(fst_bytes.to_vec())?;
+        let fst = Set::new(fst_bytes.to_vec()).with_context(|| "FST 索引区解析失败")?;
         let keys: Vec<String> = fst.stream().into_strs().unwrap_or_default();
         let mut blocks: Vec<(String, usize)> = Vec::with_capacity(keys.len());
         let mut abbrev_index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -139,20 +152,17 @@ impl FstStore {
 /// 计算前缀的排他上界（末字符 +1）；'z' 结尾返回 None。
 fn increment_prefix(prefix: &str) -> Option<String> {
     let mut chars: Vec<char> = prefix.chars().collect();
-    let last = chars.last()?;
-    if *last == 'z' {
+    let last_idx = chars.len().checked_sub(1)?;
+    let c = chars[last_idx];
+    if c == 'z' {
         return None;
     }
-    let mut new_chars = chars.clone();
-    let last_idx = new_chars.len() - 1;
-    let c = new_chars[last_idx];
-    if c == '\'' {
-        new_chars[last_idx] = 'a';
+    chars[last_idx] = if c == '\'' {
+        'a'
     } else {
-        let next = (c as u32) + 1;
-        new_chars[last_idx] = char::from_u32(next).unwrap_or(c);
-    }
-    Some(new_chars.into_iter().collect())
+        char::from_u32(c as u32 + 1).unwrap_or(c)
+    };
+    Some(chars.into_iter().collect())
 }
 
 /// 解码 values 区一个块为候选词列表。
