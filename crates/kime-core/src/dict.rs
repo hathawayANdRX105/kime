@@ -84,12 +84,11 @@ fn increment_prefix(prefix: &str) -> Option<String> {
 impl Dict {
     /// Helper to compute binary dict path alongside DB path
     fn dict_bin_path(db_path: &Path) -> PathBuf {
-        let parent = if db_path.is_absolute() {
-            db_path.parent().unwrap_or_else(|| Path::new(""))
-        } else {
-            Path::new(".")
-        };
-        parent.join("dict.bin")
+        db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("dict.bin")
     }
 
     /// 打开；不存在则建 schema + 索引
@@ -118,7 +117,10 @@ impl Dict {
                     store = Some(s);
                 }
                 Err(e) => {
-                    eprintln!("FST load failed {:?}, falling back to SQLite index", e);
+                    eprintln!(
+                        "[kime] 警告：FST 词库 {} 加载失败 ({e})，回退到 SQLite 内存索引（启动更慢、更占内存）",
+                        bin_path.display()
+                    );
                 }
             }
         }
@@ -468,7 +470,8 @@ impl Dict {
             )?;
         }
 
-        // 如果处于纯内存索引模式，同步维护内存索引
+        // FST 模式下 dict.bin 只读，用户词只落 SQLite，由 lookup 时合并 overlay；
+        // 内存索引仅在纯 SQLite 模式下需要同步（此时它就是查询数据源）。
         if let Some(entry) = self
             .index
             .iter_mut()
