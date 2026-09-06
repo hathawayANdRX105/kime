@@ -12,3 +12,5 @@ cosmic-text = "0.19.0"
 fontdb = "0.24"
 xkbcommon = "0.9"
 libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+serde_json = "1.0"

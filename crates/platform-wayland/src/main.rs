@@ -4,7 +4,15 @@
 //! 退出：Esc 按下
 
 use std::env;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
+use kime_core::config::Config;
+use kime_core::dict::Dict;
+use kime_core::llm::{Debouncer, LlmClient};
+use kime_core::{Engine, Key, Outcome};
+use platform_wayland::tray::TrayIconManager;
+use platform_wayland::window::CandidateWindow;
+use platform_wayland::Candidate as UiCandidate;
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
@@ -21,14 +29,54 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2::{Event as ZwpInputMethodEvent, ZwpInputMethodV2},
 };
 
-use kime_core::dict::Dict;
-use kime_core::{config::Config, Engine, Key, Outcome};
-use platform_wayland::tray::TrayIconManager;
-use platform_wayland::window::CandidateWindow;
-use platform_wayland::Candidate as UiCandidate;
-
 fn log(msg: &str) {
     eprintln!("[zwp-spike] {}", msg);
+}
+
+/// LLM 异步工作线程
+struct LlmWorker {
+    runtime: tokio::runtime::Runtime,
+    client: LlmClient,
+    debouncer: Debouncer,
+    result_sender: Sender<Vec<kime_core::dict::Candidate>>,
+}
+
+impl LlmWorker {
+    fn new(
+        endpoint: String,
+        model: String,
+        result_sender: Sender<Vec<kime_core::dict::Candidate>>,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("Failed to build tokio runtime");
+        let client = LlmClient::new(endpoint, model);
+        let debouncer = Debouncer::new(std::time::Duration::from_millis(200));
+        Self {
+            runtime,
+            client,
+            debouncer,
+            result_sender,
+        }
+    }
+
+    fn request(&self, syllables: Vec<String>) {
+        let client = &self.client;
+        let debouncer = &self.debouncer;
+        let sender = self.result_sender.clone();
+        self.runtime.spawn(async move {
+            if debouncer.should_fire().await {
+                match client.request_async(syllables).await {
+                    Ok(candidates) => {
+                        let _ = sender.send(candidates);
+                    }
+                    Err(e) => log(&format!("LLM error: {}", e)),
+                }
+            }
+        });
+    }
 }
 
 struct AppState {
@@ -39,6 +87,8 @@ struct AppState {
     should_exit: bool,
     im_serial: u32,
     tray: TrayIconManager,
+    llm_worker: Option<LlmWorker>,
+    llm_receiver: Option<Receiver<Vec<kime_core::dict::Candidate>>>,
 }
 
 impl AppState {
@@ -51,6 +101,19 @@ impl AppState {
             should_exit: false,
             im_serial: 0,
             tray: TrayIconManager::new(true),
+            llm_worker: None,
+            llm_receiver: None,
+        }
+    }
+
+    /// 检查并处理 LLM 异步结果
+    fn try_recv_llm(&mut self) {
+        if let Some(receiver) = &self.llm_receiver {
+            if let Ok(candidates) = receiver.try_recv() {
+                if let Some(engine) = &mut self.engine {
+                    engine.merge_ai(candidates);
+                }
+            }
         }
     }
 }
@@ -61,7 +124,8 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         _registry: &WlRegistry,
         event: RegistryEvent,
         _globals: &GlobalListContents,
-        _conn: &Connection,
+        _data: &(),
+        _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
         if let RegistryEvent::Global {
@@ -72,8 +136,9 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         {
             log(&format!("Global: {} v{} ({})", name, version, interface));
             if interface == "zwp_input_method_manager_v2" && version >= 1 {
-                let mgr =
-                    _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, qh, ()) as _;
+                let mgr = _registry
+                    .bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, qh, ())
+                    as _;
                 state.input_method_manager = Some(mgr);
                 log(&format!("bound input method manager name={}", name));
             }
@@ -87,6 +152,7 @@ impl Dispatch<WlRegistry, ()> for AppState {
         _registry: &WlRegistry,
         _event: <WlRegistry as Proxy>::Event,
         _: &(),
+        _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -98,6 +164,7 @@ impl Dispatch<ZwpInputMethodManagerV2, ()> for AppState {
         _state: &mut Self,
         _mgr: &ZwpInputMethodManagerV2,
         _event: <ZwpInputMethodManagerV2 as Proxy>::Event,
+        _: &(),
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
@@ -111,8 +178,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
         im: &ZwpInputMethodV2,
         event: ZwpInputMethodEvent,
         _: &(),
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &Connection,
+        _qh: &QueueHandle<Self>,
     ) {
         match event {
             ZwpInputMethodEvent::Activate => {
@@ -126,28 +193,23 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 } else {
                     log("failed to initialize dictionary");
                 }
-                let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(qh, ()) as _;
+                let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(_qh, ()) as _;
                 log("grab_keyboard requested");
-                // 使用 input-popup-surface 创建候选窗
-                match CandidateWindow::new_popup(conn, im) {
-                    Ok(window) => {
-                        log("创建 popup 候选窗成功");
-                        state.window = Some(window);
-                    }
-                    Err(e) => {
-                        log(&format!("创建 popup 候选窗失败: {}", e));
-                    }
-                }
+                // Initialize LLM worker
+                let (tx, rx) = channel();
+                state.llm_worker = Some(LlmWorker::new(
+                    config.ai_endpoint.unwrap_or_default(),
+                    "test-model".to_string(),
+                    tx,
+                ));
+                state.llm_receiver = Some(rx);
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
                 state.input_method = None;
                 state.engine = None;
-                // 隐藏 popup 候选窗
-                if let Some(win) = &mut state.window {
-                    let _ = win.hide();
-                }
-                state.window = None;
+                state.llm_worker = None;
+                state.llm_receiver = None;
             }
             ZwpInputMethodEvent::Done { .. } => {
                 state.im_serial += 1;
@@ -224,8 +286,13 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                                 if ui.is_empty() {
                                     let _ = win.hide();
                                 } else {
-                                    let _ = win.show(&ui, engine.highlight(), engine.preedit());
+                                    let _ =
+                                        win.show(&ui, engine.highlight(), engine.preedit());
                                 }
+                            }
+                            // 触发 LLM 请求
+                            if let Some(worker) = &state.llm_worker {
+                                worker.request(engine.preedit().split("'").map(String::from).collect());
                             }
                         }
                         Outcome::Commit(text) => {
@@ -242,6 +309,8 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                             log("engine ignored (passthrough)");
                         }
                     }
+                    // 尝试接收 LLM 结果
+                    state.try_recv_llm();
                 }
             }
             _ => {}
@@ -292,7 +361,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ];
         win.show(&ui, 0, "nihao")?;
-        std::thread::sleep(std::time::Duration::from_secs(9));
+        std::thread::sleep(std::time::Duration::from_secs(9))?;
         win.hide()?;
         return Ok(());
     }
