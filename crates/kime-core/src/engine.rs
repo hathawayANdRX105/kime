@@ -66,6 +66,8 @@ pub struct Engine {
     last_reading: Vec<String>,
     /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
     preedit: String,
+    /// 当前标点模式（中文全角 / 英文原样）
+    punct_mode: crate::config::PunctMode,
 }
 impl Engine {
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -78,6 +80,7 @@ impl Engine {
     }
 
     pub fn new(dict: Dict, config: Config) -> Self {
+        let punct_mode = config.punct_mode;
         let shuangpin = config.shuangpin;
         let mut fuzzy_map = std::collections::HashMap::new();
         for entry in &config.fuzzy {
@@ -99,6 +102,7 @@ impl Engine {
             preedit: String::new(),
             page_index: 0,
             fuzzy_map,
+            punct_mode,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -239,9 +243,21 @@ impl Engine {
             }
             return Outcome::Ignored;
         }
+        // Ctrl+. 切换标点模式（中文全角 ↔ 英文原样）
+        if k.ctrl && !k.alt && k.ch == Some('.') {
+            self.punct_mode = match self.punct_mode {
+                crate::config::PunctMode::Chinese => crate::config::PunctMode::English,
+                crate::config::PunctMode::English => crate::config::PunctMode::Chinese,
+            };
+            return Outcome::Consumed;
+        }
         // 标点处理：仅中文模式且有映射时生效
         if let Some(c) = k.ch {
             if let Some(mapped) = punct::map_punct(c) {
+                // 英文标点模式：不转换，原样输出
+                if self.punct_mode == crate::config::PunctMode::English {
+                    return Outcome::Commit(c.to_string());
+                }
                 if self.letters.is_empty() {
                     // 情况 A：无预编辑串，直接上屏标点
                     return Outcome::Commit(mapped.to_string());
@@ -1246,6 +1262,35 @@ mod tests {
             Outcome::Commit(text) => assert_eq!(text, "词19"),
             other => panic!("expected Commit(词19), got {:?}", other),
         }
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn ctrl_dot_toggles_punct_mode() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        // 默认中文标点模式
+        assert!(matches!(e.punct_mode, crate::config::PunctMode::Chinese));
+        // Ctrl+. 切换到英文
+        let outcome = e.key(Key { ch: Some('.'), code: 0, shift: false, ctrl: true, alt: false });
+        assert_eq!(outcome, Outcome::Consumed);
+        assert!(matches!(e.punct_mode, crate::config::PunctMode::English));
+        // 再按回来
+        let outcome = e.key(Key { ch: Some('.'), code: 0, shift: false, ctrl: true, alt: false });
+        assert_eq!(outcome, Outcome::Consumed);
+        assert!(matches!(e.punct_mode, crate::config::PunctMode::Chinese));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn english_punct_passes_through() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        // 切换到英文标点模式
+        e.punct_mode = crate::config::PunctMode::English;
+        // 输入逗号 → 应原样输出 "," 而非 "，"
+        let outcome = e.key(Key { ch: Some(','), code: 0, shift: false, ctrl: false, alt: false });
+        assert_eq!(outcome, Outcome::Commit(",".to_string()));
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
