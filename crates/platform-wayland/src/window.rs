@@ -11,7 +11,7 @@ use wayland_client::{
         wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_shm, wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
     },
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2;
@@ -46,7 +46,6 @@ struct WinState {
 }
 
 pub struct CandidateWindow {
-    conn: Connection,
     queue: EventQueue<WinState>,
     qh: QueueHandle<WinState>,
     state: WinState,
@@ -119,7 +118,6 @@ impl CandidateWindow {
         }
 
         Ok(Self {
-            conn,
             queue,
             qh,
             state,
@@ -188,15 +186,13 @@ impl CandidateWindow {
         // 直接设置角色，无需 configure 握手
         surface.commit();
 
-        let mut renderer = Renderer::new();
-        // 初始化缓冲区（与 layer-shell 路径共享逻辑）
+        let renderer = Renderer::new();
+        // 初始化缓冲区（与 layer-shell 路径共享 create_buffer，保证 buffer/mmap 同源）
         let (w, h) = (WIDTH as usize, HEIGHT as usize);
         let shm = state.shm.as_ref().unwrap();
-        let buffer = Self::ensure_buffer_static(shm, &qh, w, h)?;
-        let map = Self::ensure_mmap_static(&buffer, w, h)?;
+        let (buffer, map) = Self::create_buffer(shm, &qh, w, h)?;
 
         Ok(Self {
-            conn: conn.clone(),
             queue,
             qh,
             state,
@@ -363,59 +359,21 @@ impl CandidateWindow {
         if self.buffer.is_some() {
             return Ok(());
         }
-        let size = w * h * 4;
-        let fd = unsafe {
-            libc::memfd_create(
-                b"kime-candidates\0".as_ptr() as *const i8,
-                libc::MFD_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err("memfd_create failed".into());
-        }
-        if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
-            return Err("ftruncate failed".into());
-        }
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err("mmap failed".into());
-        }
-        let map_ptr = ptr as *mut u8;
-        let shm = self.state.shm.as_ref().unwrap();
-        let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-        let pool = shm.create_pool(fd_borrowed, size as i32, &self.qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            w as i32,
-            h as i32,
-            (w * 4) as i32,
-            wl_shm::Format::Argb8888, // dwl 系广泛支持
-            &self.qh,
-            (),
-        );
+        let shm = self.state.shm.as_ref().ok_or("shm 未暴露")?;
+        let (buffer, map) = Self::create_buffer(shm, &self.qh, w, h)?;
         self.buffer = Some(buffer);
-        self.map = Some((fd, map_ptr, size));
+        self.map = Some(map);
         Ok(())
     }
-}
 
-// 静态辅助函数：用于 new_popup 路径（不需要 self）
-impl CandidateWindow {
-    fn ensure_buffer_static(
+    /// 建一块 shm 缓冲：**buffer 与返回的 mmap 指针必须指向同一个 memfd**，
+    /// 否则渲染写入的像素合成器永远读不到。
+    fn create_buffer(
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<WinState>,
         w: usize,
         h: usize,
-    ) -> Result<WlBuffer, Box<dyn std::error::Error>> {
+    ) -> Result<(WlBuffer, (i32, *mut u8, usize)), Box<dyn std::error::Error>> {
         let size = w * h * 4;
         let fd = unsafe {
             libc::memfd_create(
@@ -427,6 +385,7 @@ impl CandidateWindow {
             return Err("memfd_create failed".into());
         }
         if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
+            unsafe { libc::close(fd) };
             return Err("ftruncate failed".into());
         }
         let ptr = unsafe {
@@ -440,9 +399,9 @@ impl CandidateWindow {
             )
         };
         if ptr == libc::MAP_FAILED {
+            unsafe { libc::close(fd) };
             return Err("mmap failed".into());
         }
-        let map_ptr = ptr as *mut u8;
         let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         let pool = shm.create_pool(fd_borrowed, size as i32, qh, ());
         let buffer = pool.create_buffer(
@@ -450,46 +409,11 @@ impl CandidateWindow {
             w as i32,
             h as i32,
             (w * 4) as i32,
-            wl_shm::Format::Argb8888,
+            wl_shm::Format::Argb8888, // dwl 系广泛支持
             qh,
             (),
         );
-        Ok(buffer)
-    }
-
-    fn ensure_mmap_static(
-        buffer: &WlBuffer,
-        w: usize,
-        h: usize,
-    ) -> Result<(i32, *mut u8, usize), Box<dyn std::error::Error>> {
-        let size = w * h * 4;
-        // 创建新的 memfd 用于 mmap（因为 WlBuffer 不暴露 pool fd）
-        let fd = unsafe {
-            libc::memfd_create(
-                b"kime-candidates-map\0".as_ptr() as *const i8,
-                libc::MFD_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err("memfd_create failed".into());
-        }
-        if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
-            return Err("ftruncate failed".into());
-        }
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err("mmap failed".into());
-        }
-        Ok((fd, ptr as *mut u8, size))
+        Ok((buffer, (fd, ptr as *mut u8, size)))
     }
 }
 
@@ -507,7 +431,7 @@ impl Dispatch<wayland_client::protocol::wl_registry::WlRegistry, GlobalListConte
 
 impl Dispatch<wl_shm::WlShm, ()> for WinState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _shm: &wl_shm::WlShm,
         _event: <wl_shm::WlShm as Proxy>::Event,
         _data: &(),
@@ -519,7 +443,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WinState {
 
 impl Dispatch<WlShmPool, ()> for WinState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _pool: &WlShmPool,
         _event: <WlShmPool as Proxy>::Event,
         _data: &(),
@@ -555,7 +479,7 @@ impl Dispatch<WlSurface, ()> for WinState {
 
 impl Dispatch<WlBuffer, ()> for WinState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _buffer: &WlBuffer,
         _event: <WlBuffer as Proxy>::Event,
         _data: &(),
@@ -567,7 +491,7 @@ impl Dispatch<WlBuffer, ()> for WinState {
 
 impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WinState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         _event: <zwlr_layer_shell_v1::ZwlrLayerShellV1 as Proxy>::Event,
         _data: &(),
@@ -603,26 +527,15 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WinState {
 
 impl Dispatch<ZwpInputPopupSurfaceV2, ()> for WinState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _surface: &ZwpInputPopupSurfaceV2,
-        event: <ZwpInputPopupSurfaceV2 as Proxy>::Event,
+        _event: <ZwpInputPopupSurfaceV2 as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::Event as PopupEvent;
-        match event {
-            PopupEvent::TextInputRectangle {
-                x: _,
-                y: _,
-                width: _,
-                height: _,
-            } => {
-                // Store rectangle for potential future use
-                // TODO: use this for positioning if needed
-            }
-            _ => {}
-        }
+        // input-popup-surface 的定位由合成器负责，TextInputRectangle 仅作通知，
+        // 我们无需据此摆放窗口，故此 Dispatch 无副作用。
     }
 }
 

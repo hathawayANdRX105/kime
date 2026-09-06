@@ -29,13 +29,6 @@ use crate::dict::Candidate;
 pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
     let conn = Connection::open(dict_sqlite)
         .with_context(|| format!("打开 SQLite 失败: {}", dict_sqlite.display()))?;
-    let tables: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
     let mut stmt = conn.prepare(
         "SELECT pinyin, text, freq FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC",
     )?;

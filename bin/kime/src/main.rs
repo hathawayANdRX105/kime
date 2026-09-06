@@ -8,7 +8,7 @@
 //! build-dict：把 SQLite 词库编译成 FST 二进制词库。
 
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kime_core::builder::build;
@@ -17,14 +17,11 @@ use kime_core::dict::Dict;
 use kime_core::{Engine, Key, Outcome};
 use kime_shuangpin::Scheme;
 
-const KEY_SPACE: u32 = 57;
-
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
     let mut dict_path: Option<PathBuf> = None;
     let mut import_path: Option<PathBuf> = None;
     let mut shuangpin: Option<Scheme> = None;
-    let mut args_iter = args.peekable();
+    let mut args_iter = std::env::args().skip(1).peekable();
     let action = args_iter.next();
 
     while let Some(arg) = args_iter.next() {
