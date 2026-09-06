@@ -330,8 +330,7 @@ impl Engine {
 
         // 全拼模式（原有逻辑 + abbrev 兜底）
         let segs = segment(&self.letters);
-        let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.into_iter().next()
-        {
+        let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.first().cloned() {
             let mut r = reading;
             let tail = r.pop().unwrap_or_default();
             (r, tail)
@@ -400,6 +399,16 @@ impl Engine {
                 cands = ab;
             }
             self.last_reading.clear();
+        }
+        // 句级联想（M8/Task 5）：如果有完整音节切分且长度 >= 2，尝试通过 Viterbi 构词成句
+        if let Some(full_reading) = segs.first() {
+            if full_reading.len() >= 2 {
+                if let Some(sentence) = crate::lattice::viterbi_sentence(&self.dict, full_reading) {
+                    if !cands.iter().any(|c| c.text == sentence.text) {
+                        cands.insert(0, sentence);
+                    }
+                }
+            }
         }
 
         self.candidates = cands;
@@ -1077,6 +1086,43 @@ mod tests {
         }
         let count = e.candidates().iter().filter(|c| c.text == "泥").count();
         assert_eq!(count, 1, "去重：同一文本只出现一次");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn test_viterbi_sentence_first_candidate() {
+        let db = tmp_db("viterbi_engine");
+        let yaml = std::env::temp_dir().join("kime_viterbi_engine.yaml");
+        std::fs::write(
+            &yaml,
+            "---\n...\n你好\tni hao\t5000\n世界\tshi jie\t4000\n你\tni\t1000\n好\thao\t1000\n",
+        )
+        .unwrap();
+        let mut dict = Dict::open(&db).unwrap();
+        dict.import(&yaml).unwrap();
+        let mut e = Engine::new(dict, Config::default());
+
+        for c in "nihaoshijie".chars() {
+            e.key(k(c));
+        }
+        let cands = e.candidates();
+        assert!(!cands.is_empty());
+        // 第一候选应当是由 Viterbi 最优路径合成的连贯整句「你好世界」
+        assert_eq!(cands[0].text, "你好世界");
+
+        // 空格直接上屏整句
+        let outcome = e.key(Key {
+            ch: None,
+            code: KEY_SPACE,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        match outcome {
+            Outcome::Commit(text) => assert_eq!(text, "你好世界"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
