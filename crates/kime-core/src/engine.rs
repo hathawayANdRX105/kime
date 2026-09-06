@@ -24,8 +24,8 @@ const KEY_EQUAL: u32 = 13;
 const KEY_LEFTBRACE: u32 = 26;
 const KEY_RIGHTBRACE: u32 = 27;
 
-/// 每页候选数
-const PAGE_SIZE: usize = 10;
+/// 默认每页候选数（config.page_size = 0 时生效）
+const DEFAULT_PAGE_SIZE: usize = 10;
 
 /// 平台无关最小按键。壳负责从 wayland / TSF / IMKit 换算进来。
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +68,15 @@ pub struct Engine {
     preedit: String,
 }
 impl Engine {
+    /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
+    fn page_size(&self) -> usize {
+        if self.config.page_size > 0 {
+            self.config.page_size
+        } else {
+            DEFAULT_PAGE_SIZE
+        }
+    }
+
     pub fn new(dict: Dict, config: Config) -> Self {
         let shuangpin = config.shuangpin;
         let mut fuzzy_map = std::collections::HashMap::new();
@@ -104,12 +113,12 @@ impl Engine {
 
     /// (当前页, 页大小) — 候选窗布局用
     pub fn page(&self) -> (usize, usize) {
-        (self.page_index, PAGE_SIZE)
+        (self.page_index, self.page_size())
     }
 
     /// 当前页首候选的全局索引（候选窗反色渲染用）
     pub fn highlight(&self) -> usize {
-        self.page_index * PAGE_SIZE
+        self.page_index * self.page_size()
     }
 
     /// 当前读音的全部候选（内部 cap ~50，freq 降序）
@@ -159,7 +168,9 @@ impl Engine {
             return Outcome::Consumed;
         }
 
-        // 翻页：-/LEFTBRACE 上一页，=/RIGHTBRACE 下一页（无候选 Ignored，越界钳位）
+        // 翻页：
+        //   功能码路径：- / [ 上一页，= / ] 下一页（ch 为 None 时走这里）
+        //   字符路径：- 上一页，+ / = 下一页（ch 非 None 时走这里）
         if k.ch.is_none()
             && matches!(
                 k.code,
@@ -169,7 +180,7 @@ impl Engine {
             if self.candidates.is_empty() {
                 return Outcome::Ignored;
             }
-            let total_pages = self.candidates.len().div_ceil(PAGE_SIZE);
+            let total_pages = self.candidates.len().div_ceil(self.page_size());
             match k.code {
                 KEY_MINUS | KEY_LEFTBRACE => {
                     self.page_index = self.page_index.saturating_sub(1);
@@ -179,6 +190,39 @@ impl Engine {
                 }
             }
             return Outcome::Consumed;
+        }
+        // 字符路径翻页（+ / = 下一页，- 上一页）—— 在中文模式下拦截这些键
+        if !self.candidates.is_empty() {
+            if let Some('+') | Some('=') = k.ch {
+                if !k.ctrl && !k.alt {
+                    let total_pages = self.candidates.len().div_ceil(self.page_size());
+                    self.page_index = (self.page_index + 1).min(total_pages - 1);
+                    return Outcome::Consumed;
+                }
+            }
+            if let Some('-') = k.ch {
+                if !k.ctrl && !k.alt && !k.shift {
+                    let total_pages = self.candidates.len().div_ceil(self.page_size());
+                    self.page_index = self.page_index.saturating_sub(1);
+                    return Outcome::Consumed;
+                }
+            }
+        }
+
+        // Ctrl+f / Ctrl+b 翻页（Emacs 风格，无候选 Ignored，越界钳位）
+        if k.ctrl && !k.alt && !k.shift && !self.candidates.is_empty() {
+            let total_pages = self.candidates.len().div_ceil(self.page_size());
+            match k.ch {
+                Some('f') | Some('n') => {
+                    self.page_index = (self.page_index + 1).min(total_pages - 1);
+                    return Outcome::Consumed;
+                }
+                Some('b') | Some('p') => {
+                    self.page_index = self.page_index.saturating_sub(1);
+                    return Outcome::Consumed;
+                }
+                _ => {}
+            }
         }
 
         // Space — 无候选时放行；有候选时上屏首选并清空。
@@ -238,7 +282,7 @@ impl Engine {
             // 数字 1-9：当前页内选词（全局索引 = 页*10 + 数字-1）。
             if let Some(d) = c.to_digit(10) {
                 if (1..=9).contains(&d) {
-                    let idx = self.page_index * PAGE_SIZE + (d - 1) as usize;
+                    let idx = self.page_index * self.page_size() + (d - 1) as usize;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
                         self.learn_or_warn(&text);
@@ -303,7 +347,7 @@ impl Engine {
                         self.preedit = syllables.join("");
                         self.candidates = self
                             .dict
-                            .lookup_prefix(&syllables, "", 50)
+                            .lookup_prefix(&syllables, "", self.config.candidate_limit)
                             .unwrap_or_default();
                     }
                     Err(_) => {
@@ -323,7 +367,7 @@ impl Engine {
                         self.preedit = format!("{}{}", syllables.join(""), tail);
                         self.candidates = self
                             .dict
-                            .lookup_prefix(&syllables, tail, 50)
+                            .lookup_prefix(&syllables, tail, self.config.candidate_limit)
                             .unwrap_or_default();
                     }
                     Err(_) => {
@@ -363,7 +407,7 @@ impl Engine {
         // 主路径查询
         let mut cands: Vec<Candidate> = self
             .dict
-            .lookup_prefix(&reading, &tail, 50)
+            .lookup_prefix(&reading, &tail, self.config.candidate_limit)
             .unwrap_or_default();
 
         // 模糊音变体：对完整音节与尾部半截串做「首（声母）/尾（韵母）替换」，
@@ -375,7 +419,10 @@ impl Engine {
                                 tail: &str,
                                 seen: &mut std::collections::HashSet<String>,
                                 cands: &mut Vec<Candidate>| {
-                if let Ok(mut vc) = self.dict.lookup_prefix(reading, tail, 50) {
+                if let Ok(mut vc) =
+                    self.dict
+                        .lookup_prefix(reading, tail, self.config.candidate_limit)
+                {
                     vc.retain(|c| seen.insert(c.text.clone()));
                     cands.extend(vc);
                 }
@@ -386,7 +433,7 @@ impl Engine {
                     let mut variant = reading.clone();
                     variant[i] = v;
                     push_variant(&variant, &tail, &mut seen, &mut cands);
-                    if cands.len() >= 50 {
+                    if cands.len() >= self.config.candidate_limit {
                         break;
                     }
                 }
@@ -394,16 +441,19 @@ impl Engine {
             // 尾部（半截或完整）变体
             for v in fuzzy_expand(&self.fuzzy_map, &tail) {
                 push_variant(&reading, &v, &mut seen, &mut cands);
-                if cands.len() >= 50 {
+                if cands.len() >= self.config.candidate_limit {
                     break;
                 }
             }
-            cands.truncate(50);
+            cands.truncate(self.config.candidate_limit);
         }
 
         // 若主路径与模糊路径都无候选，回退到缩写查询
         if cands.is_empty() {
-            if let Ok(ab) = self.dict.lookup_abbrev(&self.letters, 50) {
+            if let Ok(ab) = self
+                .dict
+                .lookup_abbrev(&self.letters, self.config.candidate_limit)
+            {
                 cands = ab;
             }
             self.last_reading.clear();
@@ -494,7 +544,11 @@ mod tests {
         drop(conn);
         // dict connection is stale now; reopen for lookups.
         let dict = Dict::open(&db).expect("reopen dict for lookups");
-        let engine = Engine::new(dict, Config::default());
+        let config = Config {
+            shuangpin: None,
+            ..Config::default()
+        };
+        let engine = Engine::new(dict, config);
         (engine, db, yaml)
     }
 
@@ -1020,6 +1074,7 @@ mod tests {
         let mut dict = Dict::open(&db).unwrap();
         dict.import(&yaml).unwrap();
         let cfg = Config {
+            shuangpin: None,
             fuzzy: vec!["n=l".to_string()],
             ..Config::default()
         };
@@ -1042,6 +1097,7 @@ mod tests {
         let mut dict = Dict::open(&db).unwrap();
         dict.import(&yaml).unwrap();
         let cfg = Config {
+            shuangpin: None,
             fuzzy: vec!["an=ang".to_string()],
             ..Config::default()
         };
@@ -1064,6 +1120,7 @@ mod tests {
         let mut dict = Dict::open(&db).unwrap();
         dict.import(&yaml).unwrap();
         let cfg = Config {
+            shuangpin: None,
             fuzzy: vec!["xyz".to_string(), "=x".to_string(), "x=".to_string()],
             ..Config::default()
         };
@@ -1085,6 +1142,7 @@ mod tests {
         let mut dict = Dict::open(&db).unwrap();
         dict.import(&yaml).unwrap();
         let cfg = Config {
+            shuangpin: None,
             fuzzy: vec!["n=l".to_string()],
             ..Config::default()
         };
@@ -1109,8 +1167,11 @@ mod tests {
         .unwrap();
         let mut dict = Dict::open(&db).unwrap();
         dict.import(&yaml).unwrap();
-        let mut e = Engine::new(dict, Config::default());
-
+        let cfg = Config {
+            shuangpin: None,
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
         for c in "nihaoshijie".chars() {
             e.key(k(c));
         }

@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 kime-core = { path = "../../crates/kime-core" }
 kime-shuangpin = { path = "../../crates/kime-shuangpin" }
+toml = "0.8"
