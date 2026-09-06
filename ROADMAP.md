@@ -61,9 +61,15 @@
 - [x] CLI `build-dict` 子命令：单条命令完成词库编译
 - [x] 持久化基准测试：`cargo bench --bench kime_bench`
 
-## M8 — 体验打磨（规划中）
+## M8 — 日常体验完善与分词进阶 ✅ 2026-09-06
 
-- [ ] TOML 配置文件解析（`~/.config/kime/config.toml` 真读盘）
-- [ ] 用户词覆盖层（SQLite user overlay 与只读 dict.bin 运行时合并）
-- [ ] 整句联想（基于 FST 连续切片的初级 Viterbi）
-- [ ] XIM 协议前端（彻底解决微信等 XWayland 应用的光标对齐问题）
+- [x] 中文标点符号映射与顶字上屏（`punct.rs`，全角符号自动转换与 preedit 顶字）
+- [x] TOML 配置文件解析与初始化（`~/.config/kime/config.toml`，自动生成与容错降级）
+- [x] FST 复合存储与用户词 SQLite Overlay（42MB mmap 只读基底 + 本地生词/提频动态合并）
+- [x] 候选窗主题样式与自适应紧凑尺寸（高对比度细边框，动态高度计算）
+- [x] 句级 Word Lattice 构建与轻量 Viterbi 动态规划联想（第一候选输出长句）
+
+## M9 — 进阶规划
+
+- [ ] XIM 协议前端（解决部分老旧 XWayland 应用的光标对齐问题）
+- [ ] 多模式输入（支持中英混合与自定义快捷短语管理）
