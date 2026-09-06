@@ -32,6 +32,7 @@ pub mod config;
 pub mod dict;
 pub mod engine;
 pub mod lattice;
+pub mod llm;
 pub mod predict;
 pub mod punct;
 pub mod store;
