@@ -24,6 +24,20 @@ pub struct Config {
     /// 单页最大候选数（默认 50，限制查询返回上限）
     #[serde(default = "default_candidate_limit")]
     pub candidate_limit: usize,
+    /// 标点模式：chinese = 全角中文标点，english = 原样 ASCII 标点
+    #[serde(default = "default_punct_mode")]
+    pub punct_mode: PunctMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PunctMode {
+    Chinese,
+    English,
+}
+
+fn default_punct_mode() -> PunctMode {
+    PunctMode::Chinese
 }
 
 fn default_page_size() -> usize {
@@ -47,11 +61,21 @@ impl Default for Config {
             dict_bin_path: None,
             page_size: 10,
             candidate_limit: 50,
+            punct_mode: PunctMode::Chinese,
         }
     }
 }
 
 impl Config {
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let toml_str = toml::to_string_pretty(self).map_err(|e| format!("序列化失败: {}", e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        }
+        std::fs::write(path, toml_str).map_err(|e| format!("写入失败: {}", e))?;
+        Ok(())
+    }
+
     pub fn load() -> Self {
         if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
             return Self::load_from_path(Path::new(&p));
