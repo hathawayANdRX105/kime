@@ -279,10 +279,12 @@ impl Engine {
                 self.refresh_candidates();
                 return Outcome::Consumed;
             }
-            // 数字 1-9：当前页内选词（全局索引 = 页*10 + 数字-1）。
+            // 数字 0-9：当前页内选词（0 选第 10 个，1-9 选第 1-9 个）
             if let Some(d) = c.to_digit(10) {
-                if (1..=9).contains(&d) {
-                    let idx = self.page_index * self.page_size() + (d - 1) as usize;
+                let digit = d as usize;
+                if digit == 0 || (1..=9).contains(&digit) {
+                    let offset = if digit == 0 { 9 } else { digit - 1 };
+                    let idx = self.page_index * self.page_size() + offset;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
                         self.learn_or_warn(&text);
@@ -296,6 +298,20 @@ impl Engine {
                     return Outcome::Ignored;
                 }
             }
+        }
+
+        // Enter（code 28）— 有预编辑串时原样上屏（不转中文），方便英文/网址
+        if k.ch.is_none() && k.code == 28 {
+            if !self.letters.is_empty() {
+                let text = self.letters.clone();
+                self.letters.clear();
+                self.candidates.clear();
+                self.last_reading.clear();
+                self.preedit.clear();
+                self.page_index = 0;
+                return Outcome::Commit(text);
+            }
+            return Outcome::Ignored;
         }
 
         // 其它（标点、功能键等）→ 放行给宿主。
@@ -1191,6 +1207,44 @@ mod tests {
         match outcome {
             Outcome::Commit(text) => assert_eq!(text, "你好世界"),
             other => panic!("expected Commit, got {:?}", other),
+        }
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn enter_commits_raw_preedit_without_conversion() {
+        // 输入 "nihao" 后按 Enter → 应原样上屏 "nihao"（不转中文）
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        assert_eq!(e.preedit(), "nihao");
+        let outcome = e.key(Key { ch: None, code: 28, shift: false, ctrl: false, alt: false });
+        assert_eq!(outcome, Outcome::Commit("nihao".to_string()));
+        assert!(e.preedit().is_empty());
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn digit_0_selects_tenth_candidate() {
+        // 构造 12 个候选，翻到第 1 页后按 0 → 选第 10 个（全局索引 9）
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let cfg = Config { page_size: 10, shuangpin: None, ..Config::default() };
+        let mut e = Engine::new(dict, cfg);
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        // 翻到第 2 页
+        e.key(code_k(KEY_EQUAL));
+        assert_eq!(e.page().0, 1);
+        // 按 0 → 选第 10 个候选（全局索引 1*10 + 9 = 19）
+        let outcome = e.key(k('0'));
+        match outcome {
+            Outcome::Commit(text) => assert_eq!(text, "词19"),
+            other => panic!("expected Commit(词19), got {:?}", other),
         }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
