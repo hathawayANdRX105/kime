@@ -63,8 +63,8 @@ impl LlmWorker {
     }
 
     fn request(&self, syllables: Vec<String>) {
-        let client = &self.client;
-        let debouncer = &self.debouncer;
+        let client = self.client.clone();
+        let debouncer = self.debouncer.clone();
         let sender = self.result_sender.clone();
         self.runtime.spawn(async move {
             if debouncer.should_fire().await {
@@ -124,8 +124,7 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         _registry: &WlRegistry,
         event: RegistryEvent,
         _globals: &GlobalListContents,
-        _data: &(),
-        _: &Connection,
+        _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
         if let RegistryEvent::Global {
@@ -151,10 +150,9 @@ impl Dispatch<WlRegistry, ()> for AppState {
         _state: &mut Self,
         _registry: &WlRegistry,
         _event: <WlRegistry as Proxy>::Event,
-        _: &(),
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
     ) {
     }
 }
@@ -164,10 +162,9 @@ impl Dispatch<ZwpInputMethodManagerV2, ()> for AppState {
         _state: &mut Self,
         _mgr: &ZwpInputMethodManagerV2,
         _event: <ZwpInputMethodManagerV2 as Proxy>::Event,
-        _: &(),
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
     ) {
     }
 }
@@ -177,8 +174,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
         state: &mut Self,
         im: &ZwpInputMethodV2,
         event: ZwpInputMethodEvent,
-        _: &(),
-        _: &Connection,
+        _data: &(),
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         match event {
@@ -191,7 +188,6 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                     let engine = Engine::new(dict, config.clone());
                     state.engine = Some(engine);
                     log("engine initialized");
-                    // Initialize LLM worker
                     let (tx, rx) = channel();
                     let endpoint = config.ai_endpoint.unwrap_or_default();
                     let model = config.ai_model.clone();
@@ -227,9 +223,9 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
         state: &mut Self,
         _grab: &ZwpInputMethodKeyboardGrabV2,
         event: ZwpInputMethodKeyboardGrabEvent,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
     ) {
         match event {
             ZwpInputMethodKeyboardGrabEvent::Key {
@@ -287,7 +283,6 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                                         win.show(&ui, engine.highlight(), engine.preedit());
                                 }
                             }
-                            // 触发 LLM 请求
                             if let Some(worker) = &state.llm_worker {
                                 worker.request(engine.preedit().split("'").map(String::from).collect());
                             }
@@ -357,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ];
         win.show(&ui, 0, "nihao")?;
-        std::thread::sleep(std::time::Duration::from_secs(9))?;
+        std::thread::sleep(std::time::Duration::from_secs(9));
         win.hide()?;
         return Ok(());
     }

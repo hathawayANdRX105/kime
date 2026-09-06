@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Config {
-    /// SQLite 库路径（词库 + 用户词同库）
     pub dict_path: String,
     /// 双拼方案：xiaohe / ziranma。None = 全拼
     pub shuangpin: Option<Scheme>,

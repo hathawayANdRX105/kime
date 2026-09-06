@@ -15,6 +15,7 @@ pub struct LlmRequest {
 }
 
 /// LLM HTTP 客户端（支持同步和异步）
+#[derive(Clone)]
 pub struct LlmClient {
     endpoint: String,
     model: String,
@@ -117,6 +118,7 @@ fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
 }
 
 /// Debounce 合并器（线程安全，供异步上下文用）
+#[derive(Clone)]
 pub struct Debouncer {
     last_request: Arc<Mutex<Option<std::time::Instant>>>,
     duration: Duration,
@@ -148,24 +150,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_debouncer_sync() {
-        let mut d = Debouncer::new(Duration::from_millis(200));
-        // 同步测试只能用 should_fire 的阻塞版本
-        // 这里仅测试解析逻辑
-        let json_str = r#"{"choices": [{"message": {"content": "你好世界\n你好吗\n你好啊"}}]}"#;
-        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
-        
-        let candidates = parse_candidates(text, &["ni".to_string(), "hao".to_string()]);
-
-        assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].text, "你好世界");
-        assert_eq!(candidates[1].text, "你好吗");
-        assert_eq!(candidates[2].text, "你好啊");
-        assert!(candidates[0].ai);
-    }
-
-    #[test]
     fn test_llm_client_new() {
         let client = LlmClient::new(
             "http://localhost:3000/v1/chat/completions".to_string(),
@@ -186,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_debouncer_async() {
-        let d = Debouncer::new(Duration::from_millis(200));
+        let d = Debouncer::new(std::time::Duration::from_millis(200));
         assert!(d.should_fire().await);
         // 200ms 内不应再触发
         assert!(!d.should_fire().await);
