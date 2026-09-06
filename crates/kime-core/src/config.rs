@@ -14,6 +14,9 @@ pub struct Config {
     pub shuangpin: Option<Scheme>,
     /// OpenAI 兼容端点；None = 关闭 AI 预测
     pub ai_endpoint: Option<String>,
+    /// AI 模型名称（默认 gpt-oss-120b）
+    #[serde(default = "default_ai_model")]
+    pub ai_model: String,
     /// 模糊音替换对（"zh=z"、"n=l"、"an=ang"）；空 = 关闭
     pub fuzzy: Vec<String>,
     /// Binary dict path (optional); loads ~/.local/share/kime/dict.bin if exists
@@ -43,8 +46,13 @@ fn default_punct_mode() -> PunctMode {
 fn default_page_size() -> usize {
     10
 }
+
 fn default_candidate_limit() -> usize {
     50
+}
+
+fn default_ai_model() -> String {
+    "gpt-oss-120b".to_string()
 }
 
 impl Default for Config {
@@ -57,6 +65,7 @@ impl Default for Config {
             dict_path,
             shuangpin: Some(Scheme::Ziranma),
             ai_endpoint: None,
+            ai_model: "gpt-oss-120b".to_string(),
             fuzzy: Vec::new(),
             dict_bin_path: None,
             page_size: 10,
@@ -67,15 +76,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        let toml_str = toml::to_string_pretty(self).map_err(|e| format!("序列化失败: {}", e))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
-        }
-        std::fs::write(path, toml_str).map_err(|e| format!("写入失败: {}", e))?;
-        Ok(())
-    }
-
     pub fn load() -> Self {
         if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
             return Self::load_from_path(Path::new(&p));
@@ -114,7 +114,7 @@ impl Config {
         let default_config = Config::default();
         match toml::to_string(&default_config) {
             Ok(toml_str) => {
-                if let Err(e) = fs::write(config_path, toml_str) {
+                if let Err(e) = fs::write(config_path, &toml_str) {
                     eprintln!(
                         "[kime] 警告：无法写入默认配置 {}: {}",
                         config_path.display(),
@@ -125,6 +125,15 @@ impl Config {
             Err(e) => eprintln!("[kime] 警告：默认配置序列化失败: {}", e),
         }
         default_config
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let toml_str = toml::to_string_pretty(self).map_err(|e| format!("序列化失败: {}", e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        }
+        std::fs::write(path, toml_str).map_err(|e| format!("写入失败: {}", e))?;
+        Ok(())
     }
 }
 
@@ -170,5 +179,11 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let loaded: Config = toml::from_str(&content).unwrap();
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_ai_model_default() {
+        let config = Config::default();
+        assert_eq!(config.ai_model, "gpt-oss-120b");
     }
 }

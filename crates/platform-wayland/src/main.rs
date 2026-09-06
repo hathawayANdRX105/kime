@@ -185,24 +185,23 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             ZwpInputMethodEvent::Activate => {
                 log("input_method ACTIVATE");
                 state.input_method = Some(im.clone());
-                let config = Config::default();
+                let config = Config::load();
                 let dict_path = config.dict_path.clone();
                 if let Ok(dict) = Dict::open(&dict_path) {
-                    state.engine = Some(Engine::new(dict, config));
+                    let engine = Engine::new(dict, config.clone());
+                    state.engine = Some(engine);
                     log("engine initialized");
+                    // Initialize LLM worker
+                    let (tx, rx) = channel();
+                    let endpoint = config.ai_endpoint.unwrap_or_default();
+                    let model = config.ai_model.clone();
+                    state.llm_worker = Some(LlmWorker::new(endpoint, model, tx));
+                    state.llm_receiver = Some(rx);
                 } else {
                     log("failed to initialize dictionary");
                 }
                 let _: ZwpInputMethodKeyboardGrabV2 = im.grab_keyboard(_qh, ()) as _;
                 log("grab_keyboard requested");
-                // Initialize LLM worker
-                let (tx, rx) = channel();
-                state.llm_worker = Some(LlmWorker::new(
-                    config.ai_endpoint.unwrap_or_default(),
-                    "test-model".to_string(),
-                    tx,
-                ));
-                state.llm_receiver = Some(rx);
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
@@ -242,8 +241,6 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     return;
                 }
 
-                // 功能键：ch=None、code 透传，翻页/退格等由 engine 按 code 分派；
-                // 未匹配的可打印映射直接丢弃（spike 时代遗留行为保留）
                 let is_page_key = matches!(key, 12 | 13 | 26 | 27);
                 let ch = match key {
                     1 => Some('\u{1b}'),
@@ -309,7 +306,6 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                             log("engine ignored (passthrough)");
                         }
                     }
-                    // 尝试接收 LLM 结果
                     state.try_recv_llm();
                 }
             }
