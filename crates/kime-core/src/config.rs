@@ -10,7 +10,7 @@ use std::path::Path;
 pub struct Config {
     /// SQLite 库路径（词库 + 用户词同库）
     pub dict_path: String,
-    /// None = 全拼
+    /// 双拼方案：xiaohe / ziranma。None = 全拼
     pub shuangpin: Option<Scheme>,
     /// OpenAI 兼容端点；None = 关闭 AI 预测
     pub ai_endpoint: Option<String>,
@@ -18,25 +18,35 @@ pub struct Config {
     pub fuzzy: Vec<String>,
     /// Binary dict path (optional); loads ~/.local/share/kime/dict.bin if exists
     pub dict_bin_path: Option<String>,
-    /// Page size for UI (default 10)
+    /// 每页候选数（默认 10）
+    #[serde(default = "default_page_size")]
     pub page_size: usize,
+    /// 单页最大候选数（默认 50，限制查询返回上限）
+    #[serde(default = "default_candidate_limit")]
+    pub candidate_limit: usize,
+}
+
+fn default_page_size() -> usize {
+    10
+}
+fn default_candidate_limit() -> usize {
+    50
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // ponytail: HOME unset on Windows/CI runners — fall back so the engine
-        // is always constructible in tests.
         let dict_path = std::env::var("HOME")
             .ok()
             .map(|h| format!("{}/.local/share/kime/dict.sqlite3", h))
             .unwrap_or_else(|| ".kime-dict.sqlite3".to_string());
         Self {
             dict_path,
-            shuangpin: None,
+            shuangpin: Some(Scheme::Ziranma),
             ai_endpoint: None,
             fuzzy: Vec::new(),
             dict_bin_path: None,
             page_size: 10,
+            candidate_limit: 50,
         }
     }
 }

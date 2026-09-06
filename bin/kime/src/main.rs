@@ -1,11 +1,12 @@
 //! kime CLI 入口：吞 stdin 拼音串、出候选列表。
 //!
-//! 用法（M7 起）：
+//! 用法（M9 起）：
 //!   kime build-dict --in <sqlite> --out <bin>
-//!   kime --dict <path> [--import <yaml>]
+//!   kime config <list|get KEY|set KEY VALUE>
+//!   kime --dict <path> [--import <yaml>] [--shuangpin <scheme>]
+//!   kime repl
 //!
-//! default：组合数据 REPL。
-//! build-dict：把 SQLite 词库编译成 FST 二进制词库。
+//! 配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -17,12 +18,108 @@ use kime_core::dict::Dict;
 use kime_core::{Engine, Key, Outcome};
 use kime_shuangpin::Scheme;
 
+fn handle_config_cmd(args: &[String]) -> Result<String, String> {
+    let config_path = if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
+        std::path::PathBuf::from(p)
+    } else {
+        match std::env::var("HOME") {
+            Ok(home) => std::path::PathBuf::from(home)
+                .join(".config")
+                .join("kime")
+                .join("config.toml"),
+            Err(_) => return Err("HOME 未设置".to_string()),
+        }
+    };
+    let mut config = Config::load_from_path(&config_path);
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "list" => {
+            let toml_str =
+                toml::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
+            Ok(format!("{}\n\n{}", config_path.display(), toml_str))
+        }
+        "get" => {
+            let key = args
+                .get(1)
+                .ok_or_else(|| "用法: kime config get <KEY>".to_string())?;
+            match key.as_str() {
+                "shuangpin" => Ok(format!("{:?}", config.shuangpin)),
+                "page_size" => Ok(config.page_size.to_string()),
+                "candidate_limit" => Ok(config.candidate_limit.to_string()),
+                "dict_path" => Ok(config.dict_path.clone()),
+                "fuzzy" => Ok(format!("{:?}", config.fuzzy)),
+                other => Err(format!("未知字段: {}", other)),
+            }
+        }
+        "set" => {
+            let key = args
+                .get(1)
+                .ok_or_else(|| "用法: kime config set <KEY> <VALUE>".to_string())?;
+            let val = args.get(2).ok_or_else(|| "缺少 VALUE".to_string())?;
+            match key.as_str() {
+                "shuangpin" => {
+                    config.shuangpin = match val.as_str() {
+                        "xiaohe" => Some(kime_shuangpin::Scheme::Xiaohe),
+                        "ziranma" => Some(kime_shuangpin::Scheme::Ziranma),
+                        "none" => None,
+                        other => return Err(format!("无效值: {} (xiaohe|ziranma|none)", other)),
+                    };
+                }
+                "page_size" => {
+                    config.page_size = val
+                        .parse()
+                        .map_err(|_| "page_size 必须是正整数".to_string())?;
+                }
+                "candidate_limit" => {
+                    config.candidate_limit = val
+                        .parse()
+                        .map_err(|_| "candidate_limit 必须是正整数".to_string())?;
+                }
+                other => return Err(format!("未知字段: {}", other)),
+            }
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent);
+            }
+            let toml_str =
+                toml::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
+            std::fs::write(&config_path, toml_str).map_err(|e| format!("写入失败: {}", e))?;
+            Ok(format!("已更新 {} = {}", key, val))
+        }
+        other => Err(format!(
+            "未知子命令: {} (list|get KEY|set KEY VALUE)",
+            other
+        )),
+    }
+}
+
 fn main() -> ExitCode {
+    let mut args_iter = std::env::args().skip(1).peekable();
+    let first = args_iter.next();
+
+    // 子命令分派
+    match first.as_deref() {
+        Some("config") => {
+            let sub_args: Vec<String> = args_iter.collect();
+            return match handle_config_cmd(&sub_args) {
+                Ok(s) => {
+                    println!("{}", s);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("config error: {}", e);
+                    ExitCode::from(2)
+                }
+            };
+        }
+        _ => {}
+    }
+
     let mut dict_path: Option<PathBuf> = None;
     let mut import_path: Option<PathBuf> = None;
     let mut shuangpin: Option<Scheme> = None;
+    // 重新迭代（first 已消费）
     let mut args_iter = std::env::args().skip(1).peekable();
-    let action = args_iter.next();
+    let _action = args_iter.next();
 
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
@@ -80,7 +177,7 @@ fn main() -> ExitCode {
             }
             "--help" => {
                 println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime --dict <path> [--import <yaml>] [--shuangpin <scheme>]\n\n  --build-dict 就把 rime-ice 词库编译为 FST 二进制，节省 80% 内存。"
+                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime --dict <path> [--import <yaml>] [--shuangpin <scheme>]\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -91,7 +188,6 @@ fn main() -> ExitCode {
         }
     }
 
-    let _ = action;
     // REPL
     let dict = match dict_path {
         Some(p) => match Dict::open(&p) {

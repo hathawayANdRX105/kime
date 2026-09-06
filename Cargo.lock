@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "kime-core",
  "kime-shuangpin",
+ "toml",
 ]
 
 [[package]]
