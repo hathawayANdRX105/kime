@@ -48,6 +48,7 @@ fn handle_config_cmd(args: &[String]) -> Result<String, String> {
                 "candidate_limit" => Ok(config.candidate_limit.to_string()),
                 "dict_path" => Ok(config.dict_path.clone()),
                 "fuzzy" => Ok(format!("{:?}", config.fuzzy)),
+                "punct_mode" => Ok(format!("{:?}", config.punct_mode)),
                 other => Err(format!("未知字段: {}", other)),
             }
         }
@@ -110,6 +111,17 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             };
+        }
+        Some("status") => {
+            let config = Config::load();
+            let mode = if config.punct_mode == kime_core::config::PunctMode::Chinese {
+                "chinese"
+            } else {
+                "english"
+            };
+            let scheme = format!("{:?}", config.shuangpin);
+            println!("mode: {}, scheme: {}", mode, scheme);
+            return ExitCode::SUCCESS;
         }
         _ => {}
     }

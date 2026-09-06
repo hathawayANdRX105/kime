@@ -23,6 +23,7 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
 
 use kime_core::dict::Dict;
 use kime_core::{config::Config, Engine, Key, Outcome};
+use platform_wayland::tray::TrayIconManager;
 use platform_wayland::window::CandidateWindow;
 use platform_wayland::Candidate as UiCandidate;
 
@@ -37,6 +38,7 @@ struct AppState {
     window: Option<CandidateWindow>,
     should_exit: bool,
     im_serial: u32,
+    tray: TrayIconManager,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             window: None,
             should_exit: false,
             im_serial: 0,
+            tray: TrayIconManager::new(true),
         }
     }
 }
