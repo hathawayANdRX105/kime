@@ -4,6 +4,7 @@
 //! and integration with kime input method engine.
 
 pub mod render;
+pub mod tray;
 pub mod window;
 
 pub use render::Candidate;
