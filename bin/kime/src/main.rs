@@ -106,10 +106,7 @@ fn main() -> ExitCode {
         },
         None => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            match Dict::open(PathBuf::from(format!(
-                "{}/.local/share/kime/dict.sqlite3",
-                home
-            ))) {
+            match Dict::open(PathBuf::from(home).join(".local/share/kime/dict.sqlite3")) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("failed to open default dict: {e}\ntry: kime build-dict --in ... --out ~/.local/share/kime/dict.bin");
@@ -125,29 +122,35 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    let mut engine = Engine::new(dict, Config::load());
-    if let Some(sp) = shuangpin {
-        let _ = sp;
+    // CLI --shuangpin 覆盖配置文件里的方案
+    let mut config = Config::load();
+    if shuangpin.is_some() {
+        config.shuangpin = shuangpin;
     }
+    let mut engine = Engine::new(dict, config);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("[kime] 读取标准输入失败: {e}");
+                return ExitCode::from(1);
+            }
         };
         let input = line.trim().to_string();
         if input.is_empty() {
             continue;
         }
         let mut outcome = None;
-        for c in input.bytes() {
-            if !(c.is_ascii_lowercase()) {
+        for c in input.chars() {
+            // 字母走拼音累积，ASCII 标点走顶字上屏；其余（数字/中文/控制符）丢弃
+            if !c.is_ascii_alphabetic() && !c.is_ascii_punctuation() {
                 continue;
             }
             let key = Key {
-                ch: Some(c as char),
+                ch: Some(c),
                 code: 0,
                 shift: false,
                 ctrl: false,
@@ -162,6 +165,11 @@ fn main() -> ExitCode {
                 continue;
             }
         };
+        // 已上屏时候选必然为空，不该再报「无候选」
+        if let Outcome::Commit(text) = outcome {
+            let _ = writeln!(stdout, "=> {text}");
+            continue;
+        }
         let cands = engine.candidates();
         let preedit = engine.preedit();
         if cands.is_empty() {
@@ -173,9 +181,6 @@ fn main() -> ExitCode {
                 .map(|(i, c)| format!("{}.{text}", i + 1, text = c.text))
                 .collect();
             let _ = writeln!(stdout, "{preedit}: {}", list.join(" "));
-        }
-        if let Outcome::Commit(text) = outcome {
-            let _ = writeln!(stdout, "=> {text}");
         }
     }
     ExitCode::SUCCESS

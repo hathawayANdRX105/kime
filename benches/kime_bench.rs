@@ -82,5 +82,29 @@ fn main() {
     } else {
         println!("4. FST 未就绪（无 /tmp/kime_dict.bin），跳过");
     }
+
+    // 5. Viterbi 整句联想（按键热路径，O(n^2) 次 dict.lookup）
+    let sentences: [&[&str]; 4] = [
+        &["ni", "hao"],
+        &["ni", "hao", "shi", "jie"],
+        &["wo", "men", "yi", "qi", "qu", "chi", "fan"],
+        &[
+            "jin", "tian", "tian", "qi", "zhen", "de", "hen", "bu", "cuo", "a", "ni", "yao", "bu",
+            "yao", "chu", "qu", "zou", "zou",
+        ],
+    ];
+    for syls in &sentences {
+        let reading: Vec<String> = syls.iter().map(|s| s.to_string()).collect();
+        let t = Instant::now();
+        let n = 50;
+        for _ in 0..n {
+            let _ = kime_core::lattice::viterbi_sentence(&dict, &reading);
+        }
+        println!(
+            "5. Viterbi 整句 [{} 音节]: {:.4}ms/次",
+            reading.len(),
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
+    }
     println!("===========================");
 }

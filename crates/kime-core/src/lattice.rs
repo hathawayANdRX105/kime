@@ -5,6 +5,14 @@
 
 use crate::dict::{Candidate, Dict};
 
+/// 每条边的基础代价。取值只需远大于 `FREQ_WEIGHT * ln(freq)` 的波动范围，
+/// 保证「少切几个词」始终优先于「单词频率略高」。
+const BASE_COST: f64 = 10000.0;
+/// 词频权重：ln(freq) 的放大系数，决定同样切分数下对高频词的偏好强度。
+const FREQ_WEIGHT: f64 = 1000.0;
+/// 每个词的额外惩罚，抑制把长串切成一堆单字。
+const WORD_PENALTY: f64 = 50.0;
+
 /// Viterbi 最短路径求解，返回最优组合候选（作为第一候选上屏）。
 ///
 /// - `reading`: 由 `segment` 产生的完整音节切分，长度需 ≥ 2
@@ -22,6 +30,7 @@ pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
     let mut prev: Vec<Option<(usize, String, String, u64)>> = vec![None; n + 1];
 
     dp[0] = 0.0;
+    let mut reported_err = false;
 
     // 对每个起点 i，尝试所有终点 j (i < j <= n)
     for i in 0..n {
@@ -33,16 +42,22 @@ pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
             // 查词库：最多取 5 个候选，按频次降序
             let cands = match dict.lookup(slice, 5) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(e) => {
+                    // 每次调用最多报一次：词库坏了会让每个跨度都失败，别刷屏
+                    if !reported_err {
+                        reported_err = true;
+                        eprintln!("[kime] 警告：整句联想查词失败 ({e})，本次退化为逐词候选");
+                    }
+                    continue;
+                }
             };
             if cands.is_empty() {
                 continue;
             }
-            // 取频次最高的候选作为该跨度的最佳词
+            // `Dict::lookup` 保证按 freq 降序返回，故 cands[0] 即该跨度最佳词
             let best = &cands[0];
-            // 代价：基础 10000 - ln(freq) * 1000 + 词数惩罚 50
             let freq = best.freq.max(1) as f64;
-            let cost = 10000.0 - freq.ln() * 1000.0 + 50.0;
+            let cost = BASE_COST - freq.ln() * FREQ_WEIGHT + WORD_PENALTY;
             let new_cost = dp[i] + cost;
             if new_cost < dp[j] {
                 dp[j] = new_cost;
@@ -83,7 +98,7 @@ pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
     let pinyin = pinyins.join("'");
 
     // 频率取总频 / 词数作为整句频率的保守估计
-    let sentence_freq = total_freq / words.len() as u64;
+    let sentence_freq = (total_freq as f64 / words.len() as f64).round() as u64;
 
     Some(Candidate {
         text,

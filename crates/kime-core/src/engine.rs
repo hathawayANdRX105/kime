@@ -185,7 +185,7 @@ impl Engine {
         if k.ch.is_none() && k.code == KEY_SPACE {
             if let Some(top) = self.candidates.first().cloned() {
                 let text = top.text.clone();
-                let _ = self.dict.learn(&self.last_reading, &text);
+                self.learn_or_warn(&text);
                 self.letters.clear();
                 self.candidates.clear();
                 self.last_reading.clear();
@@ -207,7 +207,7 @@ impl Engine {
                         // 情况 B：顶字上屏，拼接标点
                         let text = top.text.clone();
                         let commit_text = format!("{}{}", text, mapped);
-                        let _ = self.dict.learn(&self.last_reading, &text);
+                        self.learn_or_warn(&text);
                         self.letters.clear();
                         self.candidates.clear();
                         self.last_reading.clear();
@@ -241,7 +241,7 @@ impl Engine {
                     let idx = self.page_index * PAGE_SIZE + (d - 1) as usize;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
-                        let _ = self.dict.learn(&self.last_reading, &text);
+                        self.learn_or_warn(&text);
                         self.letters.clear();
                         self.candidates.clear();
                         self.last_reading.clear();
@@ -274,6 +274,14 @@ fn fuzzy_expand(map: &std::collections::HashMap<String, String>, s: &str) -> Vec
 }
 
 impl Engine {
+    /// 上屏后记录用户选择。学习失败不影响本次上屏（文本已交给应用），
+    /// 但必须可见：静默丢弃会让用户词永久不生效且无从排查。
+    fn learn_or_warn(&mut self, text: &str) {
+        if let Err(e) = self.dict.learn(&self.last_reading, text) {
+            eprintln!("[kime] 用户词学习失败 ({} → {}): {}", self.preedit, text, e);
+        }
+    }
+
     /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
     /// 兜底 lookup_abbrev。维护 self.last_reading 与 self.preedit。
     fn refresh_candidates(&mut self) {
