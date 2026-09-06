@@ -69,7 +69,17 @@
 - [x] 候选窗主题样式与自适应紧凑尺寸（高对比度细边框，动态高度计算）
 - [x] 句级 Word Lattice 构建与轻量 Viterbi 动态规划联想（第一候选输出长句）
 
-## M9 — 进阶规划
+## M9 — 进阶功能 ✅ 2026-09-06
 
-- [ ] XIM 协议前端（解决部分老旧 XWayland 应用的光标对齐问题）
-- [ ] 多模式输入（支持中英混合与自定义快捷短语管理）
+- [x] 中英标点切换（`Ctrl+.` 切换，`Config.punct_mode` 字段）
+- [x] 托盘图标与状态指示（`kime status` CLI + `TrayIconManager`）
+- [x] LLM 联想增强（`Engine::merge_ai()` + `LlmClient` + Debouncer）
+- [x] 默认双拼自然码 + CLI `config` 子命令热更新
+- [x] 翻页键增强（`+`/`=` 下一页，`Ctrl+f/b/n/p` Emacs 风格）
+- [x] Enter 原样上屏 + 数字 0 选第 10 个候选
+
+## M10 — 待规划
+
+- [ ] XIM 协议前端（解决 XWayland 光标对齐）
+- [ ] 多模式输入（中英混合 + 自定义快捷短语）
+- [ ] 云同步 / 词库同步
