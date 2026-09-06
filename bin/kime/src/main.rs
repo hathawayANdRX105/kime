@@ -76,6 +76,13 @@ fn handle_config_cmd(args: &[String]) -> Result<String, String> {
                         .parse()
                         .map_err(|_| "candidate_limit 必须是正整数".to_string())?;
                 }
+                "punct_mode" => {
+                    config.punct_mode = match val.as_str() {
+                        "chinese" => kime_core::config::PunctMode::Chinese,
+                        "english" => kime_core::config::PunctMode::English,
+                        other => return Err(format!("无效值: {} (chinese|english)", other)),
+                    };
+                }
                 other => return Err(format!("未知字段: {}", other)),
             }
             if let Some(parent) = config_path.parent() {
