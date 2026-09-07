@@ -106,6 +106,7 @@ impl AppState {
         }
     }
 
+    /// 检查并处理 LLM 异步结果
     fn try_recv_llm(&mut self) {
         if let Some(receiver) = &self.llm_receiver {
             if let Ok(candidates) = receiver.try_recv() {
@@ -236,22 +237,29 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     return;
                 }
 
+                let is_shift = matches!(key, 42 | 54);
                 let is_page_key = matches!(key, 12 | 13 | 26 | 27);
-                let ch = match key {
-                    1 => Some('\u{1b}'),
-                    30..=54 => Some((b'A' + (key - 30) as u8) as char),
-                    11..=20 => Some((b'0' + (key - 11) as u8) as char),
-                    57 => Some(' '),
-                    28 => Some('\n'),
-                    _ if is_page_key => None,
-                    _ => return,
+
+                let ch = if is_shift {
+                    None
+                } else {
+                    match key {
+                        1 => Some('\u{1b}'),
+                        30..=38 => Some((b'a' + (key - 30) as u8) as char),
+                        44..=53 => Some((b'j' + (key - 44) as u8) as char),
+                        11..=20 => Some((b'0' + (key - 11) as u8) as char),
+                        57 => Some(' '),
+                        28 => Some('\n'),
+                        _ if is_page_key => None,
+                        _ => return,
+                    }
                 };
 
                 if let Some(engine) = &mut state.engine {
                     let key_struct = Key {
                         ch,
                         code: key,
-                        shift: false,
+                        shift: is_shift,
                         ctrl: false,
                         alt: false,
                     };
@@ -297,7 +305,6 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                             }
                         }
                         Outcome::Ignored => {
-                            // 引擎未消费此键，原样提交给应用（英文模式/数字直接上屏）
                             if let Some(c) = ch {
                                 if let Some(im) = &state.input_method {
                                     let _ = im.commit_string(c.to_string());
