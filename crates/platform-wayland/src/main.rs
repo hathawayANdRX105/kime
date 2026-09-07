@@ -106,7 +106,6 @@ impl AppState {
         }
     }
 
-    /// 检查并处理 LLM 异步结果
     fn try_recv_llm(&mut self) {
         if let Some(receiver) = &self.llm_receiver {
             if let Ok(candidates) = receiver.try_recv() {
@@ -298,7 +297,14 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                             }
                         }
                         Outcome::Ignored => {
-                            log("engine ignored (passthrough)");
+                            // 引擎未消费此键，原样提交给应用（英文模式/数字直接上屏）
+                            if let Some(c) = ch {
+                                if let Some(im) = &state.input_method {
+                                    let _ = im.commit_string(c.to_string());
+                                    im.commit(state.im_serial);
+                                }
+                            }
+                            log(&format!("engine ignored: ch={:?} passthrough", ch));
                         }
                     }
                     state.try_recv_llm();
