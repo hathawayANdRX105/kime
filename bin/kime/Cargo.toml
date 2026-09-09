@@ -11,3 +11,6 @@ path = "src/main.rs"
 kime-core = { path = "../../crates/kime-core" }
 kime-shuangpin = { path = "../../crates/kime-shuangpin" }
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
