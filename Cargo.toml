@@ -25,3 +25,15 @@ edition.workspace = true
 
 [dependencies]
 kime-core = { path = "crates/kime-core" }
+
+[profile.release]
+# 速度优先：fat LTO + 单 codegen unit，换最大跨 crate 内联
+lto = "fat"
+codegen-units = 1
+# 去符号表；二进制本身会被 UPX 再压
+strip = true
+
+# 日常试用直接跑 target/debug 的话，依赖也按 O2 编译，
+# 首次全量编译变慢一次，之后增量编译不受影响
+[profile.dev.package."*"]
+opt-level = 2

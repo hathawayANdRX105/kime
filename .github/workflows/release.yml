@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # 允许手动触发调试
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 单测全量跑一遍，哑火就别发 release
+      - run: cargo test --workspace
+
+      # release profile 已在 Cargo.toml 固定：fat LTO + 单 codegen-unit + strip
+      - run: cargo build --release --locked
+
+      # UPX 进一步压缩体积（lzma 算法压得更狠但加载略慢，这里取默认）
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y upx-ucl
+          upx --best --lzma target/release/kime target/release/platform-wayland
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/kime target/release/platform-wayland dist/
+          tar -C dist -czf "kime-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" kime platform-wayland
+          cd dist && sha256sum kime platform-wayland > SHA256SUMS.txt
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "kime ${GITHUB_REF_NAME}"
+          generate_release_notes: true
+          files: |
+            dist/kime
+            dist/platform-wayland
+            dist/SHA256SUMS.txt
+            kime-*-linux-x86_64.tar.gz

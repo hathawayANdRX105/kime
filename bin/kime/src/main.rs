@@ -18,6 +18,9 @@ use kime_core::dict::Dict;
 use kime_core::{Engine, Key, Outcome};
 use kime_shuangpin::Scheme;
 
+// evdev keycodes — 与 platform-wayland 壳同值
+const KEY_ESC: u32 = 1;
+
 fn handle_config_cmd(args: &[String]) -> Result<String, String> {
     let config_path = if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
         std::path::PathBuf::from(p)
@@ -86,7 +89,7 @@ fn handle_config_cmd(args: &[String]) -> Result<String, String> {
                 other => return Err(format!("未知字段: {}", other)),
             }
             if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent);
+                let _ = std::fs::create_dir_all(parent);
             }
             let toml_str =
                 toml::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
@@ -135,10 +138,8 @@ fn main() -> ExitCode {
 
     let mut dict_path: Option<PathBuf> = None;
     let mut import_path: Option<PathBuf> = None;
-    let mut shuangpin: Option<Scheme> = None;
-    // 重新迭代（first 已消费）
+    let mut shuangpin: Option<Option<Scheme>> = None;
     let mut args_iter = std::env::args().skip(1).peekable();
-    let _action = args_iter.next();
 
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
@@ -151,14 +152,16 @@ fn main() -> ExitCode {
             "--shuangpin" => {
                 let s = args_iter.next().unwrap_or_default();
                 shuangpin = Some(match s.as_str() {
-                    "xiaohe" => Scheme::Xiaohe,
-                    "ziranma" => Scheme::Ziranma,
+                    "xiaohe" => Some(Scheme::Xiaohe),
+                    "ziranma" => Some(Scheme::Ziranma),
+                    "none" => None,
                     other => {
                         eprintln!("unknown shuangpin scheme: {other}");
                         return ExitCode::from(2);
                     }
                 });
             }
+            "repl" => {}
             "build-dict" => {
                 let mut in_path = None;
                 let mut out_path = None;
@@ -236,8 +239,8 @@ fn main() -> ExitCode {
     }
     // CLI --shuangpin 覆盖配置文件里的方案
     let mut config = Config::load();
-    if shuangpin.is_some() {
-        config.shuangpin = shuangpin;
+    if let Some(sp) = shuangpin {
+        config.shuangpin = sp;
     }
     let mut engine = Engine::new(dict, config);
 
@@ -255,6 +258,15 @@ fn main() -> ExitCode {
         if input.is_empty() {
             continue;
         }
+        // 每行视为独立输入：先 ESC 清掉上一行遗留的组合状态。
+        let esc = Key {
+            ch: None,
+            code: KEY_ESC,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        engine.key(esc);
         let mut outcome = None;
         for c in input.chars() {
             // 字母走拼音累积，ASCII 标点走顶字上屏；其余（数字/中文/控制符）丢弃
