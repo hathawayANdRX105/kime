@@ -28,7 +28,8 @@ jobs:
       - run: cargo test --workspace
 
       # release profile 已在 Cargo.toml 固定：fat LTO + 单 codegen-unit + strip
-      - run: cargo build --release --locked
+      # workspace 根是 kime-root 包,必须显式 --workspace 否则只编根包
+      - run: cargo build --release --workspace --locked
 
       # UPX 进一步压缩体积（lzma 算法压得更狠但加载略慢，这里取默认）
       - run: |
