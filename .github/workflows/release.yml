@@ -21,6 +21,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # platform-x11 需要 libxcb（runner 镜像没自带）
+      - run: sudo apt-get update -qq && sudo apt-get install -y libxcb1-dev
+
       # 单测全量跑一遍，哑火就别发 release
       - run: cargo test --workspace
 
