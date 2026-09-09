@@ -3,8 +3,8 @@
 //! 使用 StatusNotifierItem (appindicator) 协议在系统托盘显示当前中英模式。
 //! 点击托盘图标可切换中英文模式。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 托盘图标管理器
 pub struct TrayIconManager {

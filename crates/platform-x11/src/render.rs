@@ -1,5 +1,5 @@
 //! X11 候选窗渲染模块
-//! 
+//!
 //! 实现基于 X11 的候选词窗口绘制
 
 use kime_core::Candidate;
@@ -53,10 +53,19 @@ impl Renderer {
         let end = (start + self.page_size).min(self.candidates.len());
         let page = &self.candidates[start..end];
 
-        println!("[X11 Render] Candidate window at ({}, {}), {} candidates:", self.x, self.y, page.len());
+        println!(
+            "[X11 Render] Candidate window at ({}, {}), {} candidates:",
+            self.x,
+            self.y,
+            page.len()
+        );
         for (i, candidate) in page.iter().enumerate() {
             if i == 0 {
-                println!("[X11 Render] * Highlighted: {}. {}", start + i + 1, candidate.text);
+                println!(
+                    "[X11 Render] * Highlighted: {}. {}",
+                    start + i + 1,
+                    candidate.text
+                );
             } else {
                 println!("[X11 Render]   {}. {}", start + i + 1, candidate.text);
             }

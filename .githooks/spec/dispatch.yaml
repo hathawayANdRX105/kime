@@ -1,0 +1,20 @@
+# dispatch.yaml — hook dispatcher config
+#
+# Each hook runs the listed topics in order. Add/remove topics here
+# without touching the hook scripts.
+
+pre-commit:
+  - workspace
+  - code
+  - checklist
+
+pre-push:
+  - workspace
+  - code
+  - checklist
+
+merge:
+  - github/pull_requests
+  - github/reviews
+  - cleanup
+  - checklist

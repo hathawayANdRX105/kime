@@ -135,9 +135,8 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
         {
             log(&format!("Global: {} v{} ({})", name, version, interface));
             if interface == "zwp_input_method_manager_v2" && version >= 1 {
-                let mgr = _registry
-                    .bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, qh, ())
-                    as _;
+                let mgr =
+                    _registry.bind::<ZwpInputMethodManagerV2, (), AppState>(name, 1, qh, ()) as _;
                 state.input_method_manager = Some(mgr);
                 log(&format!("bound input method manager name={}", name));
             }
@@ -286,12 +285,13 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                                 if ui.is_empty() {
                                     let _ = win.hide();
                                 } else {
-                                    let _ =
-                                        win.show(&ui, engine.highlight(), engine.preedit());
+                                    let _ = win.show(&ui, engine.highlight(), engine.preedit());
                                 }
                             }
                             if let Some(worker) = &state.llm_worker {
-                                worker.request(engine.preedit().split("'").map(String::from).collect());
+                                worker.request(
+                                    engine.preedit().split("'").map(String::from).collect(),
+                                );
                             }
                         }
                         Outcome::Commit(text) => {

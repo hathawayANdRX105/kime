@@ -94,7 +94,10 @@ impl LlmClient {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| format!("JSON 解析失败: {}", e))?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("JSON 解析失败: {}", e))?;
         let text = json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("");
