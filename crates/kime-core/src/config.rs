@@ -114,7 +114,11 @@ impl Config {
         match toml::to_string(&default_config) {
             Ok(toml_str) => {
                 if let Err(e) = fs::write(config_path, &toml_str) {
-                    eprintln!("[kime] 警告：无法写入默认配置 {}: {}", config_path.display(), e);
+                    eprintln!(
+                        "[kime] 警告：无法写入默认配置 {}: {}",
+                        config_path.display(),
+                        e
+                    );
                 }
             }
             Err(e) => eprintln!("[kime] 警告：默认配置序列化失败: {}", e),

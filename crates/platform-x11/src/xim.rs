@@ -14,10 +14,7 @@ pub struct X11IM {
 }
 
 impl X11IM {
-    pub fn new(
-        conn: Arc<x11rb::rust_connection::RustConnection>,
-        engine: Engine,
-    ) -> Self {
+    pub fn new(conn: Arc<x11rb::rust_connection::RustConnection>, engine: Engine) -> Self {
         Self {
             conn,
             engine: Arc::new(Mutex::new(engine)),

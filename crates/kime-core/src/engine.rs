@@ -1205,12 +1205,15 @@ mod tests {
             e.key(k(c));
         }
         let original_len = e.candidates().len();
-        
-        let ai = vec![
-            Candidate { text: "你好世界".to_string(), pinyin: "ni'hao".to_string(), freq: 1, ai: true },
-        ];
+
+        let ai = vec![Candidate {
+            text: "你好世界".to_string(),
+            pinyin: "ni'hao".to_string(),
+            freq: 1,
+            ai: true,
+        }];
         e.merge_ai(ai);
-        
+
         assert_eq!(e.candidates().len(), original_len + 1);
         assert!(e.candidates().iter().any(|c| c.text == "你好世界" && c.ai));
         let _ = fs::remove_file(&db);
@@ -1224,13 +1227,16 @@ mod tests {
             e.key(k(c));
         }
         let original_len = e.candidates().len();
-        
+
         // Merge a candidate that already exists
-        let ai = vec![
-            Candidate { text: "你好".to_string(), pinyin: "ni'hao".to_string(), freq: 1, ai: true },
-        ];
+        let ai = vec![Candidate {
+            text: "你好".to_string(),
+            pinyin: "ni'hao".to_string(),
+            freq: 1,
+            ai: true,
+        }];
         e.merge_ai(ai);
-        
+
         // Should not add duplicate
         assert_eq!(e.candidates().len(), original_len);
         let _ = fs::remove_file(&db);
@@ -1285,7 +1291,13 @@ mod tests {
             e.key(k(c));
         }
         assert_eq!(e.preedit(), "nihao");
-        let outcome = e.key(Key { ch: None, code: 28, shift: false, ctrl: false, alt: false });
+        let outcome = e.key(Key {
+            ch: None,
+            code: 28,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
         assert_eq!(outcome, Outcome::Commit("nihao".to_string()));
         assert!(e.preedit().is_empty());
         let _ = fs::remove_file(&db);
@@ -1297,7 +1309,11 @@ mod tests {
         // 构造 12 个候选，翻到第 1 页后按 0 → 选第 10 个（全局索引 9）
         let (db, yaml) = fixture_many_ni();
         let dict = Dict::open(&db).unwrap();
-        let cfg = Config { page_size: 10, shuangpin: None, ..Config::default() };
+        let cfg = Config {
+            page_size: 10,
+            shuangpin: None,
+            ..Config::default()
+        };
         let mut e = Engine::new(dict, cfg);
         for c in "ni".chars() {
             e.key(k(c));
@@ -1321,11 +1337,23 @@ mod tests {
         // 默认中文标点模式
         assert!(matches!(e.punct_mode, crate::config::PunctMode::Chinese));
         // Ctrl+. 切换到英文
-        let outcome = e.key(Key { ch: Some('.'), code: 0, shift: false, ctrl: true, alt: false });
+        let outcome = e.key(Key {
+            ch: Some('.'),
+            code: 0,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        });
         assert_eq!(outcome, Outcome::Consumed);
         assert!(matches!(e.punct_mode, crate::config::PunctMode::English));
         // 再按回来
-        let outcome = e.key(Key { ch: Some('.'), code: 0, shift: false, ctrl: true, alt: false });
+        let outcome = e.key(Key {
+            ch: Some('.'),
+            code: 0,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        });
         assert_eq!(outcome, Outcome::Consumed);
         assert!(matches!(e.punct_mode, crate::config::PunctMode::Chinese));
         let _ = fs::remove_file(&db);
@@ -1338,7 +1366,13 @@ mod tests {
         // 切换到英文标点模式
         e.punct_mode = crate::config::PunctMode::English;
         // 输入逗号 → 应原样输出 "," 而非 "，"
-        let outcome = e.key(Key { ch: Some(','), code: 0, shift: false, ctrl: false, alt: false });
+        let outcome = e.key(Key {
+            ch: Some(','),
+            code: 0,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
         assert_eq!(outcome, Outcome::Commit(",".to_string()));
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);

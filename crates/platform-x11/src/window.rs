@@ -3,10 +3,10 @@
 //! 管理候选窗的创建、显示、隐藏及光标跟随定位
 //! 使用 XIMGlyphPosition 实现 XWayland 应用的光标跟随
 
+use crate::render::Renderer;
 use kime_core::{Engine, Key, Outcome};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use crate::render::Renderer;
 
 pub struct CandidateWindow {
     renderer: Renderer,
@@ -15,9 +15,7 @@ pub struct CandidateWindow {
 }
 
 impl CandidateWindow {
-    pub fn new(
-        engine: Arc<Mutex<Engine>>,
-    ) -> Self {
+    pub fn new(engine: Arc<Mutex<Engine>>) -> Self {
         let renderer = Renderer::new();
 
         Self {
@@ -63,8 +61,7 @@ impl CandidateWindow {
         self.renderer.set_visible(false);
     }
 
-    pub fn run(&mut self) {
-    }
+    pub fn run(&mut self) {}
 
     pub fn engine(&self) -> Arc<Mutex<Engine>> {
         self.engine.clone()

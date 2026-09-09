@@ -6,8 +6,16 @@ fn status_cli_returns_mode_and_scheme() {
         .arg("status")
         .output()
         .expect("Failed to execute kime status");
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("mode:"), "status output should contain mode: {}", stdout);
-    assert!(stdout.contains("scheme:"), "status output should contain scheme: {}", stdout);
+    assert!(
+        stdout.contains("mode:"),
+        "status output should contain mode: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("scheme:"),
+        "status output should contain scheme: {}",
+        stdout
+    );
 }
