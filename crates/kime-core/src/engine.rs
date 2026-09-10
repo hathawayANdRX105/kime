@@ -132,7 +132,7 @@ impl Engine {
 
     /// 唯一入口。字母累积 / 退格删音节 / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
-        // Shift 单独按下（无字符 + evdev shift 码）→ 仅在无组合时切换中英。
+        // Shift 单独按下：无组合时切中英；有预编辑时上屏原串再切英文。
         if k.ch.is_none()
             && k.shift
             && !k.ctrl
@@ -143,7 +143,14 @@ impl Engine {
                 self.chinese = !self.chinese;
                 return Outcome::Consumed;
             }
-            return Outcome::Ignored;
+            let text = self.letters.clone();
+            self.letters.clear();
+            self.candidates.clear();
+            self.last_reading.clear();
+            self.preedit.clear();
+            self.page_index = 0;
+            self.chinese = false;
+            return Outcome::Commit(text);
         }
 
         // 英文模式：除上面已处理的 shift 外，其余键一律放行。
@@ -407,6 +414,14 @@ impl Engine {
                         self.last_reading.clear();
                         self.preedit = self.letters.clone();
                     }
+                }
+            }
+            if self.candidates.is_empty() {
+                if let Ok(ab) = self
+                    .dict
+                    .lookup_abbrev(&self.letters, self.config.candidate_limit)
+                {
+                    self.candidates = ab;
                 }
             }
             return;
@@ -933,14 +948,15 @@ mod tests {
     }
 
     #[test]
-    fn shift_with_active_composition_is_ignored() {
+    fn shift_with_active_composition_commits_raw_and_switches() {
         let (mut e, db, yaml) = engine_with_fixture();
         e.key(k('n'));
+        e.key(k('h'));
         assert!(e.chinese());
-        // shift while composing: per spec, must NOT toggle — leaves state intact.
-        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Ignored);
-        assert!(e.chinese());
-        assert_eq!(e.preedit(), "n");
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Commit("nh".into()));
+        assert!(!e.chinese());
+        assert!(e.preedit().is_empty());
+        assert_eq!(e.key(k('a')), Outcome::Ignored);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

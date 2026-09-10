@@ -204,91 +204,34 @@ impl CandidateWindow {
         })
     }
 
-    /// 显示候选窗（建窗 + 渲染 + 上屏），自轮询 configure 握手
     pub fn show(
         &mut self,
         candidates: &[Candidate],
         highlight: usize,
         preedit: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 计算动态高度：base 24 + preedit行 30 + candidates * 34 (最多10个)
         let preedit_h = if preedit.is_empty() { 0 } else { 30 };
         let candidate_count = candidates.len().min(10);
-        let h = 24 + preedit_h + candidate_count * 34;
+        let h = (24 + preedit_h + candidate_count * 34).max(80);
         let (w, h) = (WIDTH as usize, h);
 
-        match &self.layer_surface {
-            Some(LayerSurface::Layer(_)) => {
-                // layer-shell 路径需要 configure 握手
-                if self.layer_surface.is_none() {
-                    self.create_layer_surface()?;
-                }
-                // 等 configure（最多 3 轮 roundtrip）
-                for _ in 0..3 {
-                    if self.state.configured {
-                        break;
-                    }
-                    self.queue.roundtrip(&mut self.state)?;
-                }
-                let serial = self
-                    .state
-                    .configure_serial
-                    .ok_or("layer surface configure 未到达")?;
-                if let Some(LayerSurface::Layer(ls)) = &self.layer_surface {
-                    ls.ack_configure(serial);
-                }
-                // 渲染到 mmap → attach → commit
-                if self.layer_surface.is_none() {
-                    self.create_layer_surface()?;
-                }
-                // 等 configure（最多 5 轮 roundtrip）
-                for i in 0..5 {
-                    if self.state.configured {
-                        break;
-                    }
-                    self.queue.roundtrip(&mut self.state)?;
-                    eprintln!("[win] roundtrip {} configured={}", i, self.state.configured);
-                }
+        if self.layer_surface.is_none() {
+            self.create_layer_surface()?;
+        }
+        for _ in 0..8 {
+            if self.state.configured {
+                break;
             }
-            Some(LayerSurface::Popup(_)) => {
-                // input-popup-surface 不需要 configure 握手
-            }
-            None => {
-                // 两种路径都需要创建 surface
-                if self.layer_surface.is_none() {
-                    self.create_layer_surface()?;
-                }
-                // 等 configure（最多 3 轮 roundtrip）
-                for _ in 0..3 {
-                    if self.state.configured {
-                        break;
-                    }
-                    self.queue.roundtrip(&mut self.state)?;
-                }
-                let serial = self
-                    .state
-                    .configure_serial
-                    .ok_or("layer surface configure 未到达")?;
-                if let Some(LayerSurface::Layer(ls)) = &self.layer_surface {
-                    ls.ack_configure(serial);
-                }
-                // 渲染到 mmap → attach → commit
-                if self.layer_surface.is_none() {
-                    self.create_layer_surface()?;
-                }
-                // 等 configure（最多 5 轮 roundtrip）
-                for i in 0..5 {
-                    if self.state.configured {
-                        break;
-                    }
-                    self.queue.roundtrip(&mut self.state)?;
-                    eprintln!("[win] roundtrip {} configured={}", i, self.state.configured);
-                }
-            }
+            self.queue.roundtrip(&mut self.state)?;
+        }
+        if let (Some(LayerSurface::Layer(ls)), Some(serial)) =
+            (&self.layer_surface, self.state.configure_serial)
+        {
+            ls.ack_configure(serial);
+            ls.set_size(WIDTH, h as u32);
         }
 
         self.ensure_buffer(w, h)?;
-        // render.rs 写内存 RGBA；shm Argb8888 内存序是 B,G,R,A → 原地换 R/B
         {
             let (_, ptr, len) = self.map.as_ref().unwrap();
             let slice = unsafe { std::slice::from_raw_parts_mut(*ptr, *len) };
@@ -298,7 +241,7 @@ impl CandidateWindow {
                 px.swap(0, 2);
             }
         }
-        let surface = self.surface.as_ref().unwrap();
+        let surface = self.surface.as_ref().ok_or("surface missing")?;
         surface.attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
         surface.damage(0, 0, WIDTH as i32, h as i32);
         surface.commit();
@@ -306,19 +249,30 @@ impl CandidateWindow {
         Ok(())
     }
 
-    /// 隐藏候选窗（销毁 layer surface，保留连接与缓冲）
+    /// 隐藏候选窗。popup 只 detach，不销毁（input-popup 绑在 IM 上，拆了再也画不出来）。
     pub fn hide(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(ls) = &self.layer_surface {
-            ls.destroy();
+        match &self.layer_surface {
+            Some(LayerSurface::Popup(_)) => {
+                if let Some(s) = &self.surface {
+                    s.attach(None, 0, 0);
+                    s.commit();
+                    let _ = self.queue.roundtrip(&mut self.state);
+                }
+                return Ok(());
+            }
+            Some(LayerSurface::Layer(ls)) => {
+                ls.destroy();
+                if let Some(s) = &self.surface {
+                    s.destroy();
+                }
+                let _ = self.queue.roundtrip(&mut self.state);
+                self.layer_surface = None;
+                self.surface = None;
+                self.state.configured = false;
+                self.state.configure_serial = None;
+            }
+            None => {}
         }
-        if let Some(s) = &self.surface {
-            s.destroy();
-        }
-        self.queue.roundtrip(&mut self.state)?;
-        self.layer_surface = None;
-        self.surface = None;
-        self.state.configured = false;
-        self.state.configure_serial = None;
         Ok(())
     }
 
@@ -345,6 +299,7 @@ impl CandidateWindow {
         layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::Bottom);
         layer_surface.set_exclusive_zone(-1);
         layer_surface.set_margin(0, 0, 10, 0);
+        layer_surface.set_size(WIDTH, HEIGHT);
         layer_surface
             .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
         surface.commit();
@@ -354,10 +309,12 @@ impl CandidateWindow {
         Ok(())
     }
 
-    /// 首次调用：memfd + ftruncate + mmap + wl_shm pool + buffer
     fn ensure_buffer(&mut self, w: usize, h: usize) -> Result<(), Box<dyn std::error::Error>> {
-        if self.buffer.is_some() {
-            return Ok(());
+        let need = w * h * 4;
+        if let Some((_, _, len)) = self.map {
+            if len >= need {
+                return Ok(());
+            }
         }
         let shm = self.state.shm.as_ref().ok_or("shm 未暴露")?;
         let (buffer, map) = Self::create_buffer(shm, &self.qh, w, h)?;
