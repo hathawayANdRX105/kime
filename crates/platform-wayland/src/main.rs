@@ -10,9 +10,8 @@ use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Key, Outcome};
+use platform_wayland::panel::{self, PanelMsg};
 use platform_wayland::tray::TrayIconManager;
-use platform_wayland::window::CandidateWindow;
-use platform_wayland::Candidate as UiCandidate;
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
@@ -156,7 +155,7 @@ struct AppState {
     seats: Vec<SeatBind>,
     target_seat: Option<String>,
     engine: Option<Engine>,
-    window: Option<CandidateWindow>,
+    window: Option<()>,
     should_exit: bool,
     im_serial: u32,
     tray: TrayIconManager,
@@ -282,16 +281,7 @@ impl AppState {
     }
 
     fn ensure_window(&mut self, _im: &ZwpInputMethodV2) {
-        if self.window.is_some() {
-            return;
-        }
-        match CandidateWindow::new_layer() {
-            Ok(win) => {
-                self.window = Some(win);
-                log("layer candidate window ready");
-            }
-            Err(e) => log(&format!("candidate window failed: {e}")),
-        }
+        let _ = _im;
     }
 
     fn apply_consumed(&mut self) {
@@ -303,27 +293,23 @@ impl AppState {
         log(&format!("consumed preedit={pe}"));
         if let Some(im) = &self.input_method {
             let cursor = pe.len() as i32;
-            im.set_preedit_string(pe, 0, cursor);
+            im.set_preedit_string(pe.clone(), 0, cursor);
             im.commit(self.im_serial);
         }
-        if let Some(win) = &mut self.window {
-            let ui: Vec<UiCandidate> = engine
-                .candidates()
-                .iter()
-                .map(|c| UiCandidate {
-                    text: c.text.clone(),
-                    pinyin: c.pinyin.clone(),
-                    freq: c.freq,
-                    ai: c.ai,
-                })
-                .collect();
-            if ui.is_empty() {
-                if let Err(e) = win.hide() {
-                    log(&format!("hide failed: {e}"));
-                }
-            } else if let Err(e) = win.show(&ui, engine.highlight(), engine.preedit()) {
-                log(&format!("show failed: {e}"));
-            }
+        let ui: Vec<String> = engine
+            .candidates()
+            .iter()
+            .take(9)
+            .map(|c| c.text.clone())
+            .collect();
+        if ui.is_empty() && pe.is_empty() {
+            panel::send_hide();
+        } else {
+            panel::send(&PanelMsg {
+                preedit: pe,
+                highlight: 0,
+                candidates: ui,
+            });
         }
         if let Some(worker) = &self.llm_worker {
             if let Some(engine) = self.engine.as_ref() {
@@ -339,9 +325,7 @@ impl AppState {
             im.set_preedit_string(String::new(), 0, 0);
             im.commit(self.im_serial);
         }
-        if let Some(win) = &mut self.window {
-            let _ = win.hide();
-        }
+        panel::send_hide();
     }
 }
 
@@ -481,9 +465,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method DEACTIVATE");
                 state.grab = None;
                 state.swallowed.clear();
-                if let Some(win) = &mut state.window {
-                    let _ = win.hide();
-                }
+                panel::send_hide();
             }
             ZwpInputMethodEvent::Done { .. } => {
                 state.im_serial += 1;
@@ -627,24 +609,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = Connection::connect_to_env()?;
     if args.iter().any(|a| a == "--show-test") {
-        let mut win = CandidateWindow::new_layer()?;
-        let ui = vec![
-            UiCandidate {
-                text: "你好".into(),
-                pinyin: "ni'hao".into(),
-                freq: 99,
-                ai: false,
-            },
-            UiCandidate {
-                text: "拟好".into(),
-                pinyin: "ni'hao".into(),
-                freq: 50,
-                ai: false,
-            },
-        ];
-        win.show(&ui, 0, "nihao")?;
+        panel::send(&PanelMsg {
+            preedit: "nihao".into(),
+            highlight: 0,
+            candidates: vec!["你好".into(), "拟好".into()],
+        });
         std::thread::sleep(std::time::Duration::from_secs(9));
-        win.hide()?;
+        panel::send_hide();
         return Ok(());
     }
 

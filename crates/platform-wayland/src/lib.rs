@@ -1,8 +1,6 @@
-//! platform-wayland crate for Wayland input method support
-//!
-//! Provides layer-shell candidate window rendering with cosmic-text
-//! and integration with kime input method engine.
+//! platform-wayland: input-method 壳 + egui 候选窗。
 
+pub mod panel;
 pub mod render;
 pub mod tray;
 pub mod window;
