@@ -210,11 +210,7 @@ impl CandidateWindow {
         highlight: usize,
         preedit: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let preedit_h = if preedit.is_empty() { 0 } else { 30 };
-        let candidate_count = candidates.len().min(10);
-        let h = (24 + preedit_h + candidate_count * 34).max(80);
-        let (w, h) = (WIDTH as usize, h);
-
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
         if self.layer_surface.is_none() {
             self.create_layer_surface()?;
         }
@@ -228,7 +224,6 @@ impl CandidateWindow {
             (&self.layer_surface, self.state.configure_serial)
         {
             ls.ack_configure(serial);
-            ls.set_size(WIDTH, h as u32);
         }
 
         self.ensure_buffer(w, h)?;
@@ -237,41 +232,20 @@ impl CandidateWindow {
             let slice = unsafe { std::slice::from_raw_parts_mut(*ptr, *len) };
             self.renderer
                 .draw_candidates(slice, w, h, candidates, highlight, preedit)?;
-            for px in slice.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
         }
         let surface = self.surface.as_ref().ok_or("surface missing")?;
         surface.attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
-        surface.damage(0, 0, WIDTH as i32, h as i32);
+        surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
         surface.commit();
         self.queue.roundtrip(&mut self.state)?;
         Ok(())
     }
 
-    /// 隐藏候选窗。popup 只 detach，不销毁（input-popup 绑在 IM 上，拆了再也画不出来）。
     pub fn hide(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.layer_surface {
-            Some(LayerSurface::Popup(_)) => {
-                if let Some(s) = &self.surface {
-                    s.attach(None, 0, 0);
-                    s.commit();
-                    let _ = self.queue.roundtrip(&mut self.state);
-                }
-                return Ok(());
-            }
-            Some(LayerSurface::Layer(ls)) => {
-                ls.destroy();
-                if let Some(s) = &self.surface {
-                    s.destroy();
-                }
-                let _ = self.queue.roundtrip(&mut self.state);
-                self.layer_surface = None;
-                self.surface = None;
-                self.state.configured = false;
-                self.state.configure_serial = None;
-            }
-            None => {}
+        if let Some(s) = &self.surface {
+            s.attach(None, 0, 0);
+            s.commit();
+            let _ = self.queue.roundtrip(&mut self.state);
         }
         Ok(())
     }

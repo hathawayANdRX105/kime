@@ -1,12 +1,8 @@
 //! Pure drawing side for candidate window rendering using cosmic_text.
-//! Zero wayland dependencies — only rendering.
-//! Supports numbered candidates, highlighting, preedit text.
-//! Uses system fonts for CJK glyph availability.
-//! ARGB pixel output for double-buffered Wayland layer-surface.
+//! shm Argb8888 little-endian: memory order B,G,R,A.
 
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Style};
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
-/// Candidate data structure — matches kime-core::dict::Candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub text: String,
@@ -21,7 +17,6 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Initialize renderer with system fonts, default font size 20.
     pub fn new() -> Self {
         let font_system = FontSystem::new();
         Self {
@@ -30,38 +25,36 @@ impl Renderer {
         }
     }
 
-    /// Set font size.
     pub fn set_font_size(&mut self, size: f64) {
         self.font_size = size;
     }
 
-    /// Draw thin border around buffer edges for visibility in dark terminals.
-    ///
-    /// `color` 为 `0xAARRGGBB`。
+    /// `color` is 0xAARRGGBB. Writes B,G,R,A into `buf`.
     fn draw_border(buf: &mut [u8], width: usize, height: usize, color: u32) {
-        let (r, g, b, a) = (
+        let (a, r, g, b) = (
+            (color >> 24) as u8,
             (color >> 16) as u8,
             (color >> 8) as u8,
             color as u8,
-            (color >> 24) as u8,
         );
-        // Top and bottom borders (full width)
-        for y in [0, height - 1] {
+        for y in [0, height.saturating_sub(1)] {
             for x in 0..width {
                 let off = (y * width + x) * 4;
-                buf[off] = r;
+                buf[off] = b;
                 buf[off + 1] = g;
-                buf[off + 2] = b;
+                buf[off + 2] = r;
                 buf[off + 3] = a;
             }
         }
-        // Left and right borders (excluding corners)
-        for x in [0, width - 1] {
+        if height <= 1 {
+            return;
+        }
+        for x in [0, width.saturating_sub(1)] {
             for y in 1..height - 1 {
                 let off = (y * width + x) * 4;
-                buf[off] = r;
+                buf[off] = b;
                 buf[off + 1] = g;
-                buf[off + 2] = b;
+                buf[off + 2] = r;
                 buf[off + 3] = a;
             }
         }
@@ -83,9 +76,9 @@ impl Renderer {
         let buf = &mut buf[..need];
 
         for px in buf.chunks_exact_mut(4) {
-            px[0] = 0x1E;
+            px[0] = 0x26;
             px[1] = 0x1E;
-            px[2] = 0x26;
+            px[2] = 0x1E;
             px[3] = 0xE8;
         }
         if !candidates.is_empty() {
@@ -107,20 +100,18 @@ impl Renderer {
             Metrics::new(self.font_size as f32, line_height),
         );
         buffer.set_size(Some(width as f32), Some(height as f32));
-        let mut attrs = Attrs::new();
-        attrs.family = cosmic_text::Family::SansSerif;
-        attrs.style = Style::Normal;
+        let attrs = Attrs::new();
         buffer.set_text(&text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
         let color = cosmic_text::Color::rgba(240, 240, 245, 255);
         let mut cache = cosmic_text::SwashCache::new();
         buffer.draw(&mut self.font_system, &mut cache, color, |x, y, w, h, c| {
             let word = c.0;
-            let (r, g, b, a) = (
+            let (a, r, g, b) = (
+                (word >> 24) as u8,
                 (word >> 16) as u8,
                 (word >> 8) as u8,
                 word as u8,
-                (word >> 24) as u8,
             );
             for dy in 0..h as usize {
                 let py = y as usize + dy;
@@ -128,9 +119,9 @@ impl Renderer {
                     let px = x as usize + dx;
                     if px < width && py < height {
                         let off = (py * width + px) * 4;
-                        buf[off] = r;
+                        buf[off] = b;
                         buf[off + 1] = g;
-                        buf[off + 2] = b;
+                        buf[off + 2] = r;
                         buf[off + 3] = a;
                     }
                 }
@@ -147,7 +138,7 @@ mod tests {
     #[test]
     fn test_renderer_basic() {
         let mut renderer = Renderer::new();
-        let mut buf = vec![0u8; 400 * 600 * 4]; // width=400, height=600
+        let mut buf = vec![0u8; 400 * 600 * 4];
         let candidates = vec![
             Candidate {
                 text: "测试".to_string(),
@@ -164,8 +155,6 @@ mod tests {
         ];
         let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 0, "输入");
         assert!(result.is_ok());
-
-        // Verify we actually rendered something (non-zero pixels)
         let non_zero = buf.iter().filter(|&&b| b != 0).count();
         assert!(
             non_zero > 0,
@@ -191,10 +180,8 @@ mod tests {
                 ai: false,
             },
         ];
-        // Test highlighted candidate (index 1)
         let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 1, "预编辑");
         assert!(result.is_ok());
-
         let non_zero = buf.iter().filter(|&&b| b != 0).count();
         assert!(
             non_zero > 0,
@@ -209,12 +196,10 @@ mod tests {
         let candidates = vec![];
         let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 0, "");
         assert!(result.is_ok());
-
-        // Empty render: uniform opaque background (every pixel = BG 0x1E1E26, A=0xE8)
         let all_bg = buf
             .chunks_exact(4)
-            .all(|px| px[0] == 0x1E && px[1] == 0x1E && px[2] == 0x26 && px[3] == 0xE8);
-        assert!(all_bg, "Empty render should be uniform background");
+            .all(|px| px[0] == 0x26 && px[1] == 0x1E && px[2] == 0x1E && px[3] == 0xE8);
+        assert!(all_bg, "Empty render should be uniform BGRA background");
     }
 
     #[test]
@@ -240,12 +225,11 @@ mod tests {
             .draw_candidates(&mut buf, w, h, &candidates, 0, "输入")
             .unwrap();
 
-        // 边框色 #4C566A，四边中点都应命中（不能只撞上文字像素）
         let px = |x: usize, y: usize| {
             let off = (y * w + x) * 4;
             (buf[off], buf[off + 1], buf[off + 2])
         };
-        let border = (0x4Cu8, 0x56u8, 0x6Au8);
+        let border = (0x6Au8, 0x56u8, 0x4Cu8);
         for (x, y, edge) in [
             (w / 2, 0, "上"),
             (w / 2, h - 1, "下"),

@@ -564,8 +564,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 if !pressed {
                     return;
                 }
-
                 let is_shift = matches!(key, 42 | 54);
+                if state.alt || state.ctrl {
+                    state.forward_key(time, key, true);
+                    return;
+                }
                 let ch = if matches!(key, 1 | 14 | 28 | 42 | 54 | 57) {
                     None
                 } else {

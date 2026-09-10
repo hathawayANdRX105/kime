@@ -295,8 +295,10 @@ impl Engine {
             }
         }
         if let Some(c) = k.ch {
-            // 字母（含 shift 的大写 → 归一化小写）→ 累积。
             if c.is_ascii_alphabetic() {
+                if k.alt || k.ctrl {
+                    return Outcome::Ignored;
+                }
                 let lc = c.to_ascii_lowercase();
                 self.letters.push(lc);
                 self.refresh_candidates();
@@ -951,6 +953,10 @@ mod tests {
     fn shift_with_active_composition_commits_raw_and_switches() {
         let (mut e, db, yaml) = engine_with_fixture();
         e.key(k('n'));
+        let mut alt_n = k('n');
+        alt_n.alt = true;
+        assert_eq!(e.key(alt_n), Outcome::Ignored);
+        assert_eq!(e.preedit(), "n");
         e.key(k('h'));
         assert!(e.chinese());
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Commit("nh".into()));
