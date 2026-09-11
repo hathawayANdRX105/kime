@@ -298,10 +298,12 @@ impl AppState {
             im.set_preedit_string(pe.clone(), 0, cursor);
             im.commit(self.im_serial);
         }
-        let ui: Vec<String> = engine
-            .candidates()
+        // 只发当前页：highlight() 即页首全局下标（page_index*page_size），
+        // 切片后面板标号 1..=ps 与引擎数字键 page_index*page_size+(digit-1) 天然对齐。
+        let (start, ps) = (engine.highlight(), engine.page().1);
+        let all = engine.candidates();
+        let ui: Vec<String> = all[start.min(all.len())..(start + ps).min(all.len())]
             .iter()
-            .take(9)
             .map(|c| c.text.clone())
             .collect();
         if ui.is_empty() && pe.is_empty() {
@@ -309,6 +311,7 @@ impl AppState {
         } else {
             panel::send(&PanelMsg {
                 preedit: pe,
+                // 页首对切片本地即 0；引擎无页内光标，数字键直接按位选词
                 highlight: 0,
                 candidates: ui,
             });
