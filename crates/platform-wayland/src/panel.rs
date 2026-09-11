@@ -98,7 +98,8 @@ impl eframe::App for PanelApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         let msg = self.state.lock().map(|g| g.clone()).unwrap_or_default();
-        let visible = !msg.candidates.is_empty() || !msg.preedit.is_empty();
+        // preedit 由应用内联显示（set_preedit_string），面板只画候选
+        let visible = !msg.candidates.is_empty();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         if !visible {
             return;
@@ -113,15 +114,7 @@ impl eframe::App for PanelApp {
                     .inner_margin(egui::Margin::symmetric(MARGIN_X as i8, MARGIN_Y as i8)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if !msg.preedit.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&msg.preedit)
-                                .size(14.0)
-                                .color(Color32::from_rgb(150, 160, 180)),
-                        );
-                        ui.separator();
-                    }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     for (i, text) in msg.candidates.iter().take(9).enumerate() {
                         let entry = format!("{}. {}", i + 1, text);
                         let label = egui::RichText::new(entry).size(16.0);
@@ -138,11 +131,11 @@ impl eframe::App for PanelApp {
                 });
             });
 
-        // 内容自适应：used_size + 内边距，钳在 [140, 760]，只在变化时发
+        // 内容自适应：高度贴合单行，只在变化时发
         let used = ctx.used_size();
         let target = Vec2::new(
             (used.x + 2.0 * MARGIN_X + 2.0).clamp(140.0, 760.0),
-            (used.y + 2.0 * MARGIN_Y + 2.0).clamp(40.0, 60.0),
+            (used.y + 2.0 * MARGIN_Y + 2.0).clamp(32.0, 48.0),
         );
         if (target - self.last_size).length() > 1.0 {
             self.last_size = target;
