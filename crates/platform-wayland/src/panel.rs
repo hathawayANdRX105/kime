@@ -39,6 +39,7 @@ pub fn send_hide() {
 struct PanelApp {
     sock: UnixDatagram,
     state: Arc<Mutex<PanelMsg>>,
+    last_size: Vec2,
 }
 
 impl PanelApp {
@@ -51,6 +52,7 @@ impl PanelApp {
         Self {
             sock,
             state: Arc::new(Mutex::new(PanelMsg::default())),
+            last_size: Vec2::new(420.0, 48.0),
         }
     }
 
@@ -102,35 +104,57 @@ impl eframe::App for PanelApp {
             return;
         }
 
-        let n = msg.candidates.len().min(9);
-        let h = 36.0 + n as f32 * 28.0 + 16.0;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(420.0, h)));
-
+        const MARGIN_X: f32 = 10.0;
+        const MARGIN_Y: f32 = 6.0;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(Color32::from_rgb(30, 30, 38))
-                    .inner_margin(8.0),
+                    .inner_margin(egui::Margin::symmetric(MARGIN_X as i8, MARGIN_Y as i8)),
             )
             .show(ctx, |ui| {
-                if !msg.preedit.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&msg.preedit)
-                            .size(16.0)
-                            .color(Color32::from_rgb(180, 190, 210)),
-                    );
-                    ui.add_space(4.0);
-                }
-                for (i, text) in msg.candidates.iter().take(9).enumerate() {
-                    let line = format!("{}. {text}", i + 1);
-                    let color = if i == msg.highlight {
-                        Color32::from_rgb(255, 220, 120)
-                    } else {
-                        Color32::from_rgb(240, 240, 245)
-                    };
-                    ui.label(egui::RichText::new(line).size(18.0).color(color));
-                }
+                ui.horizontal(|ui| {
+                    if !msg.preedit.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&msg.preedit)
+                                .size(14.0)
+                                .color(Color32::from_rgb(150, 160, 180)),
+                        );
+                        ui.separator();
+                    }
+                    for (i, text) in msg.candidates.iter().take(9).enumerate() {
+                        let entry = format!("{}. {}", i + 1, text);
+                        let label = egui::RichText::new(entry).size(16.0);
+                        let label = if i == msg.highlight {
+                            label.color(Color32::from_rgb(255, 220, 120))
+                        } else {
+                            label.color(Color32::from_rgb(240, 240, 245))
+                        };
+                        ui.label(label);
+                        if i + 1 < msg.candidates.len().min(9) {
+                            ui.add_space(10.0);
+                        }
+                    }
+                });
             });
+
+        // 内容自适应：used_size + 内边距，钳在 [140, 760]，只在变化时发
+        let used = ctx.used_size();
+        let target = Vec2::new(
+            (used.x + 2.0 * MARGIN_X + 2.0).clamp(140.0, 760.0),
+            (used.y + 2.0 * MARGIN_Y + 2.0).clamp(40.0, 60.0),
+        );
+        if (target - self.last_size).length() > 1.0 {
+            self.last_size = target;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+        }
+    }
+}
+
+impl PanelApp {
+    fn with_last_size(mut self, size: Vec2) -> Self {
+        self.last_size = size;
+        self
     }
 }
 
@@ -142,13 +166,17 @@ pub fn run() -> eframe::Result {
             .with_decorations(false)
             .with_always_on_top()
             .with_transparent(false)
-            .with_inner_size([420.0, 220.0])
+            .with_inner_size([420.0, 48.0])
             .with_resizable(false),
         ..Default::default()
     };
     eframe::run_native(
         "kime-panel",
         options,
-        Box::new(|cc| Ok(Box::new(PanelApp::new(cc)))),
+        Box::new(|cc| {
+            Ok(Box::new(
+                PanelApp::new(cc).with_last_size(Vec2::new(420.0, 48.0)),
+            ))
+        }),
     )
 }
