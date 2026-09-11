@@ -95,11 +95,13 @@ fn install_cjk_font(ctx: &egui::Context) {
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         let msg = self.state.lock().map(|g| g.clone()).unwrap_or_default();
         // preedit 由应用内联显示（set_preedit_string），面板只画候选
         let visible = !msg.candidates.is_empty();
+        // 空闲降帧：30fps 轮询，不常驻 60fps 烧 CPU/GPU
+        let interval = if visible { 16 } else { 33 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
 
         const MARGIN_X: f32 = 10.0;
         const MARGIN_Y: f32 = 6.0;
@@ -148,6 +150,10 @@ impl eframe::App for PanelApp {
             self.last_size = target;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
         }
+    }
+    /// GL 清屏色恒为全透明；实底由可见帧自己画。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 }
 
