@@ -377,59 +377,53 @@ impl Engine {
             return;
         }
 
-        // 双拼模式
+        // 双拼模式：解码失败时回退全拼切分（允许全拼混输，与 fcitx5 双拼行为一致）
         if let Some(ref table) = self.sp {
             let len = self.letters.len();
-            if len % 2 == 0 {
-                // 偶长：完整解码
-                match table.to_syllables(&self.letters) {
-                    Ok(syllables) => {
-                        self.last_reading = syllables.clone();
-                        self.preedit = syllables.join("");
-                        self.candidates = self
-                            .dict
-                            .lookup_prefix(&syllables, "", self.config.candidate_limit)
-                            .unwrap_or_default();
-                    }
-                    Err(_) => {
-                        // 解码失败（非法键对/非字母）-> 清空候选与读音
-                        self.candidates.clear();
-                        self.last_reading.clear();
-                        self.preedit = self.letters.clone();
-                    }
-                }
+            let decoded = if len % 2 == 0 {
+                table.to_syllables(&self.letters)
             } else {
-                // 奇长：前 len-1 解码，最后一个字母作 tail 前缀
-                let prefix = &self.letters[..len - 1];
-                let tail = &self.letters[len - 1..];
-                match table.to_syllables(prefix) {
-                    Ok(syllables) => {
-                        self.last_reading = syllables.clone();
-                        self.preedit = format!("{}{}", syllables.join(""), tail);
-                        self.candidates = self
+                table.to_syllables(&self.letters[..len - 1])
+            };
+            match decoded {
+                Ok(syllables) => {
+                    let tail = if len % 2 == 0 {
+                        ""
+                    } else {
+                        &self.letters[len - 1..]
+                    };
+                    self.last_reading = syllables.clone();
+                    self.preedit = format!("{}{}", syllables.join(""), tail);
+                    self.candidates = self
+                        .dict
+                        .lookup_prefix(&syllables, tail, self.config.candidate_limit)
+                        .unwrap_or_default();
+                    if self.candidates.is_empty() {
+                        if let Ok(ab) = self
                             .dict
-                            .lookup_prefix(&syllables, tail, self.config.candidate_limit)
-                            .unwrap_or_default();
+                            .lookup_abbrev(&self.letters, self.config.candidate_limit)
+                        {
+                            self.candidates = ab;
+                        }
                     }
-                    Err(_) => {
-                        self.candidates.clear();
-                        self.last_reading.clear();
-                        self.preedit = self.letters.clone();
+                    if self.candidates.is_empty() {
+                        // 双拼解出错误音节（如 nihao→ni+ha）且查无词 → 全拼重试
+                        self.refresh_full_pinyin();
                     }
                 }
-            }
-            if self.candidates.is_empty() {
-                if let Ok(ab) = self
-                    .dict
-                    .lookup_abbrev(&self.letters, self.config.candidate_limit)
-                {
-                    self.candidates = ab;
+                Err(_) => {
+                    // 非法键对：按全拼重新切分（preedit 保持原字母串）
+                    self.refresh_full_pinyin();
                 }
             }
             return;
         }
 
-        // 全拼模式（原有逻辑 + abbrev 兜底）
+        self.refresh_full_pinyin();
+    }
+
+    /// 全拼路径：segment 切分 + 前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
+    fn refresh_full_pinyin(&mut self) {
         let segs = segment(&self.letters);
         let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.first().cloned() {
             let mut r = reading;
@@ -624,7 +618,9 @@ mod tests {
                ('a',     '安',  8000,'a', 0),
                ('a''a',  '啊啊',   1,'a', 0),
                ('ni''hao','你好',5000,'h%',0),
-               ('ni''hao','你好',5000,'x',0);
+               ('ni''hao','你好',5000,'x',0),
+               ('fan''gan','反感',600,'fg',0),
+               ('fang''an','方案',900,'fa',0);
             ",
         )
         .unwrap();
@@ -705,28 +701,12 @@ mod tests {
     }
 
     #[test]
-    fn shuangpin_decode_error_clears_candidates() {
-        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
-        // 非法的双拼码，比如 "abc"（奇数长度 -> 错误）
-        for c in "abc".chars() {
-            e.key(k(c));
-        }
-        // 解码错误时，candidate 应清空，preedit 保持原字母
-        assert!(e.candidates().is_empty());
-        assert_eq!(e.preedit(), "abc");
-        // last_reading 应为空（引擎清空状态）
-        assert!(e.last_reading.is_empty());
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
     fn digit_selection_triggers_learn_and_reorders_candidates() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nih".chars() {
             e.key(k(c));
         }
-        // 1 选词 "你好"，应触发 learn -> 候选顺��序变化
+        // 1 选词 "你好"，应触发 learn -> 候选顺序变化
         let outcome = e.key(k('1'));
         match outcome {
             Outcome::Commit(t) => assert_eq!(t, "你好"),

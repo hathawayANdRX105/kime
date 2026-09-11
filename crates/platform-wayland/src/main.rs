@@ -270,11 +270,13 @@ impl AppState {
                 let engine = Engine::new(dict, config.clone());
                 self.tray.set_chinese(engine.chinese());
                 self.engine = Some(engine);
-                let (tx, rx) = channel();
                 let endpoint = config.ai_endpoint.clone().unwrap_or_default();
-                let model = config.ai_model.clone();
-                self.llm_worker = Some(LlmWorker::new(endpoint, model, tx));
-                self.llm_receiver = Some(rx);
+                if !endpoint.is_empty() {
+                    let (tx, rx) = channel();
+                    let model = config.ai_model.clone();
+                    self.llm_worker = Some(LlmWorker::new(endpoint, model, tx));
+                    self.llm_receiver = Some(rx);
+                }
             }
             Err(e) => log(&format!("failed to open dict {dict_path}: {e}")),
         }
