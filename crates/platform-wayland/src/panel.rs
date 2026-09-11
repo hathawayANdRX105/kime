@@ -100,13 +100,20 @@ impl eframe::App for PanelApp {
         let msg = self.state.lock().map(|g| g.clone()).unwrap_or_default();
         // preedit 由应用内联显示（set_preedit_string），面板只画候选
         let visible = !msg.candidates.is_empty();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
-        if !visible {
-            return;
-        }
 
         const MARGIN_X: f32 = 10.0;
         const MARGIN_Y: f32 = 6.0;
+
+        if !visible {
+            // 空闲：画全透明帧。winit/mango 忽略 Visible(false)，只能靠透明“消失”。
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
+                .show(ctx, |ui| {
+                    ui.set_min_size(Vec2::new(420.0, 48.0));
+                });
+            return;
+        }
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -158,7 +165,7 @@ pub fn run() -> eframe::Result {
             .with_app_id("kime-panel")
             .with_decorations(false)
             .with_always_on_top()
-            .with_transparent(false)
+            .with_transparent(true)
             .with_inner_size([420.0, 48.0])
             .with_resizable(false),
         ..Default::default()
