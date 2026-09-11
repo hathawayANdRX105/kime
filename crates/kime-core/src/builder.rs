@@ -4,11 +4,12 @@
 //!
 //! ```text
 //! [magic: 4 b"KIME"]
+//! [version: u32 LE]            // 当前 = 2（v1 块计数为 u16，已废弃）
 //! [fst_len: u32 LE]            // FST 序列化后的字节数
 //! [fst_bytes: <fst_len>]       // fst::Set，key = pinyin（`'` 连接），字典序
 //! [values: per-key blocks]      // 与 FST key 同序
 //!   对每个 key（按 FST 序）：
-//!     [count: u16 LE] × 该拼音的候选数
+//!     [count: u32 LE] × 该拼音的候选数
 //!     count 次：[text_len: u24 LE (3B)][text: utf8][freq: u32 LE]
 //! ```
 
@@ -65,9 +66,12 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
     let mut total_candidates = 0u64;
     for pinyin in &pinyins {
         let cands = groups.get(pinyin).unwrap();
-        let count = cands.len() as u16;
+        // 计数必须是 u32：rime-ice 的 pinyin='100' 组有 98 万条，u16 会回绕成 63457。
+        let Ok(count) = u32::try_from(cands.len()) else {
+            anyhow::bail!("单拼音候选数超出 u32: {pinyin} = {}", cands.len());
+        };
         values.extend_from_slice(&count.to_le_bytes());
-        total_candidates += count as u64;
+        total_candidates += cands.len() as u64;
         for cand in cands {
             let bytes = cand.text.as_bytes();
             let len = bytes.len();
@@ -84,7 +88,8 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
     }
 
     let mut file = BufWriter::new(File::create(out_bin)?);
-    file.write_all(b"KIME")?;
+    file.write_all(crate::store::MAGIC)?;
+    file.write_all(&crate::store::FORMAT_VERSION.to_le_bytes())?;
     file.write_all(&fst_len.to_le_bytes())?;
     file.write_all(&fst_bytes)?;
     file.write_all(&values)?;

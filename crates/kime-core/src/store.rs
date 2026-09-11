@@ -14,7 +14,17 @@ use memmap2::Mmap;
 
 use crate::dict::Candidate;
 
-const MAGIC: &[u8; 4] = b"KIME";
+pub(crate) const MAGIC: &[u8; 4] = b"KIME";
+/// 词库格式版本。v2：块候选计数 u16 → u32。v1 的 u16 在候选数 > 65535 时回绕
+/// （rime-ice 的 `100` 组 980,961 条 → 63457），values 区扫描随之错位。
+pub(crate) const FORMAT_VERSION: u32 = 2;
+/// 头部：magic(4) + version(u32) + fst_len(u32)
+pub(crate) const HEADER_LEN: usize = 12;
+/// 块头：候选计数宽度
+const COUNT_LEN: usize = 4;
+/// 单条候选：[text_len: u24][text][freq: u32]
+const TEXT_LEN_LEN: usize = 3;
+const FREQ_LEN: usize = 4;
 
 pub struct FstStore {
     _mmap: Mmap,
@@ -31,14 +41,21 @@ impl FstStore {
             .with_context(|| format!("打开 FST 词库失败: {}", bin_path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap FST 词库失败: {}", bin_path.display()))?;
-        if mmap.len() < 8 || &mmap[..4] != MAGIC {
+        if mmap.len() < HEADER_LEN || &mmap[..4] != MAGIC {
             anyhow::bail!(
                 "{} 不是合法的 dict.bin（magic 校验失败）",
                 bin_path.display()
             );
         }
-        let fst_len = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
-        if 8 + fst_len > mmap.len() {
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            anyhow::bail!(
+                "{} 是 dict.bin v{version}，本版本只支持 v{FORMAT_VERSION}，请重新 build-dict",
+                bin_path.display()
+            );
+        }
+        let fst_len = u32::from_le_bytes(mmap[8..HEADER_LEN].try_into().unwrap()) as usize;
+        if HEADER_LEN + fst_len > mmap.len() {
             anyhow::bail!(
                 "{} 头部声明 fst_len={} 超出文件大小 {}",
                 bin_path.display(),
@@ -46,8 +63,8 @@ impl FstStore {
                 mmap.len()
             );
         }
-        let fst_bytes = &mmap[8..8 + fst_len];
-        let values_start = 8 + fst_len;
+        let fst_bytes = &mmap[HEADER_LEN..HEADER_LEN + fst_len];
+        let values_start = HEADER_LEN + fst_len;
         let values = mmap[values_start..].to_vec();
 
         let fst = Set::new(fst_bytes.to_vec()).with_context(|| "FST 索引区解析失败")?;
@@ -57,23 +74,26 @@ impl FstStore {
         let mut pos = 0usize;
         for (key_idx, key) in keys.iter().enumerate() {
             let block_start = pos;
-            if pos + 2 > values.len() {
-                break;
-            }
-            let count = u16::from_le_bytes([values[pos], values[pos + 1]]) as usize;
-            pos += 2;
-            for _ in 0..count {
-                if pos + 3 > values.len() {
-                    break;
-                }
-                let text_len = (values[pos] as usize)
-                    | ((values[pos + 1] as usize) << 8)
-                    | ((values[pos + 2] as usize) << 16);
-                pos += 3 + text_len + 4;
-            }
+            pos = scan_block(&values, pos).with_context(|| {
+                format!(
+                    "{} values 区在第 {key_idx} 块（key={key}，偏移 {block_start}）错位，共 {} 字节",
+                    bin_path.display(),
+                    values.len()
+                )
+            })?;
             blocks.push((key.clone(), block_start));
             let abbrev: String = key.split('\'').filter_map(|s| s.chars().next()).collect();
             abbrev_index.entry(abbrev).or_default().push(key_idx);
+        }
+        // 完整性校验：块必须严丝合缝铺满 values 区，否则说明计数/长度错位（旧格式或被截断），
+        // 交给 Dict::open 回退 SQLite 内存索引，绝不带着残缺 blocks 继续查。
+        if pos != values.len() {
+            anyhow::bail!(
+                "{} values 区不完整：扫描消费 {pos}，实际 {} 字节 / {} 个 key",
+                bin_path.display(),
+                values.len(),
+                keys.len()
+            );
         }
 
         Ok(Self {
@@ -165,30 +185,53 @@ fn increment_prefix(prefix: &str) -> Option<String> {
     Some(chars.into_iter().collect())
 }
 
+/// 读块头候选计数（u32 LE）；越界返回 None。
+fn block_count(data: &[u8], start: usize) -> Option<usize> {
+    let b = data.get(start..start + COUNT_LEN)?;
+    Some(u32::from_le_bytes(b.try_into().unwrap()) as usize)
+}
+
+/// 读单条候选的 text_len（u24 LE）；越界返回 None。
+fn text_len_at(data: &[u8], pos: usize) -> Option<usize> {
+    let b = data.get(pos..pos + TEXT_LEN_LEN)?;
+    Some(b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16)
+}
+
+/// 跳过 values 区的一个块，返回下一块偏移；畸形或越界返回 None（open 转成 Err）。
+fn scan_block(data: &[u8], start: usize) -> Option<usize> {
+    let count = block_count(data, start)?;
+    let mut pos = start + COUNT_LEN;
+    for _ in 0..count {
+        pos += TEXT_LEN_LEN + text_len_at(data, pos)? + FREQ_LEN;
+        if pos > data.len() {
+            return None;
+        }
+    }
+    Some(pos)
+}
+
 /// 解码 values 区一个块为候选词列表。
+///
+/// 旧代码用「块首字节 == 0」判空块：计数换成 u32 LE 之后 256 条的块首字节同样是 0，
+/// 该捷径会静默吞掉整块，故改为按 count 走。
 fn decode_block(data: &[u8], mut pos: usize, pinyin: &str) -> Vec<Candidate> {
     let mut out = Vec::new();
-    if pos >= data.len() || data[pos] == 0 {
+    let Some(count) = block_count(data, pos) else {
         return out;
-    }
-    let count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
+    };
+    pos += COUNT_LEN;
     for _ in 0..count {
-        if pos + 3 > data.len() {
+        let Some(text_len) = text_len_at(data, pos) else {
             break;
-        }
-        let text_len = (data[pos] as usize)
-            | ((data[pos + 1] as usize) << 8)
-            | ((data[pos + 2] as usize) << 16);
-        pos += 3;
-        if pos + text_len + 4 > data.len() {
+        };
+        pos += TEXT_LEN_LEN;
+        if pos + text_len + FREQ_LEN > data.len() {
             break;
         }
         let text = String::from_utf8_lossy(&data[pos..pos + text_len]).into_owned();
         pos += text_len;
-        let freq =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
-        pos += 4;
+        let freq = u32::from_le_bytes(data[pos..pos + FREQ_LEN].try_into().unwrap()) as u64;
+        pos += FREQ_LEN;
         out.push(Candidate {
             text,
             pinyin: pinyin.to_string(),
