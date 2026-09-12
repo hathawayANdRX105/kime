@@ -2,13 +2,31 @@
 //! socket 读取在后台线程：mango 对透明空闲帧停发 frame-done 时渲染循环会卡在 swap，
 //! 若在 update() 里 poll，面板会对 IME 消息聋 20s~8min（实测）。
 
-use std::os::unix::net::UnixDatagram;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontTweak, Vec2};
 use serde::{Deserialize, Serialize};
+
+/// 光标矩形：IME 把 `text_input_rectangle`（surface local）加上焦点窗口原点，
+/// 换算成绝对屏幕坐标后随消息带来。面板只关心「落在哪儿」，钳制在 place_cursor 里算。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct CaretRect {
+    /// 光标行左上角（绝对屏幕坐标）
+    pub x: i32,
+    pub y: i32,
+    /// 光标行高：面板默认贴在下沿
+    pub height: i32,
+    /// 光标所在屏幕的绝对边界，越界钳制用
+    pub screen_x: i32,
+    pub screen_y: i32,
+    pub screen_w: i32,
+    pub screen_h: i32,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PanelMsg {
@@ -18,6 +36,33 @@ pub struct PanelMsg {
     pub highlight: usize,
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// None = 没拿到光标位置（旧版 IME / 非 mango 会话 / IPC 失败）→ 面板保持原位。
+    /// 缺字段时 serde 也给 None，所以老消息照样能解。
+    #[serde(default)]
+    pub cursor: Option<CaretRect>,
+}
+
+/// 面板左上角落点：贴光标行下方；右边超出屏幕则左移贴边，下方放不下则翻到光标上方。
+/// 纯计算，不碰 wayland/egui/IPC —— tests/panel_placement.rs 直接断言边界。
+pub fn place_cursor(c: &CaretRect, panel_w: f32, panel_h: f32) -> (f32, f32) {
+    let (left, top) = (c.screen_x as f32, c.screen_y as f32);
+    let (right, bottom) = (
+        left + c.screen_w.max(0) as f32,
+        top + c.screen_h.max(0) as f32,
+    );
+    let mut x = c.x as f32;
+    if x + panel_w > right {
+        x = right - panel_w;
+    }
+    let mut y = c.y as f32 + c.height.max(0) as f32;
+    if y + panel_h > bottom {
+        y = c.y as f32 - panel_h;
+    }
+    // 面板比屏幕还宽/还高时上式会把落点推出边界，最后夹回屏幕内
+    (
+        x.clamp(left, right.max(left)),
+        y.clamp(top, bottom.max(top)),
+    )
 }
 
 pub fn socket_path() -> PathBuf {
@@ -53,6 +98,134 @@ pub fn send_hide() {
     send(&PanelMsg::default());
 }
 
+// ---- mango IPC ---------------------------------------------------------------
+// `MANGO_INSTANCE_SIGNATURE` 就是 socket 路径（mmsg 也读它）。协议：一行 JSON 命令
+// → 一行 JSON 回答，直连实测 ~0.1ms。绝不 fork mmsg：每次按键 spawn 一个进程太贵。
+// 任何失败（非 mango 会话 / compositor 卡住）都返回 None，调用方退化成不挪窗口。
+
+fn mango_ipc(cmd: &str) -> Option<serde_json::Value> {
+    let path = std::env::var("MANGO_INSTANCE_SIGNATURE").ok()?;
+    let mut s = UnixStream::connect(path).ok()?;
+    // 双向 50ms 死线：这条路径在按键线程上，宁可拿不到坐标也不能卡住输入
+    let timeout = Some(Duration::from_millis(50));
+    let _ = s.set_write_timeout(timeout);
+    let _ = s.set_read_timeout(timeout);
+    s.write_all(cmd.as_bytes()).ok()?;
+    s.write_all(b"\n").ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.contains(&b'\n') || buf.len() > 1 << 20 {
+                    break;
+                }
+            }
+        }
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+fn json_i32(v: &serde_json::Value, key: &str) -> i32 {
+    v.get(key).and_then(|n| n.as_i64()).unwrap_or(0) as i32
+}
+
+/// 绝对几何：x, y, w, h。width/height 为 0 = 关掉的屏（eDP 只用外接时就是 0）或查询失败。
+fn json_rect(v: &serde_json::Value) -> Option<(i32, i32, i32, i32)> {
+    let (w, h) = (json_i32(v, "width"), json_i32(v, "height"));
+    (w > 0 && h > 0).then(|| (json_i32(v, "x"), json_i32(v, "y"), w, h))
+}
+
+/// 焦点窗口（surface-local 光标 rect 的平移原点）+ 它所在的屏幕名。
+pub struct FocusWin {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub monitor: Option<String>,
+}
+
+/// 焦点窗口几何。回答里没有 error 才算成功。
+pub fn mango_focusing_client() -> Option<FocusWin> {
+    let v = mango_ipc("get focusing-client")?;
+    if v.get("error").is_some() {
+        return None;
+    }
+    Some(FocusWin {
+        x: json_i32(&v, "x"),
+        y: json_i32(&v, "y"),
+        w: json_i32(&v, "width"),
+        h: json_i32(&v, "height"),
+        monitor: v.get("monitor").and_then(|m| m.as_str()).map(str::to_owned),
+    })
+}
+
+/// 光标所在屏幕的边界。`mango get monitor <name>` 失败时退回第一块 active 屏。
+pub fn mango_screen(monitor: Option<&str>) -> Option<(i32, i32, i32, i32)> {
+    if let Some(name) = monitor {
+        if let Some(r) = mango_ipc(&format!("get monitor {name}"))
+            .as_ref()
+            .and_then(json_rect)
+        {
+            return Some(r);
+        }
+    }
+    let all = mango_ipc("get all-monitors")?;
+    all.get("monitors")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("active").and_then(|a| a.as_bool()) == Some(true))
+        .and_then(json_rect)
+}
+
+/// 本进程自己的窗口：(client id, 绝对 x, y, w, h)。按 pid 认领，别拿 appid 猜。
+/// mango 对不存在的 client id 会把 dispatch 落到**当前焦点窗口**，所以 id 只能现查、
+/// 绝不能用缓存 —— 查错就是把用户的窗口搬走。
+fn mango_self() -> Option<(i64, i32, i32, i32, i32)> {
+    let pid = i64::from(std::process::id());
+    let c = mango_ipc("get all-clients")?
+        .get("clients")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("pid").and_then(|p| p.as_i64()) == Some(pid))?
+        .clone();
+    Some((
+        c.get("id")?.as_i64()?,
+        json_i32(&c, "x"),
+        json_i32(&c, "y"),
+        json_i32(&c, "width"),
+        json_i32(&c, "height"),
+    ))
+}
+
+/// 面板贴到光标旁。落点尺寸问合成器拿真实值 —— 面板自己的 `last_size` 可能还是
+/// 上一帧内容的尺寸，钳制会偏。非 mango 会话查不到 → 退化成不钳制。
+fn follow_cursor(ctx: &egui::Context, cur: &CaretRect) {
+    let me = mango_self();
+    let (x, y) = match me {
+        Some((_, _, _, w, h)) => place_cursor(cur, w as f32, h as f32),
+        None => (cur.x as f32, (cur.y + cur.height.max(0)) as f32),
+    };
+    // 与现状一致就一条命令都不发：每帧刷位置会抖，也白给合成器加 damage
+    if let Some((_, cx, cy, _, _)) = me {
+        if (x - cx as f32).abs() < 0.5 && (y - cy as f32).abs() < 0.5 {
+            return;
+        }
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+    if let Some((id, _, _, _, _)) = me {
+        // 实测 mango 0.16.1：dispatch movewin 的参数是绝对屏幕坐标。
+        // winit 的 set_outer_position 在 Wayland 上是空实现（协议不允许 toplevel
+        // 自定位），所以真正搬窗的是这条。
+        mango_ipc(&format!(
+            "dispatch movewin,{},{} client,{id}",
+            x as i32, y as i32
+        ));
+    }
+}
+
 struct PanelApp {
     state: Arc<Mutex<PanelMsg>>,
     last_size: Vec2,
@@ -77,6 +250,8 @@ impl PanelApp {
     }
 }
 /// 后台读 socket：阻塞 recv 与渲染循环解耦，渲染卡死也永不漏消息。
+/// 挪窗也在这条线程上：窗口不在当前 tag / 全透明帧卡住 swap 时 update() 可能几十秒
+/// 不跑一次，放 update() 里面板就会按旧坐标显示。
 fn spawn_reader(
     sock: UnixDatagram,
     path: PathBuf,
@@ -89,6 +264,9 @@ fn spawn_reader(
             match sock.recv(&mut buf) {
                 Ok(n) => {
                     if let Ok(msg) = serde_json::from_slice::<PanelMsg>(&buf[..n]) {
+                        if let Some(cur) = msg.cursor {
+                            follow_cursor(&ctx, &cur);
+                        }
                         if let Ok(mut g) = state.lock() {
                             *g = msg;
                         }
