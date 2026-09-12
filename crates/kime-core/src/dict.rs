@@ -595,21 +595,20 @@ mod tests {
         yaml
     }
 
+    /// `lookup` 是精确查询：只返回该读音自己的词。
+    /// （曾用 `lookup_prefix(.., "", ..)` 实现，那是前缀区间，见
+    /// `tests/lookup_exact_test.rs`。）
     #[test]
-    fn lookup_prefix_empty_tail_equals_exact_lookup() {
+    fn lookup_returns_only_the_exact_reading() {
         let yaml = seed_yaml("...\n你好\tni hao\t5000\n我们\two men\t4000\n");
         let db = tmp_db("seed");
         let mut d = Dict::open(&db).unwrap();
         d.import(&yaml).unwrap();
         let exact = d.lookup(&["ni".into(), "hao".into()], 10).unwrap();
-        let prefix = d
-            .lookup_prefix(&["ni".into(), "hao".into()], "", 10)
-            .unwrap();
-        assert_eq!(exact.len(), prefix.len());
-        assert_eq!(exact.len(), 1);
-        assert_eq!(prefix[0].text, "你好");
-        assert_eq!(prefix[0].pinyin, "ni'hao");
-        assert_eq!(prefix[0].freq, 5000);
+        assert_eq!(exact.len(), 1, "另一读音的词不应混入");
+        assert_eq!(exact[0].text, "你好");
+        assert_eq!(exact[0].pinyin, "ni'hao");
+        assert_eq!(exact[0].freq, 5000);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
