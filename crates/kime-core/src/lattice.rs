@@ -5,18 +5,21 @@
 
 use crate::dict::{Candidate, Dict};
 
-/// 每条边的基础代价。取值只需远大于 `FREQ_WEIGHT * ln(freq)` 的波动范围，
-/// 保证「少切几个词」始终优先于「单词频率略高」。
+/// 每条边的基础代价。每个词都收一份，构成「段数少优先」的固定偏置；
+/// 概率项本身（每个多出来的词平均再加 ~10000）已经保证了不会乱切。
 const BASE_COST: f64 = 10000.0;
-/// 词频权重：ln(freq) 的放大系数，决定同样切分数下对高频词的偏好强度。
+/// 概率权重：-ln(p) 的放大系数，决定同样切分数下对高频词的偏好强度。
 const FREQ_WEIGHT: f64 = 1000.0;
 /// 每个词的额外惩罚，抑制把长串切成一堆单字。
 const WORD_PENALTY: f64 = 50.0;
 
-/// Viterbi 最短路径求解，返回最优组合候选（作为第一候选上屏）。
+/// Viterbi 最短路径求解，返回最优组合候选（作为兜底候选上屏）。
 ///
 /// - `reading`: 由 `segment` 产生的完整音节切分，长度需 ≥ 2
-/// - 代价函数：`cost = 10000.0 - ln(max(freq, 1)) * 1000.0 + word_penalty`
+/// - 代价函数：`cost = BASE_COST - ln(p) * FREQ_WEIGHT + WORD_PENALTY`，
+///   其中 `p = freq / 语料总词频`。**必须是概率而不是计数**：多词路径的概率是相乘的，
+///   用计数比就等于拿 `f(知)×f(道)` 压 `f(知道)`，切得越碎越占便宜（实测「知道」501,255
+///   永远输给「知+道」4.4e6×1.06e6，整句吐出「只到」这类错字）。
 /// - 词数惩罚：每个词 +50，鼓励合词而非全碎成单字
 pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
     if reading.len() < 2 {
@@ -31,6 +34,8 @@ pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
 
     dp[0] = 0.0;
     let mut reported_err = false;
+    // 词频换算成概率才可比（见函数头对代价函数的说明）。一次查询，缓存住。
+    let total = dict.total_freq() as f64;
 
     // 对每个起点 i，尝试所有终点 j (i < j <= n)
     for i in 0..n {
@@ -56,8 +61,10 @@ pub fn viterbi_sentence(dict: &Dict, reading: &[String]) -> Option<Candidate> {
             }
             // `Dict::lookup` 保证按 freq 降序返回，故 cands[0] 即该跨度最佳词
             let best = &cands[0];
-            let freq = best.freq.max(1) as f64;
-            let cost = BASE_COST - freq.ln() * FREQ_WEIGHT + WORD_PENALTY;
+            // p = freq / 语料总词频。多词路径的概率是相乘的，所以「一个真词」
+            // 与「两个高频单字」现在是同量纲比较，而不是计数比大小。
+            let p = best.freq.max(1) as f64 / total;
+            let cost = BASE_COST - p.ln() * FREQ_WEIGHT + WORD_PENALTY;
             let new_cost = dp[i] + cost;
             if new_cost < dp[j] {
                 dp[j] = new_cost;

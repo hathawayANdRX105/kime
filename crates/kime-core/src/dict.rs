@@ -64,6 +64,9 @@ pub struct Dict {
     /// 每次按键都得靠 `idx_phrase_pinyin` 定位再逐行过滤 192 万行里的 user 列，
     /// 实测单键 10–57ms。全量常驻内存后热路径只做二分。
     user_overlay: Vec<IndexEntry>,
+    /// `SUM(freq)`，0 = 还没算。整句联想要把词频换算成概率才可比，见 [`Dict::total_freq`]。
+    /// 只在真正组句时才算一次，不摊到开库路径上（开库刚从 5.2s 压到 ~60ms）。
+    total_freq: std::cell::Cell<u64>,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query.
@@ -177,6 +180,7 @@ impl Dict {
             abbrev_index,
             store,
             user_overlay,
+            total_freq: std::cell::Cell::new(0),
         })
     }
 
@@ -195,6 +199,28 @@ impl Dict {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 语料总词频，用来把「词频计数」换算成可比的概率。
+    ///
+    /// 代价模型若直接拿 `ln(freq)` 相加，就是在比 `f(知)·f(道)` 与 `f(知道)`，量纲不对、
+    /// 切得越碎越占便宜：实测「知道」(501,255) 永远输给「知+道」(4.4e6 × 1.06e6)。
+    /// 除以总量后比的是 `P(知道)` 与 `P(知)·P(道)`，才知道哪个更该出现。
+    pub fn total_freq(&self) -> u64 {
+        let cached = self.total_freq.get();
+        if cached != 0 {
+            return cached;
+        }
+        // rusqlite 不为 u64 实现 FromSql，SUM 只能按 i64 取
+        let sum: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        let v = sum.max(1) as u64;
+        self.total_freq.set(v);
+        v
     }
 
     /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率）。
