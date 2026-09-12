@@ -58,6 +58,12 @@ pub struct Dict {
     abbrev_index: Vec<IndexEntry>,
     /// 可选的 FST 二进制词库存储
     store: Option<crate::store::FstStore>,
+    /// FST 模式下的用户词 overlay，按 pinyin ASC 排序。
+    ///
+    /// 用户词是极小集合（个位到几十条），但 `user = 1` 的 SQL 谓词无索引可用：
+    /// 每次按键都得靠 `idx_phrase_pinyin` 定位再逐行过滤 192 万行里的 user 列，
+    /// 实测单键 10–57ms。全量常驻内存后热路径只做二分。
+    user_overlay: Vec<IndexEntry>,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query.
@@ -106,7 +112,10 @@ impl Dict {
                UNIQUE(pinyin, text)
              );
              CREATE INDEX IF NOT EXISTS idx_phrase_pinyin  ON phrase(pinyin);
-             CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);",
+             CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);
+             -- 部分索引：只收 user = 1 的行（个位到几十条）。开库时载入用户词 overlay
+             -- 靠它一次 seek 拿到，否则 `WHERE user = 1` 无索引可用 → 全表扫 192 万行（实测 2.6s）。
+             CREATE INDEX IF NOT EXISTS idx_phrase_user ON phrase(pinyin) WHERE user = 1;",
         )?;
         // Try to load FST binary if present alongside DB
         let bin_path = Self::dict_bin_path(path);
@@ -155,12 +164,37 @@ impl Dict {
                 .then_with(|| b.freq.cmp(&a.freq))
                 .then_with(|| a.text.cmp(&b.text))
         });
+        // FST 模式下用户词 overlay 全量入内存：热路径靠它，不再每键查 SQLite。
+        // 纯 SQLite 模式下 `index` 本身就含用户词，overlay 留空。
+        let user_overlay = if store.is_some() {
+            Self::load_user_overlay(&conn)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             conn,
             index,
             abbrev_index,
             store,
+            user_overlay,
         })
+    }
+
+    /// 读出全部 `user = 1` 行，按 pinyin ASC 排序（前缀二分要求）。
+    fn load_user_overlay(conn: &Connection) -> Result<Vec<IndexEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT pinyin, text, freq, abbrev, user FROM phrase WHERE user = 1 ORDER BY pinyin ASC",
+        )?;
+        let rows = stmt.query_map(params![], |row| {
+            Ok(IndexEntry {
+                pinyin: row.get(0)?,
+                text: row.get(1)?,
+                freq: row.get(2)?,
+                abbrev: row.get(3)?,
+                user: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率），
@@ -236,38 +270,83 @@ impl Dict {
         Ok(count)
     }
 
+    /// 用户词 overlay：精确 pinyin 命中。`user_overlay` 按 pinyin ASC，二分定位后线性取等值段。
+    fn overlay_exact(&self, joined: &str) -> Vec<Candidate> {
+        let start = self
+            .user_overlay
+            .partition_point(|e| e.pinyin.as_str() < joined);
+        self.user_overlay[start..]
+            .iter()
+            .take_while(|e| e.pinyin == joined)
+            .map(Self::entry_to_candidate)
+            .collect()
+    }
+
+    /// 用户词 overlay：pinyin 前缀区间 `[lower, upper)`。`upper` 为 None 表示无上界（前缀以 z 结尾）。
+    fn overlay_prefix(&self, lower: &str, upper: Option<&str>) -> Vec<Candidate> {
+        let start = self
+            .user_overlay
+            .partition_point(|e| e.pinyin.as_str() < lower);
+        self.user_overlay[start..]
+            .iter()
+            .take_while(|e| match upper {
+                Some(up) => e.pinyin.as_str() < up,
+                None => e.pinyin.starts_with(lower),
+            })
+            .map(Self::entry_to_candidate)
+            .collect()
+    }
+
+    /// 用户词 overlay：abbrev 前缀命中。overlay 按 pinyin 排序，abbrev 只能全扫——
+    /// 集合是个位到几十条，扫一遍比维护第二份排序便宜。
+    fn overlay_abbrev(&self, initials: &str) -> Vec<Candidate> {
+        self.user_overlay
+            .iter()
+            .filter(|e| e.abbrev.starts_with(initials))
+            .map(Self::entry_to_candidate)
+            .collect()
+    }
+
+    fn entry_to_candidate(e: &IndexEntry) -> Candidate {
+        Candidate {
+            text: e.text.clone(),
+            pinyin: e.pinyin.clone(),
+            freq: e.freq as u64,
+            ai: false,
+        }
+    }
+
+    /// 用户词覆盖基底词（同文本以用户词频为准），去重后按 (freq DESC, text ASC) 截断。
+    fn merge_overlay(base: Vec<Candidate>, user: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+        if user.is_empty() {
+            // 绝大多数按键走这里：基底已是 freq DESC 有序，不必重排。
+            let mut base = base;
+            base.truncate(limit);
+            return base;
+        }
+        let mut merged: HashMap<String, Candidate> = HashMap::new();
+        for cand in base {
+            merged.entry(cand.text.clone()).or_insert(cand);
+        }
+        for cand in user {
+            merged.insert(cand.text.clone(), cand);
+        }
+        let mut candidates: Vec<Candidate> = merged.into_values().collect();
+        candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+        candidates.truncate(limit);
+        candidates
+    }
+
     /// 精确查询：读音序列 → 候选，freq 降序 LIMIT limit
     pub fn lookup(&self, reading: &[String], limit: usize) -> Result<Vec<Candidate>> {
         if reading.is_empty() {
             return Ok(Vec::new());
         }
         if let Some(store) = &self.store {
-            let base = store.lookup_prefix(reading, "", limit);
+            let base = store.lookup_exact(reading, limit);
             let joined = reading.join("'");
-            let mut stmt = self.conn.prepare(
-                "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND pinyin = ?1 ORDER BY freq DESC, text ASC",
-            )?;
-            let user_candidates: Vec<Candidate> = stmt
-                .query_map(params![joined], |row| {
-                    Ok(Candidate {
-                        text: row.get(0)?,
-                        pinyin: row.get(1)?,
-                        freq: row.get::<_, i64>(2)? as u64,
-                        ai: false,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut merged: HashMap<String, Candidate> = HashMap::new();
-            for cand in base {
-                merged.entry(cand.text.clone()).or_insert(cand);
-            }
-            for cand in user_candidates {
-                merged.insert(cand.text.clone(), cand);
-            }
-            let mut candidates: Vec<Candidate> = merged.into_values().collect();
-            candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
-            candidates.truncate(limit);
-            return Ok(candidates);
+            let user_candidates = self.overlay_exact(&joined);
+            return Ok(Self::merge_overlay(base, user_candidates, limit));
         }
         let joined = reading.join("'");
         let start = self.index.partition_point(|e| e.pinyin < joined);
@@ -340,34 +419,11 @@ impl Dict {
         if joined.is_empty() {
             return Ok(Vec::new());
         }
-        let upper_bound = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
+        let upper_bound = increment_prefix(&joined);
         let store = self.store.as_ref().unwrap();
         let base_candidates = store.lookup_prefix(syllables, tail, limit);
-        let mut stmt = self.conn.prepare(
-            "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND pinyin >= ?1 AND pinyin < ?2 ORDER BY freq DESC, text ASC",
-        )?;
-        let user_candidates: Vec<Candidate> = stmt
-            .query_map(params![joined, upper_bound], |row| {
-                Ok(Candidate {
-                    text: row.get(0)?,
-                    pinyin: row.get(1)?,
-                    freq: row.get::<_, i64>(2)? as u64,
-                    ai: false,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        // 合并：用户词覆盖基底词，新词插入，去重
-        let mut merged: HashMap<String, Candidate> = HashMap::new();
-        for cand in base_candidates {
-            merged.entry(cand.text.clone()).or_insert(cand);
-        }
-        for cand in user_candidates {
-            merged.insert(cand.text.clone(), cand);
-        }
-        let mut candidates: Vec<Candidate> = merged.into_values().collect();
-        candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
-        candidates.truncate(limit);
-        Ok(candidates)
+        let user_candidates = self.overlay_prefix(&joined, upper_bound.as_deref());
+        Ok(Self::merge_overlay(base_candidates, user_candidates, limit))
     }
 
     /// 声母缩写查询
@@ -379,35 +435,10 @@ impl Dict {
             return Ok(Vec::new());
         }
         if let Some(store) = &self.store {
-            // FST 模式：使用 FST 的 abbrev 索引
+            // FST 模式：使用 FST 的 abbrev 索引，用户词从内存 overlay 补
             let candidates = store.lookup_abbrev(initials, limit);
-            // 补充用户词覆盖
-            let mut stmt = self.conn.prepare(
-                "SELECT text, pinyin, freq FROM phrase WHERE user = 1 AND abbrev >= ?1 AND abbrev < ?2 ORDER BY freq DESC, text ASC",
-            )?;
-            let upper_char = (initials.as_bytes()[initials.len() - 1] + 1) as char;
-            let upper_prefix = format!("{}{}", &initials[..initials.len() - 1], upper_char);
-            let user_candidates: Vec<Candidate> = stmt
-                .query_map(params![initials, upper_prefix], |row| {
-                    Ok(Candidate {
-                        text: row.get(0)?,
-                        pinyin: row.get(1)?,
-                        freq: row.get::<_, i64>(2)? as u64,
-                        ai: false,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut merged: HashMap<String, Candidate> = HashMap::new();
-            for cand in candidates {
-                merged.entry(cand.text.clone()).or_insert(cand);
-            }
-            for cand in user_candidates {
-                merged.insert(cand.text.clone(), cand);
-            }
-            let mut merged_vec: Vec<Candidate> = merged.into_values().collect();
-            merged_vec.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
-            merged_vec.truncate(limit);
-            Ok(merged_vec)
+            let user_candidates = self.overlay_abbrev(initials);
+            Ok(Self::merge_overlay(candidates, user_candidates, limit))
         } else {
             // 回退到内存 abbrev_index
             let lower = self
@@ -435,16 +466,16 @@ impl Dict {
 
     /// 用户词前 N：user=1 行按 freq DESC, text ASC（engine 个性化排序用）。
     pub fn top_user(&self, limit: usize) -> Result<Vec<Candidate>> {
-        let mut candidates: Vec<Candidate> = self
-            .index
+        // FST 模式下 `index` 是空的（词库在 dict.bin 里），用户词只在 overlay 中。
+        let source = if self.store.is_some() {
+            &self.user_overlay
+        } else {
+            &self.index
+        };
+        let mut candidates: Vec<Candidate> = source
             .iter()
             .filter(|e| e.user == 1)
-            .map(|e| Candidate {
-                text: e.text.clone(),
-                pinyin: e.pinyin.clone(),
-                freq: e.freq as u64,
-                ai: false,
-            })
+            .map(Self::entry_to_candidate)
             .collect();
         candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
         candidates.truncate(limit);
@@ -470,8 +501,40 @@ impl Dict {
             )?;
         }
 
-        // FST 模式下 dict.bin 只读，用户词只落 SQLite，由 lookup 时合并 overlay；
-        // 内存索引仅在纯 SQLite 模式下需要同步（此时它就是查询数据源）。
+        // FST 模式：dict.bin 只读，用户词的查询数据源是 user_overlay，必须当场同步，
+        // 否则刚学的词要等到下次开库才查得到。
+        if self.store.is_some() {
+            match self
+                .user_overlay
+                .iter_mut()
+                .find(|e| e.pinyin == joined && e.text == text)
+            {
+                Some(entry) => entry.freq += 1,
+                None => {
+                    // 这行刚从词库词转成用户词（UPDATE 命中，user 0→1），它的真实频率是
+                    // 词库频率 + 1，不是 1。读回权威值，别让 overlay 把候选踢到末尾。
+                    let freq: i64 = self.conn.query_row(
+                        "SELECT freq FROM phrase WHERE pinyin = ?1 AND text = ?2",
+                        params![&joined, text],
+                        |row| row.get(0),
+                    )?;
+                    let pos = self.user_overlay.partition_point(|e| e.pinyin < joined);
+                    self.user_overlay.insert(
+                        pos,
+                        IndexEntry {
+                            pinyin: joined,
+                            text: text.to_string(),
+                            freq,
+                            abbrev,
+                            user: 1,
+                        },
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        // 纯 SQLite 模式：内存索引就是查询数据源。
         if let Some(entry) = self
             .index
             .iter_mut()
@@ -479,7 +542,7 @@ impl Dict {
         {
             entry.freq += 1;
             entry.user = 1;
-        } else if self.store.is_none() {
+        } else {
             let new_entry = IndexEntry {
                 pinyin: joined,
                 text: text.to_string(),

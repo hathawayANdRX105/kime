@@ -366,6 +366,27 @@ impl FstStore {
         }
     }
 
+    /// 精确查询：`syllables` 必须与 key 完全相等。FST 是 `Map<pinyin, key_idx>`，一次 get 即可。
+    ///
+    /// 与 `lookup_prefix(syllables, "", limit)` 不同，后者是前缀区间查询：
+    /// `increment_prefix("ni'hao")` = `"ni'hap"`，区间 `["ni'hao", "ni'hap")` 会带上
+    /// `ni'hao'shi'jie` 这类更长的 key。Viterbi 按跨度 (i,j) 查词，必须只拿该跨度的词，
+    /// 否则 2 音节跨度返回 4 音节的词，格子里的词互相重叠，整句结果变成乱码。
+    pub fn lookup_exact(&self, syllables: &[String], limit: usize) -> Vec<Candidate> {
+        if limit == 0 || syllables.is_empty() {
+            return Vec::new();
+        }
+        let joined = syllables.join("'");
+        let Some(key_idx) = self.fst.get(joined.as_str()) else {
+            return Vec::new();
+        };
+        let Some(data) = self.block(key_idx) else {
+            return Vec::new();
+        };
+        // 块内已按 (freq DESC, text ASC) 写入，解到 limit 即止。
+        decode_block(data, &joined, limit)
+    }
+
     /// 前缀查询：完整音节 + 未完成尾音节。返回按 (freq DESC, text ASC) 排序的至多 limit 条。
     ///
     /// 语义修正（相对 v2）：v2「收集满 limit 即 break」会整体跳过后面的 key，
