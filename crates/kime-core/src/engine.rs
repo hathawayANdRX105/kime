@@ -428,9 +428,7 @@ impl Engine {
                                 self.last_reading = syllables.clone();
                                 self.preedit = format!("{}{}", syllables.join(""), pending);
                             }
-                            if !self.candidates.iter().any(|c| c.text == sentence.text) {
-                                self.candidates.insert(0, sentence);
-                            }
+                            Self::place_sentence(&mut self.candidates, sentence);
                         }
                     }
                 }
@@ -528,14 +526,29 @@ impl Engine {
         if let Some(full_reading) = segs.first() {
             if full_reading.len() >= 2 {
                 if let Some(sentence) = crate::lattice::viterbi_sentence(&self.dict, full_reading) {
-                    if !cands.iter().any(|c| c.text == sentence.text) {
-                        cands.insert(0, sentence);
-                    }
+                    Self::place_sentence(&mut cands, sentence);
                 }
             }
         }
 
         self.candidates = cands;
+    }
+
+    /// 整句候选只当兜底：没有任何直接命中该读音的候选时才许它排第一，否则挂到末尾。
+    ///
+    /// lattice 的代价是 `ln(freq)` 可加的，于是「两个超高频单字」永远比「一个真词」
+    /// 便宜 —— 词库频率修好后实测 `ufme`→神么 压过 什么、`jintian`→级虐差 压过 今天。
+    /// 修数据前是单字 freq 全为 0 恰好把这条错误路径盖住，不是模型对。
+    /// 不动代价模型（那要真正的语料概率），只固定它的名次。
+    fn place_sentence(cands: &mut Vec<Candidate>, sentence: Candidate) {
+        if cands.iter().any(|c| c.text == sentence.text) {
+            return;
+        }
+        if cands.is_empty() {
+            cands.insert(0, sentence);
+        } else {
+            cands.push(sentence);
+        }
     }
 
     /// M5: AI 候选合入当前列表。后台线程完成后由壳回调（仍在主线程执行）
