@@ -21,23 +21,33 @@ const BG: [u8; 4] = [38, 30, 30, 255];
 const FG: Color = Color::rgba(220, 220, 230, 255);
 /// 高亮项：旧面板同款琥珀色，深底对比足够
 const HL: Color = Color::rgba(255, 220, 120, 255);
+/// 模式字：青绿系，与 FG/HL 及其抗锯齿混色都不撞
+const CHIP: Color = Color::rgba(122, 207, 214, 255);
 
-/// 单个已摆放的候选项：x 为内容左沿（不含 MARGIN_X 之外的偏移），w 为实测宽。
+/// 模式标识字：中文 = 候选条开头的 chip；英文 = 无候选时唯一的提示内容。
+pub fn mode_chip(chinese: bool) -> &'static str {
+    if chinese {
+        "中"
+    } else {
+        "英"
+    }
+}
+
+/// 单个已摆放的项：x 为内容左沿，w 为实测宽；chip = 模式字（不编号、不可选）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacedItem {
     pub x: u32,
     pub w: u32,
     pub text: String,
+    pub chip: bool,
 }
 
-/// 一帧的完整摆放结果。空候选 → 1×1（隐藏帧，像素全透明）。
+/// 一帧的完整摆放结果。中文 + 空候选 → 1×1（隐藏帧，像素全透明）；
+/// 英文 + 空候选 → 只含 `英` 字的提示小窗。
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub width: u32,
     pub height: u32,
-    /// 光标行高占位：文本带整体下移这么多像素，候选不压住光标行。
-    /// 拿不到 text_input_rectangle 时为 0（固定偏移兜底）。
-    pub top_gap: u32,
     pub items: Vec<PlacedItem>,
 }
 
@@ -46,7 +56,6 @@ impl Layout {
         Self {
             width: 1,
             height: 1,
-            top_gap: 0,
             items: Vec::new(),
         }
     }
@@ -98,26 +107,40 @@ impl Renderer {
         w.ceil().max(0.0) as u32
     }
 
-    /// 横排单行摆放：每项 "N. 候选"，定宽分隔符，总宽随内容自适应。
-    /// candidates 已是当前页（调用方切好片），这里不再截断。
-    pub fn layout(&mut self, candidates: &[String], top_gap: u32) -> Layout {
-        if candidates.is_empty() {
+    /// 横排单行摆放：模式字打头（不编号），其后每项 "N. 候选"，定宽分隔，
+    /// 总宽随内容自适应。candidates 已是当前页（调用方切好片），这里不再截断。
+    /// 高度只含边距 + 行高：合成器已把 popup 摆在光标旁，表面内不再留光标行空行。
+    pub fn layout(&mut self, candidates: &[String], chinese: bool) -> Layout {
+        if candidates.is_empty() && chinese {
             return Layout::hidden();
         }
-        let mut items = Vec::with_capacity(candidates.len());
+        let mut items = Vec::with_capacity(candidates.len() + 1);
         let mut x = MARGIN_X;
+        let chip = mode_chip(chinese);
+        let w = self.measure(chip);
+        items.push(PlacedItem {
+            x,
+            w,
+            text: chip.to_string(),
+            chip: true,
+        });
+        x += w + SEP;
         for (i, text) in candidates.iter().enumerate() {
             let label = format!("{}. {}", i + 1, text);
             let w = self.measure(&label);
-            items.push(PlacedItem { x, w, text: label });
+            items.push(PlacedItem {
+                x,
+                w,
+                text: label,
+                chip: false,
+            });
             x += w + SEP;
         }
         let width = (x - SEP + MARGIN_X).max(1);
-        let height = top_gap + MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
+        let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
         Layout {
             width,
             height,
-            top_gap,
             items,
         }
     }
@@ -137,10 +160,18 @@ impl Renderer {
         for px in buf.chunks_exact_mut(4) {
             px.copy_from_slice(&BG);
         }
-        let band_top = layout.top_gap + MARGIN_Y;
+        let band_top = MARGIN_Y;
         let band_h = LINE_HEIGHT.ceil() as i32;
-        for (i, item) in layout.items.iter().enumerate() {
-            let color = if i == highlight { HL } else { FG };
+        // highlight 是页内候选下标，模式字永远不算候选
+        let mut cand_idx = 0usize;
+        for item in &layout.items {
+            let color = if item.chip {
+                CHIP
+            } else {
+                let c = if cand_idx == highlight { HL } else { FG };
+                cand_idx += 1;
+                c
+            };
             let mut buffer =
                 Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
             buffer.set_size(None, None);

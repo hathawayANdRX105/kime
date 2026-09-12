@@ -193,8 +193,8 @@ struct PopupCanvas {
     /// 待显示内容：当前页候选 + 页内高亮下标
     content: Vec<String>,
     highlight: usize,
-    /// 光标行高占位（text_input_rectangle.height；拿不到就 0 = 固定偏移）
-    top_gap: u32,
+    /// 引擎中英模式：英文 + 无候选 = 画 `英` 提示小窗；中文 + 无候选 = 隐藏
+    chinese: bool,
 }
 
 impl PopupCanvas {
@@ -218,7 +218,7 @@ impl PopupCanvas {
             dirty: false,
             content: Vec::new(),
             highlight: 0,
-            top_gap: 0,
+            chinese: true,
         };
         canvas.present(qh);
         canvas
@@ -228,22 +228,22 @@ impl PopupCanvas {
         &mut self,
         candidates: Vec<String>,
         highlight: usize,
+        chinese: bool,
         qh: &QueueHandle<AppState>,
     ) {
-        if self.content == candidates && self.highlight == highlight {
+        if self.content == candidates && self.highlight == highlight && self.chinese == chinese {
             return;
         }
         self.content = candidates;
         self.highlight = highlight;
+        self.chinese = chinese;
         self.present(qh);
     }
 
-    fn set_top_gap(&mut self, gap: u32, qh: &QueueHandle<AppState>) {
-        if self.top_gap == gap {
-            return;
-        }
-        self.top_gap = gap;
-        self.present(qh);
+    /// 强制隐藏（deactivate 用）：即便引擎在英文模式也不留提示窗。
+    /// 中文 + 空候选正是 layout() 的隐藏帧条件。
+    fn hide(&mut self, qh: &QueueHandle<AppState>) {
+        self.set_content(Vec::new(), 0, true, qh);
     }
 
     fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
@@ -265,7 +265,7 @@ impl PopupCanvas {
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
     fn present(&mut self, qh: &QueueHandle<AppState>) {
         self.dirty = false;
-        let layout = self.renderer.layout(&self.content, self.top_gap);
+        let layout = self.renderer.layout(&self.content, self.chinese);
         let Some(slot) = self.pick_slot(&layout) else {
             self.dirty = true;
             return;
@@ -394,7 +394,7 @@ struct AppState {
     swallowed: HashSet<u32>,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
-    /// 候选窗：收 text_input_rectangle + 画候选词，同一个 input-popup surface
+    /// 候选窗：画候选词 + 中英模式提示；text_input_rectangle 只留日志
     popup: Option<PopupCanvas>,
 }
 
@@ -533,11 +533,12 @@ impl AppState {
         log("input popup 候选窗已建（已提交 1×1 透明首帧）");
     }
 
-    /// 引擎当前页候选 + 页内高亮 → 进程内渲染层。
+    /// 引擎当前页候选 + 页内高亮 + 中英模式 → 进程内渲染层。
     /// 只画当前页：highlight() 是页首全局下标，页内 = highlight()-start；
     /// 数字键 1..=9/0 与标号天然对齐。不画 preedit（应用自己内联显示）。
+    /// 英文模式候选恒为空 → 渲染层退化为只画 `英` 的提示小窗。
     fn popup_show(&mut self, qh: &QueueHandle<AppState>) {
-        let (page, hl) = match &self.engine {
+        let (page, hl, chinese) = match &self.engine {
             Some(engine) => {
                 let (start, ps) = (engine.highlight(), engine.page().1);
                 let all = engine.candidates();
@@ -545,19 +546,24 @@ impl AppState {
                     .iter()
                     .map(|c| c.text.clone())
                     .collect();
-                (page, engine.highlight().saturating_sub(start))
+                (
+                    page,
+                    engine.highlight().saturating_sub(start),
+                    engine.chinese(),
+                )
             }
-            None => (Vec::new(), 0),
+            None => (Vec::new(), 0, true),
         };
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.set_content(page, hl, qh);
+            canvas.set_content(page, hl, chinese, qh);
         }
     }
 
     /// 隐藏 = 1×1 全透明帧，绝不 destroy surface（可见性归 IM active 状态管）。
+    /// 只在 deactivate 用；键流上的清空走 popup_show（英文模式要显示提示窗）。
     fn popup_hide(&mut self, qh: &QueueHandle<AppState>) {
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.set_content(Vec::new(), 0, qh);
+            canvas.hide(qh);
         }
     }
 
@@ -589,7 +595,9 @@ impl AppState {
             im.set_preedit_string(String::new(), 0, 0);
             im.commit(self.im_serial);
         }
-        self.popup_hide(qh);
+        // 走 popup_show 而非 hide：Shift 上屏原串会同时切到英文模式，
+        // 此时要显示 `英` 提示窗；中文模式下候选已被引擎清空 → 自然回到隐藏帧。
+        self.popup_show(qh);
     }
 }
 
@@ -728,8 +736,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method ACTIVATE");
                 state.input_method = Some(im.clone());
                 state.ensure_engine();
-                // 换应用了：上一家的光标行高作废，等新的 text_input_rectangle
                 state.ensure_popup(im, qh);
+                // 英文模式下 activate 也要立刻见 `英` 提示，不等第一次按键
+                state.popup_show(qh);
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
@@ -835,15 +844,16 @@ impl Dispatch<WlCallback, ()> for AppState {
     }
 }
 
-/// 候选窗只画进这个 surface；坐标由合成器定，rect 只有 height 有用途。
+/// 候选窗只画进这个 surface，摆位全权交给合成器：rect 不再参与布局，只留日志 —
+/// 它是「我们真的被 map 并被摆位了」的唯一真机验收证据。
 impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _popup: &ZwpInputPopupSurfaceV2,
         event: ZwpInputPopupSurfaceEvent,
         _data: &(),
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
     ) {
         if let ZwpInputPopupSurfaceEvent::TextInputRectangle {
             x,
@@ -853,10 +863,6 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
         } = event
         {
             log(&format!("caret rect {x},{y} {width}x{height}"));
-            // 只用 height：候选贴下沿时让出光标行；全 0（应用没报）就 0 偏移
-            if let Some(canvas) = state.popup.as_mut() {
-                canvas.set_top_gap(height.clamp(0, 64) as u32, qh);
-            }
         }
     }
 }
