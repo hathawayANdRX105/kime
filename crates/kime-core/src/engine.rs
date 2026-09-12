@@ -213,7 +213,6 @@ impl Engine {
             }
             if let Some('-') = k.ch {
                 if !k.ctrl && !k.alt && !k.shift {
-                    let total_pages = self.candidates.len().div_ceil(self.page_size());
                     self.page_index = self.page_index.saturating_sub(1);
                     return Outcome::Consumed;
                 }
