@@ -45,7 +45,7 @@ fn decoded(table: &Table) -> HashMap<String, String> {
     map
 }
 
-fn check(fixture: &str, scheme: Scheme, label: &str) {
+fn check(fixture: &str, scheme: Scheme, label: &str) -> usize {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/").to_string() + fixture;
     let rows = allowed(&path);
     let got = decoded(&Table::new(scheme));
@@ -76,16 +76,24 @@ fn check(fixture: &str, scheme: Scheme, label: &str) {
             .is_some_and(|codes| codes.iter().any(|c| c == key));
         assert!(ok, "{label}: 键位 {key} 解成 {syl}，但 rime 不认这个组合");
     }
+    rows.len()
 }
 
 #[test]
 fn ziranma_table_matches_rime_algebra() {
-    check("rime_ziranma.tsv", Scheme::Ziranma, "自然码");
+    // fixture 被清空/截断时 helper 里的双向断言会假过，规模在这里钉住
+    assert!(
+        check("rime_ziranma.tsv", Scheme::Ziranma, "自然码") >= 400,
+        "自然码 fixture 规模异常"
+    );
 }
 
 #[test]
 fn xiaohe_table_matches_rime_algebra() {
-    check("rime_xiaohe.tsv", Scheme::Xiaohe, "小鹤");
+    assert!(
+        check("rime_xiaohe.tsv", Scheme::Xiaohe, "小鹤") >= 400,
+        "小鹤 fixture 规模异常"
+    );
 }
 
 #[test]
