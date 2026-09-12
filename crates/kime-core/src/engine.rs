@@ -378,20 +378,26 @@ impl Engine {
         }
 
         // 双拼模式：解码失败时回退全拼切分（允许全拼混输，与 fcitx5 双拼行为一致）
-        if let Some(ref table) = self.sp {
+        if self.sp.is_some() {
             let len = self.letters.len();
-            let decoded = if len % 2 == 0 {
-                table.to_syllables(&self.letters)
+            // 解码在块表达式里做完，`self.sp` 的借用随块结束：
+            // 后续要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
+            let decoded = {
+                let table = self.sp.as_ref().unwrap();
+                if len % 2 == 0 {
+                    table.to_syllables(&self.letters)
+                } else {
+                    table.to_syllables(&self.letters[..len - 1])
+                }
+            };
+            let tail: String = if len % 2 == 0 {
+                String::new()
             } else {
-                table.to_syllables(&self.letters[..len - 1])
+                self.letters[len - 1..].to_string()
             };
             match decoded {
                 Ok(syllables) => {
-                    let tail = if len % 2 == 0 {
-                        ""
-                    } else {
-                        &self.letters[len - 1..]
-                    };
+                    let tail = tail.as_str();
                     self.last_reading = syllables.clone();
                     self.preedit = format!("{}{}", syllables.join(""), tail);
                     self.candidates = self
@@ -407,8 +413,25 @@ impl Engine {
                         }
                     }
                     if self.candidates.is_empty() {
-                        // 双拼解出错误音节（如 nihao→ni+ha）且查无词 → 全拼重试
+                        // 双拼解出错误音节（如 nihao→ni+ha）且查无词 → 全拼重试。
+                        // 先试全拼：混输的键串按全拼才是对的，此时不该拿双拼音节硬凑句子。
                         self.refresh_full_pinyin();
+                    }
+                    // 整句联想：词库没有整串词条时（「我不知道你说的是什么」这类长句），
+                    // Viterbi 组词是唯一的候选来源。双拼分支此前完全没接，长句一律 0 候选。
+                    if syllables.len() >= 2 {
+                        if let Some(sentence) =
+                            crate::lattice::viterbi_sentence(&self.dict, &syllables)
+                        {
+                            if self.candidates.is_empty() {
+                                // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
+                                self.last_reading = syllables.clone();
+                                self.preedit = format!("{}{}", syllables.join(""), tail);
+                            }
+                            if !self.candidates.iter().any(|c| c.text == sentence.text) {
+                                self.candidates.insert(0, sentence);
+                            }
+                        }
                     }
                 }
                 Err(_) => {
