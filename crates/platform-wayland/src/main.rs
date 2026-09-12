@@ -5,19 +5,22 @@ use std::collections::HashSet;
 use std::env;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Instant;
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Key, Outcome};
-use platform_wayland::panel::{self, PanelMsg};
+use platform_wayland::panel::{self, CaretRect, PanelMsg};
 use platform_wayland::tray::TrayIconManager;
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
+        wl_compositor::WlCompositor,
         wl_keyboard::KeyState,
         wl_registry::{Event as RegistryEvent, WlRegistry},
         wl_seat::{self, WlSeat},
+        wl_surface::WlSurface,
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
@@ -27,6 +30,7 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     },
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_input_method_v2::{Event as ZwpInputMethodEvent, ZwpInputMethodV2},
+    zwp_input_popup_surface_v2::{Event as ZwpInputPopupSurfaceEvent, ZwpInputPopupSurfaceV2},
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -144,6 +148,19 @@ struct SeatBind {
     name: Option<String>,
 }
 
+/// 把 surface-local 光标 rect 平移成绝对坐标所需的一次性上下文（mango IPC 查得）。
+struct CaretBase {
+    /// 焦点窗口左上角（绝对）
+    win_x: i32,
+    win_y: i32,
+    /// 光标所在屏幕边界 x, y, w, h
+    screen: (i32, i32, i32, i32),
+    at: Instant,
+}
+
+/// 焦点窗口原点基本不动：500ms TTL 覆盖一串连续按键，换应用由 ACTIVATE 清缓存。
+const CARET_BASE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct AppState {
     conn: Option<Connection>,
     input_method_manager: Option<ZwpInputMethodManagerV2>,
@@ -155,7 +172,6 @@ struct AppState {
     seats: Vec<SeatBind>,
     target_seat: Option<String>,
     engine: Option<Engine>,
-    window: Option<()>,
     should_exit: bool,
     im_serial: u32,
     tray: TrayIconManager,
@@ -166,6 +182,18 @@ struct AppState {
     shift: bool,
     /// grab 吃掉 press 的键，release 也不转发，避免半截按键
     swallowed: HashSet<u32>,
+    compositor: Option<WlCompositor>,
+    /// 光标位置「天线」：popup surface 只为了收 text_input_rectangle 事件。
+    /// 不 attach buffer、不 commit（本项目历史上拿它当候选窗，mango 从不 map 它，
+    /// 所以候选仍由 egui 面板进程画）。wl_surface 必须与 popup 同存活：协议规定
+    /// popup 存在期间不得销毁它，wayland-client 丢代理即发 destroy。
+    popup_surface: Option<WlSurface>,
+    popup: Option<ZwpInputPopupSurfaceV2>,
+    /// 最近一次 text_input_rectangle，surface local（相对被输入的那个应用窗口）
+    caret_rect: Option<(i32, i32, i32, i32)>,
+    caret_base: Option<CaretBase>,
+    /// 查不到焦点窗口只吼一次，避免每键刷日志
+    caret_warned: bool,
 }
 
 impl AppState {
@@ -181,7 +209,6 @@ impl AppState {
             seats: Vec::new(),
             target_seat,
             engine: None,
-            window: None,
             should_exit: false,
             im_serial: 0,
             tray: TrayIconManager::new(true),
@@ -191,6 +218,12 @@ impl AppState {
             alt: false,
             shift: false,
             swallowed: HashSet::new(),
+            compositor: None,
+            popup_surface: None,
+            popup: None,
+            caret_rect: None,
+            caret_base: None,
+            caret_warned: false,
         }
     }
 
@@ -282,24 +315,91 @@ impl AppState {
         }
     }
 
-    fn ensure_window(&mut self, _im: &ZwpInputMethodV2) {
-        let _ = _im;
+    /// 建光标 rect 订阅：裸 wl_surface + get_input_popup_surface，只收事件不画内容。
+    /// 不 attach buffer 也不 commit —— mango 从不 map 这个 surface（历史踩坑），
+    /// 候选窗由独立 egui 进程画，这里只要 text_input_rectangle 这一个事件。
+    fn ensure_popup(&mut self, im: &ZwpInputMethodV2, qh: &QueueHandle<Self>) {
+        if self.popup.is_some() {
+            return;
+        }
+        let Some(comp) = self.compositor.as_ref() else {
+            log("wl_compositor 未绑定，光标跟随不可用");
+            return;
+        };
+        let surface = comp.create_surface(qh, ());
+        self.popup = Some(im.get_input_popup_surface(&surface, qh, ()));
+        self.popup_surface = Some(surface);
+        log("input popup surface 已建（仅订阅光标 rect）");
     }
 
-    fn apply_consumed(&mut self) {
+    /// 最近一次光标 rect（surface local）→ 绝对坐标 + 所在屏幕边界。
+    /// 焦点窗口原点靠 mango IPC 现查（TTL 缓存，绝不每键 fork mmsg）。查不到就返回
+    /// None：面板保持原位，也比把候选窗甩到猜出来的坐标上强。
+    fn caret_cursor(&mut self) -> Option<CaretRect> {
+        let (x, y, _w, h) = self.caret_rect?;
+        if self
+            .caret_base
+            .as_ref()
+            .is_none_or(|b| b.at.elapsed() >= CARET_BASE_TTL)
+        {
+            self.caret_base = panel::mango_focusing_client().map(|f| {
+                // 拿不到 monitor 边界就用焦点窗口自己的范围兜底
+                let screen = panel::mango_screen(f.monitor.as_deref()).unwrap_or((
+                    f.x,
+                    f.y,
+                    f.w.max(1),
+                    f.h.max(1),
+                ));
+                CaretBase {
+                    win_x: f.x,
+                    win_y: f.y,
+                    screen,
+                    at: Instant::now(),
+                }
+            });
+        }
+        match self.caret_base.as_ref() {
+            Some(b) => {
+                let (sx, sy, sw, sh) = b.screen;
+                Some(CaretRect {
+                    x: b.win_x + x,
+                    y: b.win_y + y,
+                    height: h.max(0),
+                    screen_x: sx,
+                    screen_y: sy,
+                    screen_w: sw,
+                    screen_h: sh,
+                })
+            }
+            None => {
+                if !self.caret_warned {
+                    self.caret_warned = true;
+                    log("mango IPC 拿不到焦点窗口：面板不跟随光标（只报一次）");
+                }
+                None
+            }
+        }
+    }
+
+    /// 光标自己动了（方向键/点击，不经过按键消费路径）：面板有内容时按新坐标重推。
+    fn follow_caret(&mut self) {
+        let shown = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| !e.preedit().is_empty() || !e.candidates().is_empty());
+        if shown {
+            self.push_panel();
+        }
+    }
+
+    /// 把引擎当前页候选推给面板，顺带带上绝对光标坐标。
+    /// 只发当前页：highlight() 即页首全局下标（page_index*page_size），
+    /// 切片后面板标号 1..=ps 与引擎数字键 page_index*page_size+(digit-1) 天然对齐。
+    fn push_panel(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        self.tray.set_chinese(engine.chinese());
         let pe = engine.preedit().to_string();
-        log(&format!("consumed preedit={pe}"));
-        if let Some(im) = &self.input_method {
-            let cursor = pe.len() as i32;
-            im.set_preedit_string(pe.clone(), 0, cursor);
-            im.commit(self.im_serial);
-        }
-        // 只发当前页：highlight() 即页首全局下标（page_index*page_size），
-        // 切片后面板标号 1..=ps 与引擎数字键 page_index*page_size+(digit-1) 天然对齐。
         let (start, ps) = (engine.highlight(), engine.page().1);
         let all = engine.candidates();
         let ui: Vec<String> = all[start.min(all.len())..(start + ps).min(all.len())]
@@ -308,18 +408,35 @@ impl AppState {
             .collect();
         if ui.is_empty() && pe.is_empty() {
             panel::send_hide();
-        } else {
-            panel::send(&PanelMsg {
-                preedit: pe,
-                // 页首对切片本地即 0；引擎无页内光标，数字键直接按位选词
-                highlight: 0,
-                candidates: ui,
-            });
+            return;
         }
-        if let Some(worker) = &self.llm_worker {
-            if let Some(engine) = self.engine.as_ref() {
-                worker.request(engine.preedit().split('\'').map(String::from).collect());
+        panel::send(&PanelMsg {
+            preedit: pe,
+            // 页首对切片本地即 0；引擎无页内光标，数字键直接按位选词
+            highlight: 0,
+            candidates: ui,
+            cursor: self.caret_cursor(),
+        });
+    }
+
+    fn apply_consumed(&mut self) {
+        let syllables = {
+            let Some(engine) = self.engine.as_ref() else {
+                return;
+            };
+            self.tray.set_chinese(engine.chinese());
+            let pe = engine.preedit().to_string();
+            log(&format!("consumed preedit={pe}"));
+            if let Some(im) = &self.input_method {
+                let cursor = pe.len() as i32;
+                im.set_preedit_string(pe.clone(), 0, cursor);
+                im.commit(self.im_serial);
             }
+            pe.split('\'').map(String::from).collect::<Vec<_>>()
+        };
+        self.push_panel();
+        if let Some(worker) = &self.llm_worker {
+            worker.request(syllables);
         }
     }
 
@@ -363,6 +480,11 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
                     state.vk_manager = Some(mgr);
                     log("bound virtual keyboard manager");
                     state.try_bind_vk(qh);
+                }
+                "wl_compositor" if version >= 1 => {
+                    state.compositor =
+                        Some(registry.bind::<WlCompositor, (), AppState>(name, 1, qh, ()));
+                    log(&format!("bound wl_compositor name={name}"));
                 }
                 "wl_seat" if version >= 1 => {
                     let ver = version.min(7);
@@ -460,7 +582,10 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method ACTIVATE");
                 state.input_method = Some(im.clone());
                 state.ensure_engine();
-                state.ensure_window(im);
+                // 换应用了：上一家的光标 rect 作废，等新的 text_input_rectangle
+                state.caret_rect = None;
+                state.caret_base = None;
+                state.ensure_popup(im, qh);
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
@@ -480,6 +605,58 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 state.should_exit = true;
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlCompositor, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _comp: &WlCompositor,
+        _event: <WlCompositor as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlSurface, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _surface: &WlSurface,
+        _event: <WlSurface as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// 光标位置的唯一来源：坐标是 surface local，绝对化在 caret_cursor 里做。
+impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _popup: &ZwpInputPopupSurfaceV2,
+        event: ZwpInputPopupSurfaceEvent,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ZwpInputPopupSurfaceEvent::TextInputRectangle {
+            x,
+            y,
+            width,
+            height,
+        } = event
+        {
+            let rect = (x, y, width, height);
+            if state.caret_rect == Some(rect) {
+                return;
+            }
+            state.caret_rect = Some(rect);
+            log(&format!("caret rect {x},{y} {width}x{height}"));
+            state.follow_caret();
         }
     }
 }
@@ -618,6 +795,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             preedit: "nihao".into(),
             highlight: 0,
             candidates: vec!["你好".into(), "拟好".into()],
+            cursor: None,
         });
         std::thread::sleep(std::time::Duration::from_secs(9));
         panel::send_hide();
@@ -657,6 +835,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .registry()
                             .bind::<WlSeat, (), AppState>(global.name, ver, &qh, ());
                     app.seats.push(SeatBind { seat, name: None });
+                }
+                "wl_compositor" if global.version >= 1 => {
+                    log("Found wl_compositor");
+                    app.compositor = Some(globals.registry().bind::<WlCompositor, (), AppState>(
+                        global.name,
+                        1,
+                        &qh,
+                        (),
+                    ));
                 }
                 _ => {}
             }
