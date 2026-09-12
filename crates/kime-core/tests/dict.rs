@@ -30,9 +30,19 @@ fn dict_open_is_idempotent() {
     let path = tmp_db_path("open_idem");
     let _ = fs::remove_file(&path);
 
-    let _d1 = Dict::open(&path).expect("first open");
-    // Second open over the same file must succeed without "table already exists" errors.
-    let _d2 = Dict::open(&path).expect("second open");
+    let mut d1 = Dict::open(&path).expect("first open");
+    d1.learn(&["ni".into(), "hao".into()], "你好").unwrap();
+    drop(d1);
+
+    // 第二次开同一文件：既不能报 "table already exists"，也必须看得见前一个句柄
+    // 写进去的东西 —— 只 expect() 的话，schema 没建全也能算"成功"。
+    let d2 = Dict::open(&path).expect("second open");
+    let hits = d2.lookup(&["ni".into(), "hao".into()], 10).unwrap();
+    assert!(
+        hits.iter().any(|c| c.text == "你好"),
+        "重开后看不到前一个句柄写入的用户词：实际 {:?}",
+        hits.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+    );
 
     let _ = fs::remove_file(&path);
 }
