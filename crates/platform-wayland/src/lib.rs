@@ -1,9 +1,6 @@
-//! platform-wayland: input-method 壳 + egui 候选窗。
+//! platform-wayland: input-method-v2 壳，候选词直接画进 zwp_input_popup_surface_v2。
 
-pub mod panel;
 pub mod render;
 pub mod tray;
-pub mod window;
 
-pub use render::Candidate;
-pub use render::Renderer;
+pub use render::{Layout, PlacedItem, Renderer};

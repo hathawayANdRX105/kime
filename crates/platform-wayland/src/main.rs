@@ -5,21 +5,24 @@ use std::collections::HashSet;
 use std::env;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Key, Outcome};
-use platform_wayland::panel::{self, CaretRect, PanelMsg};
 use platform_wayland::tray::TrayIconManager;
+use platform_wayland::{Layout, Renderer};
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
+        wl_buffer::WlBuffer,
+        wl_callback::WlCallback,
         wl_compositor::WlCompositor,
         wl_keyboard::KeyState,
         wl_registry::{Event as RegistryEvent, WlRegistry},
         wl_seat::{self, WlSeat},
+        wl_shm::WlShm,
+        wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
@@ -148,18 +151,225 @@ struct SeatBind {
     name: Option<String>,
 }
 
-/// 把 surface-local 光标 rect 平移成绝对坐标所需的一次性上下文（mango IPC 查得）。
-struct CaretBase {
-    /// 焦点窗口左上角（绝对）
-    win_x: i32,
-    win_y: i32,
-    /// 光标所在屏幕边界 x, y, w, h
-    screen: (i32, i32, i32, i32),
-    at: Instant,
+/// 一块 shm 画布：memfd 与其 mmap 必须是同源的（历史上渲染写 B、合成器读 A，
+/// 候选窗永远空白的根因）。Drop 时 munmap+close；WlBuffer 代理丢弃即 destroy。
+struct ShmBuffer {
+    buffer: WlBuffer,
+    fd: i32,
+    ptr: *mut u8,
+    len: usize,
+    w: u32,
+    h: u32,
 }
 
-/// 焦点窗口原点基本不动：500ms TTL 覆盖一串连续按键，换应用由 ACTIVATE 清缓存。
-const CARET_BASE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+impl Drop for ShmBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// wl_buffer user data：release 回来后该槽位重新可用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferSlot(u8);
+
+/// 候选窗本体：zwp_input_popup_surface_v2 + 简单双缓冲。
+///
+/// mango 的摆位守卫读 `surface->mapped`（= attach 过 buffer 且 commit 过），
+/// 所以 surface 一建好就提交 1×1 全透明首帧；此后隐藏同样 = 提交 1×1 透明帧。
+/// surface/role 全程只建一次、绝不销毁——input-popup 的可见性归 IM active 管。
+struct PopupCanvas {
+    surface: WlSurface,
+    _role: ZwpInputPopupSurfaceV2,
+    shm: WlShm,
+    renderer: Renderer,
+    buffers: [Option<ShmBuffer>; 2],
+    free: [bool; 2],
+    frame: Option<WlCallback>,
+    /// 新内容因无空闲 buffer 未能上屏：release/frame 到达即补画
+    dirty: bool,
+    /// 待显示内容：当前页候选 + 页内高亮下标
+    content: Vec<String>,
+    highlight: usize,
+    /// 光标行高占位（text_input_rectangle.height；拿不到就 0 = 固定偏移）
+    top_gap: u32,
+}
+
+impl PopupCanvas {
+    fn new(
+        im: &ZwpInputMethodV2,
+        comp: &WlCompositor,
+        shm: &WlShm,
+        qh: &QueueHandle<AppState>,
+    ) -> Self {
+        let surface = comp.create_surface(qh, ());
+        // 必须用当前这个 zwp_input_method_v2 实例建 popup（历史上绑错过 IME 对象）
+        let _role = im.get_input_popup_surface(&surface, qh, ());
+        let mut canvas = Self {
+            surface,
+            _role,
+            shm: shm.clone(),
+            renderer: Renderer::new(),
+            buffers: [None, None],
+            free: [true, true],
+            frame: None,
+            dirty: false,
+            content: Vec::new(),
+            highlight: 0,
+            top_gap: 0,
+        };
+        canvas.present(qh);
+        canvas
+    }
+
+    fn set_content(
+        &mut self,
+        candidates: Vec<String>,
+        highlight: usize,
+        qh: &QueueHandle<AppState>,
+    ) {
+        if self.content == candidates && self.highlight == highlight {
+            return;
+        }
+        self.content = candidates;
+        self.highlight = highlight;
+        self.present(qh);
+    }
+
+    fn set_top_gap(&mut self, gap: u32, qh: &QueueHandle<AppState>) {
+        if self.top_gap == gap {
+            return;
+        }
+        self.top_gap = gap;
+        self.present(qh);
+    }
+
+    fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
+        if slot < 2 {
+            self.free[slot] = true;
+        }
+        if self.dirty {
+            self.present(qh);
+        }
+    }
+
+    fn on_frame(&mut self, qh: &QueueHandle<AppState>) {
+        self.frame = None;
+        if self.dirty {
+            self.present(qh);
+        }
+    }
+
+    /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
+    fn present(&mut self, qh: &QueueHandle<AppState>) {
+        self.dirty = false;
+        let layout = self.renderer.layout(&self.content, self.top_gap);
+        let Some(slot) = self.pick_slot(&layout) else {
+            self.dirty = true;
+            return;
+        };
+        let reuse = self.buffers[slot].as_ref().is_some_and(|b| {
+            b.w == layout.width && b.h == layout.height && b.len == layout.pixel_len()
+        });
+        if !reuse {
+            // 槽位里的旧 buffer 必已 release（free 才会走到这），换掉安全
+            match Self::create_buffer(&self.shm, &layout, slot, qh) {
+                Ok(b) => self.buffers[slot] = Some(b),
+                Err(e) => {
+                    log(&format!("popup buffer 分配失败: {e}"));
+                    return;
+                }
+            }
+        }
+        {
+            let b = self.buffers[slot].as_ref().unwrap();
+            let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.len) };
+            self.renderer.paint(&layout, self.highlight, pixels);
+        }
+        let b = self.buffers[slot].as_ref().unwrap();
+        self.surface.attach(Some(&b.buffer), 0, 0);
+        self.surface
+            .damage(0, 0, layout.width as i32, layout.height as i32);
+        self.surface.commit();
+        self.free[slot] = false;
+        self.frame = Some(self.surface.frame(qh, ()));
+    }
+
+    fn pick_slot(&self, layout: &Layout) -> Option<usize> {
+        let mut fallback = None;
+        for i in 0..2 {
+            if !self.free[i] {
+                continue;
+            }
+            if let Some(b) = &self.buffers[i] {
+                if b.w == layout.width && b.h == layout.height {
+                    return Some(i);
+                }
+            }
+            fallback = Some(i);
+        }
+        fallback
+    }
+
+    /// 避坑 4：宽高均为正、stride = width*4、Format::Argb8888。
+    fn create_buffer(
+        shm: &WlShm,
+        layout: &Layout,
+        slot: usize,
+        qh: &QueueHandle<AppState>,
+    ) -> Result<ShmBuffer, &'static str> {
+        let (w, h) = (layout.width, layout.height);
+        if w == 0 || h == 0 || w > 8192 || h > 1024 {
+            return Err("popup 尺寸非法");
+        }
+        let len = (w as usize) * (h as usize) * 4;
+        let fd =
+            unsafe { libc::memfd_create(b"kime-popup\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err("memfd_create 失败");
+        }
+        if unsafe { libc::ftruncate(fd, len as libc::off_t) } < 0 {
+            unsafe { libc::close(fd) };
+            return Err("ftruncate 失败");
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            unsafe { libc::close(fd) };
+            return Err("mmap 失败");
+        }
+        let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let pool = shm.create_pool(fd_borrowed, len as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            qh,
+            BufferSlot(slot as u8),
+        );
+        pool.destroy();
+        Ok(ShmBuffer {
+            buffer,
+            fd,
+            ptr: ptr as *mut u8,
+            len,
+            w,
+            h,
+        })
+    }
+}
 
 struct AppState {
     conn: Option<Connection>,
@@ -183,17 +393,9 @@ struct AppState {
     /// grab 吃掉 press 的键，release 也不转发，避免半截按键
     swallowed: HashSet<u32>,
     compositor: Option<WlCompositor>,
-    /// 光标位置「天线」：popup surface 只为了收 text_input_rectangle 事件。
-    /// 不 attach buffer、不 commit（本项目历史上拿它当候选窗，mango 从不 map 它，
-    /// 所以候选仍由 egui 面板进程画）。wl_surface 必须与 popup 同存活：协议规定
-    /// popup 存在期间不得销毁它，wayland-client 丢代理即发 destroy。
-    popup_surface: Option<WlSurface>,
-    popup: Option<ZwpInputPopupSurfaceV2>,
-    /// 最近一次 text_input_rectangle，surface local（相对被输入的那个应用窗口）
-    caret_rect: Option<(i32, i32, i32, i32)>,
-    caret_base: Option<CaretBase>,
-    /// 查不到焦点窗口只吼一次，避免每键刷日志
-    caret_warned: bool,
+    shm: Option<WlShm>,
+    /// 候选窗：收 text_input_rectangle + 画候选词，同一个 input-popup surface
+    popup: Option<PopupCanvas>,
 }
 
 impl AppState {
@@ -219,11 +421,8 @@ impl AppState {
             shift: false,
             swallowed: HashSet::new(),
             compositor: None,
-            popup_surface: None,
+            shm: None,
             popup: None,
-            caret_rect: None,
-            caret_base: None,
-            caret_warned: false,
         }
     }
 
@@ -281,13 +480,18 @@ impl AppState {
         vk.key(time, key, state);
     }
 
-    fn try_recv_llm(&mut self) {
+    fn try_recv_llm(&mut self, qh: &QueueHandle<Self>) {
+        let mut merged = false;
         if let Some(receiver) = &self.llm_receiver {
             if let Ok(candidates) = receiver.try_recv() {
                 if let Some(engine) = &mut self.engine {
                     engine.merge_ai(candidates);
+                    merged = true;
                 }
             }
+        }
+        if merged {
+            self.popup_show(qh);
         }
     }
 
@@ -315,111 +519,49 @@ impl AppState {
         }
     }
 
-    /// 建光标 rect 订阅：裸 wl_surface + get_input_popup_surface，只收事件不画内容。
-    /// 不 attach buffer 也不 commit —— mango 从不 map 这个 surface（历史踩坑），
-    /// 候选窗由独立 egui 进程画，这里只要 text_input_rectangle 这一个事件。
+    /// 候选窗只建一次：当前 IM 实例 + wl_compositor + wl_shm 齐了就建 canvas，
+    /// 建好即提交 1×1 全透明首帧（不 commit 的 surface 永远不 mapped，mango 不摆位）。
     fn ensure_popup(&mut self, im: &ZwpInputMethodV2, qh: &QueueHandle<Self>) {
         if self.popup.is_some() {
             return;
         }
-        let Some(comp) = self.compositor.as_ref() else {
-            log("wl_compositor 未绑定，光标跟随不可用");
+        let (Some(comp), Some(shm)) = (self.compositor.clone(), self.shm.clone()) else {
+            log("wl_compositor/wl_shm 未绑定，候选窗不可用");
             return;
         };
-        let surface = comp.create_surface(qh, ());
-        self.popup = Some(im.get_input_popup_surface(&surface, qh, ()));
-        self.popup_surface = Some(surface);
-        log("input popup surface 已建（仅订阅光标 rect）");
+        self.popup = Some(PopupCanvas::new(im, &comp, &shm, qh));
+        log("input popup 候选窗已建（已提交 1×1 透明首帧）");
     }
 
-    /// 最近一次光标 rect（surface local）→ 绝对坐标 + 所在屏幕边界。
-    /// 焦点窗口原点靠 mango IPC 现查（TTL 缓存，绝不每键 fork mmsg）。查不到就返回
-    /// None：面板保持原位，也比把候选窗甩到猜出来的坐标上强。
-    fn caret_cursor(&mut self) -> Option<CaretRect> {
-        let (x, y, _w, h) = self.caret_rect?;
-        if self
-            .caret_base
-            .as_ref()
-            .is_none_or(|b| b.at.elapsed() >= CARET_BASE_TTL)
-        {
-            self.caret_base = panel::mango_focusing_client().map(|f| {
-                // 拿不到 monitor 边界就用焦点窗口自己的范围兜底
-                let screen = panel::mango_screen(f.monitor.as_deref()).unwrap_or((
-                    f.x,
-                    f.y,
-                    f.w.max(1),
-                    f.h.max(1),
-                ));
-                CaretBase {
-                    win_x: f.x,
-                    win_y: f.y,
-                    screen,
-                    at: Instant::now(),
-                }
-            });
-        }
-        match self.caret_base.as_ref() {
-            Some(b) => {
-                let (sx, sy, sw, sh) = b.screen;
-                Some(CaretRect {
-                    x: b.win_x + x,
-                    y: b.win_y + y,
-                    height: h.max(0),
-                    screen_x: sx,
-                    screen_y: sy,
-                    screen_w: sw,
-                    screen_h: sh,
-                })
+    /// 引擎当前页候选 + 页内高亮 → 进程内渲染层。
+    /// 只画当前页：highlight() 是页首全局下标，页内 = highlight()-start；
+    /// 数字键 1..=9/0 与标号天然对齐。不画 preedit（应用自己内联显示）。
+    fn popup_show(&mut self, qh: &QueueHandle<AppState>) {
+        let (page, hl) = match &self.engine {
+            Some(engine) => {
+                let (start, ps) = (engine.highlight(), engine.page().1);
+                let all = engine.candidates();
+                let page = all[start.min(all.len())..(start + ps).min(all.len())]
+                    .iter()
+                    .map(|c| c.text.clone())
+                    .collect();
+                (page, engine.highlight().saturating_sub(start))
             }
-            None => {
-                if !self.caret_warned {
-                    self.caret_warned = true;
-                    log("mango IPC 拿不到焦点窗口：面板不跟随光标（只报一次）");
-                }
-                None
-            }
-        }
-    }
-
-    /// 光标自己动了（方向键/点击，不经过按键消费路径）：面板有内容时按新坐标重推。
-    fn follow_caret(&mut self) {
-        let shown = self
-            .engine
-            .as_ref()
-            .is_some_and(|e| !e.preedit().is_empty() || !e.candidates().is_empty());
-        if shown {
-            self.push_panel();
-        }
-    }
-
-    /// 把引擎当前页候选推给面板，顺带带上绝对光标坐标。
-    /// 只发当前页：highlight() 即页首全局下标（page_index*page_size），
-    /// 切片后面板标号 1..=ps 与引擎数字键 page_index*page_size+(digit-1) 天然对齐。
-    fn push_panel(&mut self) {
-        let Some(engine) = self.engine.as_ref() else {
-            return;
+            None => (Vec::new(), 0),
         };
-        let pe = engine.preedit().to_string();
-        let (start, ps) = (engine.highlight(), engine.page().1);
-        let all = engine.candidates();
-        let ui: Vec<String> = all[start.min(all.len())..(start + ps).min(all.len())]
-            .iter()
-            .map(|c| c.text.clone())
-            .collect();
-        if ui.is_empty() && pe.is_empty() {
-            panel::send_hide();
-            return;
+        if let Some(canvas) = self.popup.as_mut() {
+            canvas.set_content(page, hl, qh);
         }
-        panel::send(&PanelMsg {
-            preedit: pe,
-            // 页首对切片本地即 0；引擎无页内光标，数字键直接按位选词
-            highlight: 0,
-            candidates: ui,
-            cursor: self.caret_cursor(),
-        });
     }
 
-    fn apply_consumed(&mut self) {
+    /// 隐藏 = 1×1 全透明帧，绝不 destroy surface（可见性归 IM active 状态管）。
+    fn popup_hide(&mut self, qh: &QueueHandle<AppState>) {
+        if let Some(canvas) = self.popup.as_mut() {
+            canvas.set_content(Vec::new(), 0, qh);
+        }
+    }
+
+    fn apply_consumed(&mut self, qh: &QueueHandle<Self>) {
         let syllables = {
             let Some(engine) = self.engine.as_ref() else {
                 return;
@@ -434,20 +576,20 @@ impl AppState {
             }
             pe.split('\'').map(String::from).collect::<Vec<_>>()
         };
-        self.push_panel();
+        self.popup_show(qh);
         if let Some(worker) = &self.llm_worker {
             worker.request(syllables);
         }
     }
 
-    fn apply_commit(&mut self, text: String) {
+    fn apply_commit(&mut self, text: String, qh: &QueueHandle<Self>) {
         log(&format!("commit {text}"));
         if let Some(im) = &self.input_method {
             im.commit_string(text);
             im.set_preedit_string(String::new(), 0, 0);
             im.commit(self.im_serial);
         }
-        panel::send_hide();
+        self.popup_hide(qh);
     }
 }
 
@@ -485,6 +627,10 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
                     state.compositor =
                         Some(registry.bind::<WlCompositor, (), AppState>(name, 1, qh, ()));
                     log(&format!("bound wl_compositor name={name}"));
+                }
+                "wl_shm" if version >= 1 => {
+                    state.shm = Some(registry.bind::<WlShm, (), AppState>(name, 1, qh, ()));
+                    log(&format!("bound wl_shm name={name}"));
                 }
                 "wl_seat" if version >= 1 => {
                     let ver = version.min(7);
@@ -582,9 +728,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method ACTIVATE");
                 state.input_method = Some(im.clone());
                 state.ensure_engine();
-                // 换应用了：上一家的光标 rect 作废，等新的 text_input_rectangle
-                state.caret_rect = None;
-                state.caret_base = None;
+                // 换应用了：上一家的光标行高作废，等新的 text_input_rectangle
                 state.ensure_popup(im, qh);
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
@@ -595,7 +739,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method DEACTIVATE");
                 state.grab = None;
                 state.swallowed.clear();
-                panel::send_hide();
+                state.popup_hide(qh);
             }
             ZwpInputMethodEvent::Done { .. } => {
                 state.im_serial += 1;
@@ -633,7 +777,65 @@ impl Dispatch<WlSurface, ()> for AppState {
     }
 }
 
-/// 光标位置的唯一来源：坐标是 surface local，绝对化在 caret_cursor 里做。
+impl Dispatch<WlShm, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _shm: &WlShm,
+        _event: <WlShm as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _pool: &WlShmPool,
+        _event: <WlShmPool as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// 合成器归还 buffer：对应槽位重新可用，欠的帧立刻补画。
+impl Dispatch<WlBuffer, BufferSlot> for AppState {
+    fn event(
+        state: &mut Self,
+        _buffer: &WlBuffer,
+        event: <WlBuffer as Proxy>::Event,
+        slot: &BufferSlot,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, <WlBuffer as Proxy>::Event::Release) {
+            if let Some(canvas) = state.popup.as_mut() {
+                canvas.on_release(slot.0 as usize, qh);
+            }
+        }
+    }
+}
+
+/// frame 回调：上一帧已被合成器显示，可以安全画下一帧。
+impl Dispatch<WlCallback, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _cb: &WlCallback,
+        _event: <WlCallback as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let Some(canvas) = state.popup.as_mut() {
+            canvas.on_frame(qh);
+        }
+    }
+}
+
+/// 候选窗只画进这个 surface；坐标由合成器定，rect 只有 height 有用途。
 impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
     fn event(
         state: &mut Self,
@@ -641,7 +843,7 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
         event: ZwpInputPopupSurfaceEvent,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         if let ZwpInputPopupSurfaceEvent::TextInputRectangle {
             x,
@@ -650,13 +852,11 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
             height,
         } = event
         {
-            let rect = (x, y, width, height);
-            if state.caret_rect == Some(rect) {
-                return;
-            }
-            state.caret_rect = Some(rect);
             log(&format!("caret rect {x},{y} {width}x{height}"));
-            state.follow_caret();
+            // 只用 height：候选贴下沿时让出光标行；全 0（应用没报）就 0 偏移
+            if let Some(canvas) = state.popup.as_mut() {
+                canvas.set_top_gap(height.clamp(0, 64) as u32, qh);
+            }
         }
     }
 }
@@ -668,7 +868,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
         event: ZwpInputMethodKeyboardGrabEvent,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         match event {
             ZwpInputMethodKeyboardGrabEvent::Keymap { format, fd, size } => {
@@ -753,17 +953,17 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 match engine.key(key_struct) {
                     Outcome::Consumed => {
                         state.swallowed.insert(key);
-                        state.apply_consumed();
+                        state.apply_consumed(qh);
                     }
                     Outcome::Commit(text) => {
                         state.swallowed.insert(key);
-                        state.apply_commit(text);
+                        state.apply_commit(text, qh);
                     }
                     Outcome::Ignored => {
                         state.forward_key(time, key, true);
                     }
                 }
-                state.try_recv_llm();
+                state.try_recv_llm(qh);
             }
             _ => {}
         }
@@ -790,17 +990,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let conn = Connection::connect_to_env()?;
-    if args.iter().any(|a| a == "--show-test") {
-        panel::send(&PanelMsg {
-            preedit: "nihao".into(),
-            highlight: 0,
-            candidates: vec!["你好".into(), "拟好".into()],
-            cursor: None,
-        });
-        std::thread::sleep(std::time::Duration::from_secs(9));
-        panel::send_hide();
-        return Ok(());
-    }
 
     let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
     let qh: QueueHandle<AppState> = event_queue.handle();
@@ -839,6 +1028,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "wl_compositor" if global.version >= 1 => {
                     log("Found wl_compositor");
                     app.compositor = Some(globals.registry().bind::<WlCompositor, (), AppState>(
+                        global.name,
+                        1,
+                        &qh,
+                        (),
+                    ));
+                }
+                "wl_shm" if global.version >= 1 => {
+                    log("Found wl_shm");
+                    app.shm = Some(globals.registry().bind::<WlShm, (), AppState>(
                         global.name,
                         1,
                         &qh,

@@ -6,17 +6,9 @@ edition.workspace = true
 [dependencies]
 kime-core = { path = "../kime-core" }
 wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 cosmic-text = "0.19.0"
 fontdb = "0.24"
 xkbcommon = "0.9"
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1.0"
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-
-[[bin]]
-name = "kime-panel"
-path = "src/panel_main.rs"

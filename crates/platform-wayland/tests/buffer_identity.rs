@@ -1,13 +1,13 @@
 //! 回归测试：候选窗 shm buffer 与渲染用 mmap 必须同源。
 //!
-//! 修复前 `new_popup` 走 `ensure_buffer_static` + `ensure_mmap_static` 两个独立
-//! memfd：渲染写 B，合成器读 A，候选窗永远空白。此测试用同样的 memfd + mmap
-//! 序列，断言「写 mmap 指针 → 从 fd 读回」能看到同一份字节。
+//! 修复前候选窗走两个独立 memfd：渲染写 B，合成器读 A，候选窗永远空白。
+//! 此测试用与 `PopupCanvas::create_buffer` 相同的 memfd + mmap 序列，断言
+//! 「写 mmap 指针 → 从 fd 读回」能看到同一份字节。
 
 use std::io::Read;
 use std::os::unix::io::FromRawFd;
 
-/// 复刻 `CandidateWindow::create_buffer` 的 memfd + ftruncate + mmap 序列，
+/// 复刻 `PopupCanvas::create_buffer` 的 memfd + ftruncate + mmap 序列，
 /// 返回 (fd, ptr, size)。不建 wl_shm pool（无需 Wayland 连接）。
 fn memfd_mmap(size: usize) -> (i32, *mut u8) {
     let fd = unsafe {

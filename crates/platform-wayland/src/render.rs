@@ -1,242 +1,203 @@
-//! Pure drawing side for candidate window rendering using cosmic_text.
-//! shm Argb8888 little-endian: memory order B,G,R,A.
+//! 候选窗绘制（input-popup 内容）：cosmic-text 横排单行 → Argb8888 字节缓冲。
+//!
+//! 内存序：ARGB8888 小端 = B,G,R,A。本模块不碰 wayland：`layout`/`paint`
+//! 都是纯计算 + 光栅，tests/popup_render.rs 直接对返回值断言。
 
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache};
+
+pub const FONT_SIZE: f32 = 16.0;
+pub const LINE_HEIGHT: f32 = 22.0;
+/// 面板左右留白
+pub const MARGIN_X: u32 = 10;
+/// 上下留白
+pub const MARGIN_Y: u32 = 6;
+/// 候选项之间的定宽分隔（px）
+pub const SEP: u32 = 10;
+
+/// 背景 (30,30,38)，不透明。B,G,R,A 序。
+const BG: [u8; 4] = [38, 30, 30, 255];
+const FG: Color = Color::rgba(220, 220, 230, 255);
+/// 高亮项：旧面板同款琥珀色，深底对比足够
+const HL: Color = Color::rgba(255, 220, 120, 255);
+
+/// 单个已摆放的候选项：x 为内容左沿（不含 MARGIN_X 之外的偏移），w 为实测宽。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Candidate {
+pub struct PlacedItem {
+    pub x: u32,
+    pub w: u32,
     pub text: String,
-    pub pinyin: String,
-    pub freq: u64,
-    pub ai: bool,
+}
+
+/// 一帧的完整摆放结果。空候选 → 1×1（隐藏帧，像素全透明）。
+#[derive(Clone, Debug)]
+pub struct Layout {
+    pub width: u32,
+    pub height: u32,
+    /// 光标行高占位：文本带整体下移这么多像素，候选不压住光标行。
+    /// 拿不到 text_input_rectangle 时为 0（固定偏移兜底）。
+    pub top_gap: u32,
+    pub items: Vec<PlacedItem>,
+}
+
+impl Layout {
+    pub fn hidden() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            top_gap: 0,
+            items: Vec::new(),
+        }
+    }
+    pub fn is_hidden(&self) -> bool {
+        self.items.is_empty()
+    }
+    pub fn pixel_len(&self) -> usize {
+        (self.width as usize) * (self.height as usize) * 4
+    }
+}
+
+/// 系统里连一个能用的字形都量不到：明确吼一声，别默默画空白帧。
+fn warn_no_font(text: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("[kime-popup] cosmic-text 量不到字形宽度（无可用字体？）：「{text}」");
+    }
 }
 
 pub struct Renderer {
     font_system: FontSystem,
-    font_size: f64,
+    cache: SwashCache,
 }
 
 impl Renderer {
+    /// FontSystem::new() 扫系统字体（fontconfig 路径），一次性、偏慢，只建一个。
     pub fn new() -> Self {
-        let font_system = FontSystem::new();
         Self {
-            font_system,
-            font_size: 20.0,
+            font_system: FontSystem::new(),
+            cache: SwashCache::new(),
         }
     }
 
-    pub fn set_font_size(&mut self, size: f64) {
-        self.font_size = size;
+    /// 测量一段文本的像素宽（横排、不换行）。
+    /// 宽度取所有 run 的 `line_w` 最大值：script/BiDi 分段后各段不重叠，
+    /// 单段宽度不是整行总宽。
+    pub fn measure(&mut self, text: &str) -> u32 {
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        buffer.set_size(None, None);
+        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let w = buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0f32, f32::max);
+        if w < 0.5 && !text.is_empty() {
+            warn_no_font(text);
+        }
+        w.ceil().max(0.0) as u32
     }
 
-    /// `color` is 0xAARRGGBB. Writes B,G,R,A into `buf`.
-    fn draw_border(buf: &mut [u8], width: usize, height: usize, color: u32) {
-        let (a, r, g, b) = (
-            (color >> 24) as u8,
-            (color >> 16) as u8,
-            (color >> 8) as u8,
-            color as u8,
+    /// 横排单行摆放：每项 "N. 候选"，定宽分隔符，总宽随内容自适应。
+    /// candidates 已是当前页（调用方切好片），这里不再截断。
+    pub fn layout(&mut self, candidates: &[String], top_gap: u32) -> Layout {
+        if candidates.is_empty() {
+            return Layout::hidden();
+        }
+        let mut items = Vec::with_capacity(candidates.len());
+        let mut x = MARGIN_X;
+        for (i, text) in candidates.iter().enumerate() {
+            let label = format!("{}. {}", i + 1, text);
+            let w = self.measure(&label);
+            items.push(PlacedItem { x, w, text: label });
+            x += w + SEP;
+        }
+        let width = (x - SEP + MARGIN_X).max(1);
+        let height = top_gap + MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
+        Layout {
+            width,
+            height,
+            top_gap,
+            items,
+        }
+    }
+
+    /// 把 layout 画进 `buf`（长度必须恰好 `layout.pixel_len()`，即 stride=w*4）。
+    /// `highlight` 是页内下标；越界只是不着色，不 panic。
+    pub fn paint(&mut self, layout: &Layout, highlight: usize, buf: &mut [u8]) {
+        assert!(
+            layout.width > 0 && layout.height > 0,
+            "popup buffer 尺寸非法"
         );
-        for y in [0, height.saturating_sub(1)] {
-            for x in 0..width {
-                let off = (y * width + x) * 4;
-                buf[off] = b;
-                buf[off + 1] = g;
-                buf[off + 2] = r;
-                buf[off + 3] = a;
-            }
-        }
-        if height <= 1 {
+        assert_eq!(buf.len(), layout.pixel_len(), "popup buffer 长度与布局不符");
+        if layout.is_hidden() {
+            buf.fill(0);
             return;
         }
-        for x in [0, width.saturating_sub(1)] {
-            for y in 1..height - 1 {
-                let off = (y * width + x) * 4;
-                buf[off] = b;
-                buf[off + 1] = g;
-                buf[off + 2] = r;
-                buf[off + 3] = a;
-            }
-        }
-    }
-
-    pub fn draw_candidates(
-        &mut self,
-        buf: &mut [u8],
-        width: usize,
-        height: usize,
-        candidates: &[Candidate],
-        highlight: usize,
-        preedit: &str,
-    ) -> Result<(), &'static str> {
-        let need = width * height * 4;
-        if buf.len() < need {
-            return Err("Buffer size mismatch");
-        }
-        let buf = &mut buf[..need];
-
         for px in buf.chunks_exact_mut(4) {
-            px[0] = 0x26;
-            px[1] = 0x1E;
-            px[2] = 0x1E;
-            px[3] = 0xE8;
+            px.copy_from_slice(&BG);
         }
-        if !candidates.is_empty() {
-            Self::draw_border(buf, width, height, 0xFF4C566Au32);
-        }
-
-        let mut text = String::new();
-        if !preedit.is_empty() {
-            text.push_str(&format!("{preedit}\n"));
-        }
-        for (i, cand) in candidates.iter().enumerate() {
-            let prefix = if i == highlight { "> " } else { "  " };
-            text.push_str(&format!("{} {}. {}\n", prefix, i + 1, cand.text));
-        }
-
-        let line_height = (self.font_size * 1.4) as f32;
-        let mut buffer = Buffer::new(
-            &mut self.font_system,
-            Metrics::new(self.font_size as f32, line_height),
-        );
-        buffer.set_size(Some(width as f32), Some(height as f32));
-        let attrs = Attrs::new();
-        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-        let color = cosmic_text::Color::rgba(240, 240, 245, 255);
-        let mut cache = cosmic_text::SwashCache::new();
-        buffer.draw(&mut self.font_system, &mut cache, color, |x, y, w, h, c| {
-            let word = c.0;
-            let (a, r, g, b) = (
-                (word >> 24) as u8,
-                (word >> 16) as u8,
-                (word >> 8) as u8,
-                word as u8,
-            );
-            for dy in 0..h as usize {
-                let py = y as usize + dy;
-                for dx in 0..w as usize {
-                    let px = x as usize + dx;
-                    if px < width && py < height {
-                        let off = (py * width + px) * 4;
-                        buf[off] = b;
-                        buf[off + 1] = g;
-                        buf[off + 2] = r;
-                        buf[off + 3] = a;
-                    }
+        let band_top = layout.top_gap + MARGIN_Y;
+        let band_h = LINE_HEIGHT.ceil() as i32;
+        for (i, item) in layout.items.iter().enumerate() {
+            let color = if i == highlight { HL } else { FG };
+            let mut buffer =
+                Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            buffer.set_size(None, None);
+            buffer.set_text(&item.text, &Attrs::new(), Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            // 单行：把 run 的行盒垂直居中到文本带
+            let dy = match buffer.layout_runs().next() {
+                Some(run) => {
+                    band_top as i32 + (band_h - run.line_height as i32) / 2 - run.line_top as i32
                 }
-            }
-        });
-        Ok(())
+                None => band_top as i32,
+            };
+            let ox = item.x as i32;
+            buffer.draw(
+                &mut self.font_system,
+                &mut self.cache,
+                color,
+                |x, y, w, h, c| {
+                    composite_rect(buf, layout.width as usize, (x + ox, y + dy), (w, h), c);
+                },
+            );
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_renderer_basic() {
-        let mut renderer = Renderer::new();
-        let mut buf = vec![0u8; 400 * 600 * 4];
-        let candidates = vec![
-            Candidate {
-                text: "测试".to_string(),
-                pinyin: "ce shi".to_string(),
-                freq: 1000,
-                ai: false,
-            },
-            Candidate {
-                text: "结果".to_string(),
-                pinyin: "jie guo".to_string(),
-                freq: 800,
-                ai: false,
-            },
-        ];
-        let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 0, "输入");
-        assert!(result.is_ok());
-        let non_zero = buf.iter().filter(|&&b| b != 0).count();
-        assert!(
-            non_zero > 0,
-            "Rendering produced all-transparent buffer - CJK glyphs missing"
-        );
+/// 直行 alpha 合成到不透明底上（cosmic 回调色：rgb=字色，a=覆盖率）。
+fn composite_rect(
+    buf: &mut [u8],
+    stride_px: usize,
+    pos: (i32, i32),
+    size: (u32, u32),
+    color: Color,
+) {
+    let a = color.a() as u32;
+    if a == 0 {
+        return;
     }
-
-    #[test]
-    fn test_renderer_highlight() {
-        let mut renderer = Renderer::new();
-        let mut buf = vec![0u8; 400 * 600 * 4];
-        let candidates = vec![
-            Candidate {
-                text: "第一个".to_string(),
-                pinyin: "di yi ge".to_string(),
-                freq: 1000,
-                ai: false,
-            },
-            Candidate {
-                text: "第二个".to_string(),
-                pinyin: "di er ge".to_string(),
-                freq: 900,
-                ai: false,
-            },
-        ];
-        let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 1, "预编辑");
-        assert!(result.is_ok());
-        let non_zero = buf.iter().filter(|&&b| b != 0).count();
-        assert!(
-            non_zero > 0,
-            "Rendering with highlight produced all-transparent buffer"
-        );
-    }
-
-    #[test]
-    fn test_renderer_empty() {
-        let mut renderer = Renderer::new();
-        let mut buf = vec![0u8; 400 * 600 * 4];
-        let candidates = vec![];
-        let result = renderer.draw_candidates(&mut buf, 400, 600, &candidates, 0, "");
-        assert!(result.is_ok());
-        let all_bg = buf
-            .chunks_exact(4)
-            .all(|px| px[0] == 0x26 && px[1] == 0x1E && px[2] == 0x1E && px[3] == 0xE8);
-        assert!(all_bg, "Empty render should be uniform BGRA background");
-    }
-
-    #[test]
-    fn test_renderer_draws_border_around_candidates() {
-        let mut renderer = Renderer::new();
-        let candidates = vec![
-            Candidate {
-                text: "测试".to_string(),
-                pinyin: "ce shi".to_string(),
-                freq: 1,
-                ai: false,
-            },
-            Candidate {
-                text: "结果".to_string(),
-                pinyin: "jie guo".to_string(),
-                freq: 2,
-                ai: false,
-            },
-        ];
-        let (w, h) = (380usize, 380usize);
-        let mut buf = vec![0u8; w * h * 4];
-        renderer
-            .draw_candidates(&mut buf, w, h, &candidates, 0, "输入")
-            .unwrap();
-
-        let px = |x: usize, y: usize| {
-            let off = (y * w + x) * 4;
-            (buf[off], buf[off + 1], buf[off + 2])
-        };
-        let border = (0x6Au8, 0x56u8, 0x4Cu8);
-        for (x, y, edge) in [
-            (w / 2, 0, "上"),
-            (w / 2, h - 1, "下"),
-            (0, h / 2, "左"),
-            (w - 1, h / 2, "右"),
-        ] {
-            assert_eq!(px(x, y), border, "{edge}边框未绘制");
+    let (r, g, b) = (color.r() as u32, color.g() as u32, color.b() as u32);
+    for yy in 0..size.1 as i32 {
+        let py = pos.1 + yy;
+        if py < 0 {
+            continue;
+        }
+        for xx in 0..size.0 as i32 {
+            let px = pos.0 + xx;
+            if px < 0 {
+                continue;
+            }
+            let off = (py as usize * stride_px + px as usize) * 4;
+            let Some(p) = buf.get_mut(off..off + 4) else {
+                continue;
+            };
+            // B,G,R 通道：out = bg*(1-α) + fg*α；A 恒 255（实底面板）
+            p[0] = ((p[0] as u32 * (255 - a) + b * a) / 255) as u8;
+            p[1] = ((p[1] as u32 * (255 - a) + g * a) / 255) as u8;
+            p[2] = ((p[2] as u32 * (255 - a) + r * a) / 255) as u8;
+            p[3] = 255;
         }
     }
 }
