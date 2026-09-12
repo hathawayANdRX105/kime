@@ -25,17 +25,17 @@
 - [x] 完整通路：grab → 键盘事件进 core → preedit 显示拼音串 → commit_string 上屏
 - [x] 协议纠错：`commit(serial)` 的 serial 严格对应 done 事件计数
 
-## M4 — 候选窗 UI（layer-shell）✅ 2026-09-06
+## M4 — 候选窗渲染管线（wl_shm + cosmic-text）✅ 2026-09-06
 
-- [x] layer-shell overlay 层、真实 wl_shm/memfd 渲染管线
+- [x] 真 wl_shm/memfd 渲染管线：buffer 与 mmap 同源，Argb8888，stride=w*4
 - [x] cosmic-text 渲染 CJK 字体，实底深灰蓝底 + 白字
-- [x] 真机像素扫描实锤：底部中央 87 行命中面板底色
+- [x] layer-shell 独立窗实验废弃：wayland 客户端无权自行摆位，候选必须走 input-popup
 
-## M4.5 — 候选窗光标跟随（input-popup-surface）✅ 2026-09-06
+## M4.5 — 候选窗进 input-popup-surface（光标跟随的正解）✅ 2026-09-12
 
-- [x] 协议正路改造：`im.get_input_popup_surface`，无 configure 握手
-- [x] compositor 自动贴着光标定位；内容自适应高度
-- [x] 真人实测：foot / QQ 贴着光标正常弹出；微信（XWayland）位置偏移记为已知边界
+- [x] 候选词直接画进 `zwp_input_popup_surface_v2`：attach + commit 才 mapped，合成器用 text-input positioner 摆位；独立面板进程 / socket / IPC 搬窗全部移除
+- [x] 横排单行候选、宽度随内容自适应、不画 preedit；隐藏 = 提交 1×1 全透明帧，surface 全程不销毁
+- [x] `text_input_rectangle.height` 仅作光标行占位，摆位交合成器；双缓冲 + frame 回调控帧
 
 ## M5 — 翻页 + 模糊音 + 音节补全 ✅ 2026-09-06
 
@@ -66,7 +66,7 @@
 - [x] 中文标点符号映射与顶字上屏（`punct.rs`，全角符号自动转换与 preedit 顶字）
 - [x] TOML 配置文件解析与初始化（`~/.config/kime/config.toml`，自动生成与容错降级）
 - [x] FST 复合存储与用户词 SQLite Overlay（42MB mmap 只读基底 + 本地生词/提频动态合并）
-- [x] 候选窗主题样式与自适应紧凑尺寸（高对比度细边框，动态高度计算）
+- [x] 候选窗主题样式：背景 (30,30,38) 实底、高亮琥珀、横排单行宽度随内容自适应（逐候选实测字宽）
 - [x] 句级 Word Lattice 构建与轻量 Viterbi 动态规划联想（第一候选输出长句）
 
 ## M9 — 进阶功能 ✅ 2026-09-06

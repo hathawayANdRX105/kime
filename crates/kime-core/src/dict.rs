@@ -197,7 +197,22 @@ impl Dict {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率），
+    /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率）。
+    ///
+    /// 冲突策略是**频率取大**，不是「先插入者胜」：同一个 `(pinyin, text)` 只保留见过的最高频率。
+    /// rime-ice 的约定是「重复词条时最上面的权重生效」，但 `cn_dicts/41448`（大字表，正文
+    /// 46,031 条**全无频率列**）字典序排在 `cn_dicts/8105`（8,783 条带频率）之前，
+    /// 早先的 `INSERT OR IGNORE` 于是把 8105 的真实频率全部 IGNORE 掉 —— 全库 54% 的行 freq=0，
+    /// 单字在 `(freq DESC, text ASC)` 的候选序里被多音节词彻底压住。
+    /// 现在调用方以什么顺序喂这些表都不影响结果，只需保证别漏文件。
+    ///
+    /// `user = 1`（自学习词）的行完全不参与更新：它们的 freq 是学习次数，不是词库权重。
+    ///
+    /// 正文里两类行直接丢弃（见循环内注释）：`text` 以 `#` 开头的注释行、
+    /// `pinyin` 含非 `a-z`/空格 的数字读法行。
+    ///
+    /// 返回值 = 实际写入的行数（新插入 + 频率被抬高的）。冲突但频率没涨的行不计入，
+    /// 因此重复导入同一文件返回 0，幂等语义与旧实现一致。
     pub fn import(&mut self, dict_yaml: impl AsRef<Path>) -> Result<usize> {
         let f = File::open(dict_yaml).map_err(io_to_sqlite)?;
         let reader = BufReader::new(f);
@@ -215,8 +230,14 @@ impl Dict {
                 continue;
             }
             let mut cols = line.split('\t');
+            // 下面两道是源数据卫生过滤（rime-ice 正文里混着两类不能上屏的行）：
+            // ① text 以 `#` 开头的是被注释掉的示例行（库里 11,726 条，`# 那`/nei 频率
+            //    高达 9,929,703），频率修好前被 0 压着看不见，修好后会直接顶在首候选；
+            // ② 引擎的组合缓冲只收 a-z（数字键是页内选词），所以 `pinyin = "100"` 的
+            //    数字读法条目（tencent.dict.yaml 全表 980,961 条 = 旧库 51%）永远查不到，
+            //    只会让 dict.bin 胖一倍。
             let text = match cols.next() {
-                Some(t) if !t.is_empty() => t,
+                Some(t) if !t.is_empty() && !t.starts_with('#') => t,
                 _ => continue,
             };
             let pinyin = match cols.next() {
@@ -227,12 +248,17 @@ impl Dict {
                 Some(s) => s.parse().unwrap_or(0),
                 None => 0,
             };
+            if !pinyin.bytes().all(|b| b.is_ascii_alphabetic() || b == b' ') {
+                continue;
+            }
             let syllables: Vec<&str> = pinyin.split_whitespace().collect();
             let joined = syllables.join("'");
             let abbrev: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
             let abbrev = abbrev.to_lowercase();
             let added = tx.execute(
-                "INSERT OR IGNORE INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, ?3, ?4, 0)",
+                "INSERT INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(pinyin, text) DO UPDATE SET freq = excluded.freq
+                 WHERE user = 0 AND freq < excluded.freq",
                 params![joined, text, freq, abbrev],
             )?;
             count += added;

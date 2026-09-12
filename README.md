@@ -9,7 +9,7 @@ bin/kime/             CLI 入口（REPL、词库编译）
 crates/kime-core/     引擎核心：状态机、持久化、FST/内存索引
 crates/kime-pinyin/   纯拼音音节切分（404 音节表，零依赖）
 crates/kime-shuangpin/双拼码表（小鹤/自然码，纯查表）
-crates/platform-wayland/ input-method-v2 客户端 + layer-shell/popup 候选窗
+crates/platform-wayland/ input-method-v2 客户端 + input-popup 候选窗（进程内渲染）
 platform-win/         （规划中）Windows TSF 壳
 platform-mac/         （规划中）macOS IMKit 壳
 ```

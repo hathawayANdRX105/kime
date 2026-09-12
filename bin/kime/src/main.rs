@@ -3,7 +3,7 @@
 //! 用法（M9 起）：
 //!   kime build-dict --in <sqlite> --out <bin>
 //!   kime config <list|get KEY|set KEY VALUE>
-//!   kime --dict <path> [--import <yaml>] [--shuangpin <scheme>]
+//!   kime --dict <path> [--import <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
 //!
 //! 配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit
@@ -137,7 +137,9 @@ fn main() -> ExitCode {
     }
 
     let mut dict_path: Option<PathBuf> = None;
-    let mut import_path: Option<PathBuf> = None;
+    // `--import` 可重复：rime-ice 是 5~6 张分表，一次调用要全部喂进去。
+    // 旧实现用单个 Option 存路径，第二个 `--import` 会静默覆盖第一个 → 只导了一张表。
+    let mut import_paths: Vec<PathBuf> = Vec::new();
     let mut shuangpin: Option<Option<Scheme>> = None;
     let mut args_iter = std::env::args().skip(1).peekable();
 
@@ -147,7 +149,9 @@ fn main() -> ExitCode {
                 dict_path = args_iter.next().map(PathBuf::from);
             }
             "--import" => {
-                import_path = args_iter.next().map(PathBuf::from);
+                if let Some(p) = args_iter.next().map(PathBuf::from) {
+                    import_paths.push(p);
+                }
             }
             "--shuangpin" => {
                 let s = args_iter.next().unwrap_or_default();
@@ -199,7 +203,7 @@ fn main() -> ExitCode {
             }
             "--help" => {
                 println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime --dict <path> [--import <yaml>] [--shuangpin <scheme>]\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
+                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime --dict <path> [--import <yaml>]... [--shuangpin <scheme>]（--import 可重复，逐个词库表导入）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -231,10 +235,19 @@ fn main() -> ExitCode {
         }
     };
     let mut dict = dict;
-    if let Some(yaml) = import_path {
-        if let Err(e) = dict.import(&yaml) {
-            eprintln!("import failed: {e}");
-            return ExitCode::from(1);
+    // 逐表导入，顺序随便：`Dict::import` 冲突时取频率较大者。
+    // 旧实现是 `INSERT OR IGNORE` + 按文件名 glob，无频率列的 `cn_dicts/41448`（46,031 条，
+    // 频率全空）字典序排在带真实频率的 `cn_dicts/8105`（8,783 条）之前，先落库的空 0 值
+    // 把 8105 的频率全 IGNORE 掉了 —— 这才是「打 shi 出不来『是』」的根因。
+    // 现在 41448 导不导都不影响已有条目的频率，只决定要不要那批生僻字（rime-ice 自己
+    // 把它注释在「按需启用」）；本次重建沿用了库里已有的那批，一个字符都没丢。
+    for yaml in &import_paths {
+        match dict.import(yaml) {
+            Ok(n) => eprintln!("imported {}: {n} rows", yaml.display()),
+            Err(e) => {
+                eprintln!("import failed for {}: {e}", yaml.display());
+                return ExitCode::from(1);
+            }
         }
     }
     // CLI --shuangpin 覆盖配置文件里的方案
