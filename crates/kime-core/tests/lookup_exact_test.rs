@@ -51,11 +51,13 @@ fn lookup_prefix_still_includes_longer_keys() {
     let dir = tempfile::tempdir().unwrap();
     let d = seeded(dir.path());
 
-    // 对照：前缀查询就该看到长词（用户还在打字，ni'hao 是 ni'hao'shi'jie 的前缀）
+    // 对照：前缀查询就该看到长词（用户还在打字，ni'hao 是 ni'hao'shi'jie 的前缀）——
+    // 但按两层契约：精确命中 key `ni'hao` 的「你好」先于补全词「你好世界」，
+    // 层内仍按 freq（工单第 2 条；旧断言的全局 freq 序固化的是「补全压过精确」的错契约）。
     let hits = d.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
     assert_eq!(
         texts(&hits),
-        vec!["你好世界", "你好"],
-        "前缀查询应含更长的 key，且按 freq 降序"
+        vec!["你好", "你好世界"],
+        "层一（精确 key）必须先于层二（补全），哪怕后者频率更高"
     );
 }

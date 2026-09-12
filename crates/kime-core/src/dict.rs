@@ -64,30 +64,27 @@ pub struct Dict {
     /// 每次按键都得靠 `idx_phrase_pinyin` 定位再逐行过滤 192 万行里的 user 列，
     /// 实测单键 10–57ms。全量常驻内存后热路径只做二分。
     user_overlay: Vec<IndexEntry>,
-    /// `SUM(freq)`，0 = 还没算。整句联想要把词频换算成概率才可比，见 [`Dict::total_freq`]。
-    /// 只在真正组句时才算一次，不摊到开库路径上（开库刚从 5.2s 压到 ~60ms）。
-    total_freq: std::cell::Cell<u64>,
+    /// 语料总词频（`SUM(freq)`）。整句联想要把词频换算成概率才可比。
+    ///
+    /// 在开库时算一次：92 万行无索引全扫约 150ms，但那会儿用户还没开始打字。
+    /// 首次组句时懒算试过，结果这 150ms 正好砸在第一下按键上（实测 `zuiqi` 一键 52–120ms）。
+    total_freq: u64,
 }
 
-/// Helper to compute exclusive upper bound for prefix range query.
-/// Returns `None` when the prefix ends with `'z'` because no valid greater string
-/// exists within the allowed alphabet (`'` + `a-z`).
+/// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
+/// 同语义：末字符 +1，`'z'` 进 `'{'`——只对小写字母串求上界，`'` 结尾进 `'a'`。
+/// 旧版对 `'z'` 返回 None，SQLite 回退路径据此把整个补全区间塌缩成空集，与 store 路径
+/// 行为不一致；None 现在只可能出现在空串上，而空 joined 在查询入口就被挡掉。）
 fn increment_prefix(prefix: &str) -> Option<String> {
-    let chars: Vec<char> = prefix.chars().collect();
-    let last = chars.last()?;
-    if *last == 'z' {
-        return None;
-    }
-    let mut new_chars = chars.clone();
-    let last_idx = new_chars.len() - 1;
-    let c = new_chars[last_idx];
-    if c == '\'' {
-        new_chars[last_idx] = 'a';
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last_idx = chars.len().checked_sub(1)?;
+    let c = chars[last_idx];
+    chars[last_idx] = if c == '\'' {
+        'a'
     } else {
-        let next = ((c as u32) + 1) as u32;
-        new_chars[last_idx] = char::from_u32(next).unwrap_or(c);
-    }
-    Some(new_chars.into_iter().collect())
+        char::from_u32(c as u32 + 1).unwrap_or(c)
+    };
+    Some(chars.into_iter().collect())
 }
 
 impl Dict {
@@ -174,13 +171,14 @@ impl Dict {
         } else {
             Vec::new()
         };
+        let total_freq = Self::query_total_freq(&conn);
         Ok(Self {
             conn,
             index,
             abbrev_index,
             store,
             user_overlay,
-            total_freq: std::cell::Cell::new(0),
+            total_freq,
         })
     }
 
@@ -201,26 +199,18 @@ impl Dict {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// 语料总词频，用来把「词频计数」换算成可比的概率。
-    ///
-    /// 代价模型若直接拿 `ln(freq)` 相加，就是在比 `f(知)·f(道)` 与 `f(知道)`，量纲不对、
-    /// 切得越碎越占便宜：实测「知道」(501,255) 永远输给「知+道」(4.4e6 × 1.06e6)。
-    /// 除以总量后比的是 `P(知道)` 与 `P(知)·P(道)`，才知道哪个更该出现。
+    /// 语料总词频。见字段注释：为什么在开库时算。
     pub fn total_freq(&self) -> u64 {
-        let cached = self.total_freq.get();
-        if cached != 0 {
-            return cached;
-        }
+        self.total_freq
+    }
+
+    fn query_total_freq(conn: &Connection) -> u64 {
         // rusqlite 不为 u64 实现 FromSql，SUM 只能按 i64 取
-        let sum: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0);
-        let v = sum.max(1) as u64;
-        self.total_freq.set(v);
-        v
+        conn.query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|s| s.max(1) as u64)
+        .unwrap_or(1)
     }
 
     /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率）。
@@ -319,6 +309,8 @@ impl Dict {
                 .then_with(|| a.text.cmp(&b.text))
         });
         self.abbrev_index = abbrev_index;
+        // 批量灌词后总量变了，缓存必须跟着刷新（否则刚导入的库整句代价用旧概率）
+        self.total_freq = Self::query_total_freq(&self.conn);
         Ok(count)
     }
 
@@ -347,6 +339,21 @@ impl Dict {
             })
             .map(Self::entry_to_candidate)
             .collect()
+    }
+
+    /// 用户词 overlay 的层二（补全）切分，与 store 的两层谓词完全一致：
+    /// tail 为空 → 只收以 `joined + "'"` 开头的 key；tail 非空 → 开区间去掉精确 key。
+    fn overlay_comps(&self, joined: &str, tail: &str) -> Vec<Candidate> {
+        if tail.is_empty() {
+            let lower = format!("{joined}'");
+            let upper = increment_prefix(&lower);
+            self.overlay_prefix(&lower, upper.as_deref())
+        } else {
+            let upper = increment_prefix(joined);
+            let mut v = self.overlay_prefix(joined, upper.as_deref());
+            v.retain(|c| c.pinyin != joined);
+            v
+        }
     }
 
     /// 用户词 overlay：abbrev 前缀命中。overlay 按 pinyin 排序，abbrev 只能全扫——
@@ -419,48 +426,21 @@ impl Dict {
         Ok(candidates)
     }
 
-    /// 前缀查询：完整音节 `syllables` 后面接未完成的 `tail`，返回 freq 降序前 N 候选。
+    /// 前缀查询（两层合并）：层一 = key 恰等于输入（joined）的词条，层二 = 合法补全。
+    /// 每层内部 `(freq DESC, text ASC)`。limit 分配：层一不满时层二填满到 limit；
+    /// 层一溢出时——仅当 tail 非空（还在打最后一个音节）——层二至少保留一半名额，
+    /// 「`mi` 仍要够得着 `min`/`ming` 的字」是显式验收，否则 `mi` 这种几百字的精确块
+    /// 会把补全整段挤出列表。tail 为空 = 音节已收口，层一独占到底。
     ///
-    /// 当 `store` 存在时，先从 FST 获取基底候选词，再从 SQLite `phrase` 表查询 `user = 1`（或高频自学习）的用户词。
-    /// 动态合并：用户词若已在基底中存在，以用户词频覆盖；新词插入；去重后按 `(freq DESC, text ASC)` 排序并截取 `limit`。
-    /// 当 `store` 为 `None` 时，保持原有纯内存 Vec 查询。
+    /// FST 路径与纯 SQLite 内存索引路径必须同语义（上一轮 `lookup_exact` 的 bug 就出在
+    /// 两条路径不一致）。用户词 overlay 按层合并：只有 pinyin == joined 的词进层一，
+    /// 不许在层二借高频插队到精确命中之前。
     pub fn lookup_prefix(
         &self,
         syllables: &[String],
         tail: &str,
         limit: usize,
     ) -> Result<Vec<Candidate>> {
-        if self.store.is_none() {
-            // 回退到纯内存查询
-            let mut joined = syllables.join("'");
-            if !tail.is_empty() {
-                if !joined.is_empty() {
-                    joined.push('\'');
-                }
-                joined.push_str(tail);
-            }
-            if joined.is_empty() {
-                return Ok(Vec::new());
-            }
-            let upper_bound = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
-            let lower_idx = self.index.partition_point(|e| e.pinyin < joined);
-            let upper_idx = self.index.partition_point(|e| e.pinyin < upper_bound);
-            let slice = &self.index[lower_idx..upper_idx];
-            let mut candidates: Vec<Candidate> = slice
-                .iter()
-                .map(|e| Candidate {
-                    text: e.text.clone(),
-                    pinyin: e.pinyin.clone(),
-                    freq: e.freq as u64,
-                    ai: false,
-                })
-                .collect();
-            candidates.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
-            candidates.truncate(limit);
-            return Ok(candidates);
-        }
-
-        // FST 模式：先从 FST 查询基底候选词
         let mut joined = syllables.join("'");
         if !tail.is_empty() {
             if !joined.is_empty() {
@@ -468,14 +448,65 @@ impl Dict {
             }
             joined.push_str(tail);
         }
-        if joined.is_empty() {
+        if joined.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let upper_bound = increment_prefix(&joined);
-        let store = self.store.as_ref().unwrap();
-        let base_candidates = store.lookup_prefix(syllables, tail, limit);
-        let user_candidates = self.overlay_prefix(&joined, upper_bound.as_deref());
-        Ok(Self::merge_overlay(base_candidates, user_candidates, limit))
+        let user_exact = self.overlay_exact(&joined);
+        let user_comps = self.overlay_comps(&joined, tail);
+
+        if let Some(store) = &self.store {
+            let (base_exact, base_comps) = store.lookup_prefix_layers(syllables, tail, limit);
+            let l1_cap = if tail.is_empty() {
+                limit
+            } else {
+                limit.div_ceil(2)
+            };
+            let mut out = Self::merge_overlay(base_exact, user_exact, l1_cap);
+            let rest = limit - out.len().min(limit);
+            out.extend(Self::merge_overlay(base_comps, user_comps, rest));
+            out.truncate(limit);
+            return Ok(out);
+        }
+
+        // 纯 SQLite 路径：`index` 按 (pinyin ASC, freq DESC, text ASC) 排好，
+        // 层一 = joined 的精确块（切片内已 freq 降序），层二 = 区间其余部分重排。
+        let start = self.index.partition_point(|e| e.pinyin < joined);
+        let exact_len = self.index[start..]
+            .iter()
+            .take_while(|e| e.pinyin == joined)
+            .count();
+        let mut out: Vec<Candidate> = self.index[start..]
+            .iter()
+            .take_while(|e| e.pinyin == joined)
+            .map(Self::entry_to_candidate)
+            .take(if tail.is_empty() {
+                limit
+            } else {
+                limit.div_ceil(2)
+            })
+            .collect();
+        let (lo, hi) = if tail.is_empty() {
+            let lower = format!("{joined}'");
+            let upper = increment_prefix(&lower).unwrap_or_else(|| lower.clone());
+            (
+                self.index.partition_point(|e| e.pinyin < lower),
+                self.index.partition_point(|e| e.pinyin < upper),
+            )
+        } else {
+            let upper = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
+            (
+                start + exact_len,
+                self.index.partition_point(|e| e.pinyin < upper),
+            )
+        };
+        let mut comps: Vec<Candidate> = self.index[lo..hi]
+            .iter()
+            .map(Self::entry_to_candidate)
+            .collect();
+        comps.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+        comps.truncate(limit - out.len());
+        out.extend(comps);
+        Ok(out)
     }
 
     /// 声母缩写查询

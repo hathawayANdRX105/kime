@@ -68,6 +68,9 @@ pub struct Engine {
     preedit: String,
     /// 当前标点模式（中文全角 / 英文原样）
     punct_mode: crate::config::PunctMode,
+    /// 成对引号状态：`Some(q)` = 刚上屏过 `q` 的开引号，下一次再敲 `q` 出闭引号。
+    /// 只覆盖 `"` 与 `'`（rime punctuator 同款最小状态机），其它键一按即重置。
+    quote_open: Option<char>,
 }
 impl Engine {
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -103,6 +106,7 @@ impl Engine {
             page_index: 0,
             fuzzy_map,
             punct_mode,
+            quote_open: None,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -132,6 +136,15 @@ impl Engine {
 
     /// 唯一入口。字母累积 / 退格删音节 / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
+        // 成对标点状态机入口：同一个引号键连按交替 开→闭→开；任何其它键（字母、
+        // 空格、ESC、英文模式下的任何东西）都重置回「下一次出开引号」。
+        let quote_key = match k.ch {
+            Some(c @ ('"' | '\'')) => Some(c),
+            _ => None,
+        };
+        if quote_key != self.quote_open {
+            self.quote_open = None;
+        }
         // Shift 单独按下：无组合时切中英；有预编辑时上屏原串再切英文。
         if k.ch.is_none()
             && k.shift
@@ -155,6 +168,7 @@ impl Engine {
 
         // 英文模式：除上面已处理的 shift 外，其余键一律放行。
         if !self.chinese {
+            self.quote_open = None;
             return Outcome::Ignored;
         }
 
@@ -260,10 +274,21 @@ impl Engine {
         // 标点处理：仅中文模式且有映射时生效
         if let Some(c) = k.ch {
             if let Some(mapped) = punct::map_punct(c) {
-                // 英文标点模式：不转换，原样输出
+                // 英文标点模式：不转换，原样输出（也不维护引号状态）
                 if self.punct_mode == crate::config::PunctMode::English {
+                    self.quote_open = None;
                     return Outcome::Commit(c.to_string());
                 }
+                // 成对引号：map_punct 只给开引号；连着按的第二次在这里换成闭引号。
+                let closing = self.quote_open == Some(c);
+                if quote_key.is_some() {
+                    self.quote_open = if closing { None } else { Some(c) };
+                }
+                let mapped: &str = match (c, closing) {
+                    ('"', true) => "”",
+                    ('\'', true) => "’",
+                    _ => mapped,
+                };
                 if self.letters.is_empty() {
                     // 情况 A：无预编辑串，直接上屏标点
                     return Outcome::Commit(mapped.to_string());
@@ -324,8 +349,22 @@ impl Engine {
             }
         }
 
-        // Enter（code 28）— 有预编辑串时原样上屏（不转中文），方便英文/网址
+        // Enter（code 28）— 有候选时提交当前高亮项（与候选窗反色一致），照选词走 learn；
+        // 无候选但有字母串（英文/网址）时原样上屏。两条分支都不碰中英文模式——
+        // 切模式只属于 Shift（见本函数开头）。旧行为「有预编辑一律上屏字母」让用户
+        // 以为 Enter 切了中英（工单第 3 条），改掉。
         if k.ch.is_none() && k.code == 28 {
+            if !self.candidates.is_empty() {
+                let idx = self.highlight().min(self.candidates.len() - 1);
+                let text = self.candidates[idx].text.clone();
+                self.learn_or_warn(&text);
+                self.letters.clear();
+                self.candidates.clear();
+                self.last_reading.clear();
+                self.preedit.clear();
+                self.page_index = 0;
+                return Outcome::Commit(text);
+            }
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
                 self.letters.clear();
@@ -1322,8 +1361,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_commits_raw_preedit_without_conversion() {
-        // 输入 "nihao" 后按 Enter → 应原样上屏 "nihao"（不转中文）
+    fn enter_commits_highlighted_candidate_without_toggling_mode() {
+        // 工单第 3 条：Enter = 提交选中候选 + learn + 清空组合；绝不切中英模式。
+        // （旧行为「原样上屏 nihao」已删，新契约的无候选分支见 tests/enter_commit_test.rs。）
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1336,8 +1376,10 @@ mod tests {
             ctrl: false,
             alt: false,
         });
-        assert_eq!(outcome, Outcome::Commit("nihao".to_string()));
+        assert_eq!(outcome, Outcome::Commit("你好".to_string()));
+        assert!(e.chinese(), "Enter 之后必须仍是中文模式");
         assert!(e.preedit().is_empty());
+        assert!(e.candidates().is_empty());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

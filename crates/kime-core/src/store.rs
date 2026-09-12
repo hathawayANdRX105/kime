@@ -368,10 +368,9 @@ impl FstStore {
 
     /// 精确查询：`syllables` 必须与 key 完全相等。FST 是 `Map<pinyin, key_idx>`，一次 get 即可。
     ///
-    /// 与 `lookup_prefix(syllables, "", limit)` 不同，后者是前缀区间查询：
-    /// `increment_prefix("ni'hao")` = `"ni'hap"`，区间 `["ni'hao", "ni'hap")` 会带上
-    /// `ni'hao'shi'jie` 这类更长的 key。Viterbi 按跨度 (i,j) 查词，必须只拿该跨度的词，
-    /// 否则 2 音节跨度返回 4 音节的词，格子里的词互相重叠，整句结果变成乱码。
+    /// 与 `lookup_prefix(syllables, "", limit)` 不同——后者层二仍收 `ni'hao'…` 这类
+    /// 跨边界补全 key（见 `lookup_prefix_layers`）。Viterbi 按跨度 (i,j) 查词，必须只拿
+    /// 该跨度的词，否则 2 音节跨度返回 4 音节的词，格子里的词互相重叠，整句结果变成乱码。
     pub fn lookup_exact(&self, syllables: &[String], limit: usize) -> Vec<Candidate> {
         if limit == 0 || syllables.is_empty() {
             return Vec::new();
@@ -387,14 +386,40 @@ impl FstStore {
         decode_block(data, &joined, limit)
     }
 
-    /// 前缀查询：完整音节 + 未完成尾音节。返回按 (freq DESC, text ASC) 排序的至多 limit 条。
-    ///
-    /// 语义修正（相对 v2）：v2「收集满 limit 即 break」会整体跳过后面的 key，
-    /// 高频词被前面 key 的低频块挤掉；v3 对每个命中块至多解 limit 条并全程归并
-    /// （块头剪枝保证宽区间下每块只花常数读），返回真正的区间全局 top-k。
+    /// 前缀查询（合并形态）：层一（精确命中）在前、层二（补全）在后，各自内部
+    /// (freq DESC, text ASC)。语义见 [`Self::lookup_prefix_layers`]。
     pub fn lookup_prefix(&self, syllables: &[String], tail: &str, limit: usize) -> Vec<Candidate> {
+        let (exact, comps) = self.lookup_prefix_layers(syllables, tail, limit);
+        let mut out = exact;
+        out.extend(comps);
+        out.truncate(limit);
+        out
+    }
+
+    /// 两层前缀查询：`(层一 = key 恰为 joined 的块, 层二 = 合法补全)`。
+    ///
+    /// 层二的区间按 tail 是否打完分两种（这就是「打 min 出明/名/命」的修复点）：
+    /// - **tail 非空**（最后一个音节还在打）：开区间 `[joined, increment_prefix(joined))`
+    ///   去掉精确 key 自身——`mi` 仍能补全出 `min`、`ming`、`mi'xxx`（用户可能正打任何
+    ///   以 mi 开头的音节，这里砍不得）。
+    /// - **tail 为空**（音节边界已成）：只允许**跨音节边界**的延展，即 key 以
+    ///   `joined + "'"` 开头。`ming` 不是 `min` 的补全——它要求用户在不换边界的前提下
+    ///   往同一音节里再敲字母；`min'xxx` 才是合法补全。上界用
+    ///   `increment_prefix("min'") = "mina"`：`'`(0x27) 是 a–z 表之前的字节，
+    ///   `"min'…"` 全部 < `"mina"`，且任何以 `mina` 开头的 key 必不以 `min'` 开头，紧致。
+    ///
+    /// **tail 为空时不走 topk 热表**：热表桶按「首音节的裸字母前缀」在构建期预计算，
+    /// 桶内没有 `'` 边界概念，`min` 桶天然装着 `ming` 的条目——正是本修复要排除的集合。
+    /// tail 非空时热表仍可用：开区间本就是桶的语义，只需滤掉精确 key 的条目
+    /// （滤后可能少 1–2 条桶深之外的候选，与原实现的 TOPK 截断同级，不更差）。
+    pub fn lookup_prefix_layers(
+        &self,
+        syllables: &[String],
+        tail: &str,
+        limit: usize,
+    ) -> (Vec<Candidate>, Vec<Candidate>) {
         if limit == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut joined = syllables.join("'");
         if !tail.is_empty() {
@@ -404,25 +429,65 @@ impl FstStore {
             joined.push_str(tail);
         }
         if joined.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
-        // 热表：joined 不含 `'` 时其区间 = 首段以 joined 开头的 key 集，构建期已算好全局 top-K。
-        if limit <= TOPK && !joined.contains('\'') {
-            if let Some(off) = self.topk.get(joined.as_str()) {
-                return self.fetch_topk(off as usize, limit);
+        // 层一：一次 fst.get + 单块解码（块内已按 freq DESC 排好）。不借热表——
+        // 桶是全局 top-64，精确块里的低频字（民→闵）可能被挤出，单查该块才完整。
+        let exact = match self
+            .fst
+            .get(joined.as_str())
+            .and_then(|idx| self.block(idx))
+        {
+            Some(data) => decode_block(data, &joined, limit),
+            None => Vec::new(),
+        };
+
+        // 层二
+        let comps = if tail.is_empty() {
+            let lower = format!("{joined}'");
+            self.scan_range(&lower, limit)
+        } else if !joined.contains('\'') && limit <= TOPK {
+            match self.topk.get(joined.as_str()) {
+                Some(off) => self
+                    .fetch_topk(off as usize, TOPK)
+                    .into_iter()
+                    .filter(|c| c.pinyin != joined)
+                    .take(limit)
+                    .collect(),
+                None => self.scan_range(&joined, limit),
             }
-        }
-
-        let upper = increment_prefix(&joined);
-        let stream_builder = if let Some(ref up) = upper {
-            self.fst.range().ge(joined.as_str()).lt(up.as_str())
         } else {
-            self.fst.range().ge(joined.as_str())
+            // 全区间扫时跳过精确 key 本身：它已经在层一。
+            self.scan_range_excluding(&joined, limit, Some(joined.as_bytes()))
+        };
+        (exact, comps)
+    }
+
+    /// 区间 `[prefix, increment_prefix(prefix))` 的全局 top-limit 归并。
+    /// `prefix` 以字母结尾时 increment 必存在（store 版进位不返回 None）。
+    fn scan_range(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
+        self.scan_range_excluding(prefix, limit, None)
+    }
+
+    fn scan_range_excluding(
+        &self,
+        prefix: &str,
+        limit: usize,
+        exclude: Option<&[u8]>,
+    ) -> Vec<Candidate> {
+        let upper = increment_prefix(prefix);
+        let stream_builder = if let Some(up) = &upper {
+            self.fst.range().ge(prefix).lt(up.as_str())
+        } else {
+            self.fst.range().ge(prefix)
         };
         let mut top: BinaryHeap<Worst> = BinaryHeap::with_capacity(limit.min(TOPK));
         let mut stream = stream_builder.into_stream();
         while let Some(out) = stream.next() {
+            if exclude == Some(out.0) {
+                continue; // 精确 key 归层一
+            }
             self.collect_block(out.1, Some(out.0), &mut top, limit);
         }
         finish(top)

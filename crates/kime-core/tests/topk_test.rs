@@ -109,9 +109,11 @@ fn oversized_bucket_keeps_global_topk_in_table() {
     build(&db, &bin).unwrap();
     let store = FstStore::open(&bin).unwrap();
 
-    // 前缀 "ba" 的桶收 71 条候选（key ba 的 70 条 freq1..70 + key ba'zi 的 freq9999），
+    // 前缀 "b" 的桶收 71 条候选（key ba 的 70 条 freq1..70 + key ba'zi 的 freq9999），
     // limit=50 走热表：期望 9999 置顶 + freq 70..22 共 50 条。
-    let hits = store.lookup_prefix(&[], "ba", 50);
+    // 用裸前缀 "b" 而不是 "ba"：「ba」在两层契约下是精确 key（层一），热表桶里它的
+    // 条目会被拆去层一——本测试守的是【补全区间】(层二) 的全局 top-K，与精确层无关。
+    let hits = store.lookup_prefix(&[], "b", 50);
     assert_eq!(hits[0].text, "稀9999");
     assert_eq!(hits.len(), 50);
     let expected: Vec<String> = std::iter::once("稀9999".to_string())
@@ -124,7 +126,7 @@ fn oversized_bucket_keeps_global_topk_in_table() {
     );
 
     // 恰好取满桶容量：第 64 名 = freq 8。
-    let full = store.lookup_prefix(&[], "ba", 64);
+    let full = store.lookup_prefix(&[], "b", 64);
     assert_eq!(full.len(), 64);
     assert_eq!(full[63].text, "常8");
 }
