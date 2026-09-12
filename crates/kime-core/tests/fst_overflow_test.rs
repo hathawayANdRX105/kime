@@ -79,9 +79,9 @@ fn open_rejects_truncated_and_legacy_dict_bin() {
     let dir = tempfile::tempdir().unwrap();
     let body = "你好\tni hao\t5000\n拟好\tni hao\t100\n什么\tshen me\t8000\n";
     let (db, bin, _) = build_from_body(dir.path(), body, 3);
-    assert!(FstStore::open(&bin).is_ok(), "健康的 v2 词库必须能打开");
+    assert!(FstStore::open(&bin).is_ok(), "健康的 v3 词库必须能打开");
 
-    // (a) values 区被截尾：扫描消费 < 声明长度 → Err（旧代码静默返回残缺 blocks）
+    // (a) 文件被截尾：各区声明长度与文件大小不符 → Err（v2 时代靠全量扫描发现，v3 由区界校验发现）
     let mut bytes = fs::read(&bin).unwrap();
     let cut = bytes.len() - 8;
     bytes.truncate(cut);
@@ -89,21 +89,25 @@ fn open_rejects_truncated_and_legacy_dict_bin() {
     fs::write(&truncated, &bytes).unwrap();
     assert!(
         FstStore::open(&truncated).is_err(),
-        "截断的 values 区必须报 Err"
+        "截断的 dict.bin 必须报 Err"
     );
 
-    // (b) v1 文件（块计数 u16）：版本门禁直接拒绝，不能按 u32 误读
-    bytes = fs::read(&bin).unwrap();
-    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-    let legacy = dir.path().join("legacy.bin");
-    fs::write(&legacy, &bytes).unwrap();
-    assert!(
-        FstStore::open(&legacy).is_err(),
-        "旧格式 dict.bin 必须报 Err 并触发回退"
-    );
+    // (b) 旧格式文件：v3 的索引区不落盘就无法重建，版本门禁必须拒绝 v1/v2，
+    //     不能按新头部误读
+    let intact = fs::read(&bin).unwrap();
+    for legacy_version in [1u32, 2] {
+        let mut bytes = intact.clone();
+        bytes[4..8].copy_from_slice(&legacy_version.to_le_bytes());
+        let legacy = dir.path().join(format!("legacy{legacy_version}.bin"));
+        fs::write(&legacy, &bytes).unwrap();
+        assert!(
+            FstStore::open(&legacy).is_err(),
+            "旧格式 (v{legacy_version}) dict.bin 必须报 Err 并触发回退"
+        );
+    }
 
     // 回退路径真的可用：坏 dict.bin 摆在 db 旁边，Dict 仍从 SQLite 查出候选
-    fs::copy(&legacy, &bin).unwrap();
+    fs::copy(&dir.path().join("legacy2.bin"), &bin).unwrap();
     let dict = Dict::open(&db).unwrap();
     let hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
     assert_eq!(
