@@ -52,4 +52,36 @@ impl Table {
         }
         Ok(out)
     }
+
+    /// 半截键（只敲了键对的前一半）代表的拼音前缀。
+    ///
+    /// 从码表推导，不另立一张映射表：以 `u` 为声母键的音节全是 sh 系
+    /// （shi/shen/shang/…），所以 `u` 就代表 `"sh"`；`b` 打头全是 b 系，故 `"b"`。
+    /// 好处是码表一改这里自动跟着改，不会和码表漂移。
+    pub fn initial_of(&self, key: char) -> String {
+        if !key.is_ascii_lowercase() {
+            return String::new();
+        }
+        let first = key as u8;
+        let mut common: Option<&str> = None;
+        for second in b'a'..=b'z' {
+            let Some(syl) = (self.decode)(first, second) else {
+                continue;
+            };
+            common = Some(match common {
+                None => syl,
+                Some(prev) => common_prefix(prev, syl),
+            });
+            if common == Some("") {
+                break; // 已经缩到空，不可能更长
+            }
+        }
+        common.unwrap_or("").to_string()
+    }
+}
+
+/// ASCII 公共前缀（拼音全 ASCII，按字节切安全）。
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    &a[..n]
 }

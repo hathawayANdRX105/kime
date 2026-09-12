@@ -379,29 +379,30 @@ impl Engine {
         // 双拼模式：解码失败时回退全拼切分（允许全拼混输，与 fcitx5 双拼行为一致）
         if self.sp.is_some() {
             let len = self.letters.len();
-            // 解码在块表达式里做完，`self.sp` 的借用随块结束：
-            // 后续要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
-            let decoded = {
+            // 解码和半截键的拼音前缀都在块表达式里算完，`self.sp` 的借用随块结束：
+            // 后面要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
+            let (decoded, pending) = {
                 let table = self.sp.as_ref().unwrap();
                 if len % 2 == 0 {
-                    table.to_syllables(&self.letters)
+                    (table.to_syllables(&self.letters), String::new())
                 } else {
-                    table.to_syllables(&self.letters[..len - 1])
+                    // 最后一个键还没凑成键对，它代表的是**声母**而不是拼音字母：
+                    // 直接拿它当拼音前缀去查，等于查 "u" 开头的词，半截状态必出垃圾。
+                    let last = self.letters[len - 1..].chars().next();
+                    (
+                        table.to_syllables(&self.letters[..len - 1]),
+                        table.initial_of(last.unwrap_or(' ')),
+                    )
                 }
-            };
-            let tail: String = if len % 2 == 0 {
-                String::new()
-            } else {
-                self.letters[len - 1..].to_string()
             };
             match decoded {
                 Ok(syllables) => {
-                    let tail = tail.as_str();
+                    let pending = pending.as_str();
                     self.last_reading = syllables.clone();
-                    self.preedit = format!("{}{}", syllables.join(""), tail);
+                    self.preedit = format!("{}{}", syllables.join(""), pending);
                     self.candidates = self
                         .dict
-                        .lookup_prefix(&syllables, tail, self.config.candidate_limit)
+                        .lookup_prefix(&syllables, pending, self.config.candidate_limit)
                         .unwrap_or_default();
                     if self.candidates.is_empty() {
                         if let Ok(ab) = self
@@ -425,7 +426,7 @@ impl Engine {
                             if self.candidates.is_empty() {
                                 // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                                 self.last_reading = syllables.clone();
-                                self.preedit = format!("{}{}", syllables.join(""), tail);
+                                self.preedit = format!("{}{}", syllables.join(""), pending);
                             }
                             if !self.candidates.iter().any(|c| c.text == sentence.text) {
                                 self.candidates.insert(0, sentence);

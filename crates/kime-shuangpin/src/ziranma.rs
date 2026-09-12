@@ -23,6 +23,11 @@
 //!   - `v` 在 dt…cs 之后                → `ui`； 在 j/q/x/y 之后 → `u`（ju/qu/xu/yu）
 //!                                         在 n/l 之后 → `ü`（nv/lv）
 //!   - `o` 在 dt…cs 之后                → `uo`；否则保持 `o`
+//!
+//! 零声母 `y` 一律**当声母**，韵母取本表键位：`you`=yb(ou→B)、`yan`=yj(an→J)、
+//! `yao`=yk(ao→K)、`ye`=ye。把 `y` 当介音 `i` 去套 `iu/ian/iao/ie` 的键
+//! （yq/ym/yc/yx）是错的 —— rime `double_pinyin` 的 algebra 没有那个替换。
+//! 守卫见 `tests/rime_algebra_test.rs`。
 
 #[cfg(test)]
 use kime_pinyin::Reading;
@@ -400,18 +405,18 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xia", *b"xw"),
     ("xie", *b"xx"),
     ("xing", *b"xy"),
-    ("yao", *b"yc"),
+    ("you", *b"yb"),
+    ("ye", *b"ye"),
     ("yang", *b"yh"),
     ("yi", *b"yi"),
-    ("yan", *b"ym"),
+    ("yan", *b"yj"),
+    ("yao", *b"yk"),
     ("yin", *b"yn"),
     ("yun", *b"yp"),
-    ("you", *b"yq"),
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
     ("yue", *b"yt"),
     ("yu", *b"yv"),
-    ("ye", *b"yx"),
     ("ying", *b"yy"),
     ("za", *b"za"),
     ("zou", *b"zb"),

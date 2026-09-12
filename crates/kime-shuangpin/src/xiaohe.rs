@@ -24,6 +24,10 @@
 //!   - `v` 在 dt…cs 之后                → `ui`； 在 j/q/x/y 之后 → `u`（ju/qu/xu/yu）
 //!                                         在 n/l 之后 → `ü`（nv/lv）
 //!   - `o` 在 dt…cs 之后                → `uo`；否则保持 `o`
+//!
+//! 零声母 `y` 一律**当声母**，韵母取本表键位：`you`=yz(ou→Z)、`yao`=yc(iao→C)、
+//! `yan`=yj(an→J)、`ye`=ye。把 `y` 当介音去套别的键（yq/yn/ym/yp）是错的 ——
+//! rime `double_pinyin_flypy` 的 algebra 没有那个替换。守卫见 `tests/rime_algebra_test.rs`。
 
 /// 把 401 音节里属于本方案的「音节→键对」手工列出来。
 /// 编码 = `声母键 + 韵母键`；零声母单韵母双写（如 `a→aa`）。
@@ -404,18 +408,18 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xia", *b"xx"),
     ("xun", *b"xy"),
     ("yin", *b"yb"),
+    ("yao", *b"yc"),
+    ("ye", *b"ye"),
     ("yang", *b"yh"),
     ("yi", *b"yi"),
+    ("yan", *b"yj"),
     ("ying", *b"yk"),
-    ("yan", *b"ym"),
-    ("yao", *b"yn"),
-    ("ye", *b"yp"),
-    ("you", *b"yq"),
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
     ("yue", *b"yt"),
     ("yu", *b"yv"),
     ("yun", *b"yy"),
+    ("you", *b"yz"),
     ("za", *b"za"),
     ("zao", *b"zc"),
     ("zai", *b"zd"),
