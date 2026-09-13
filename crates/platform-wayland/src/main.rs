@@ -1,7 +1,6 @@
 //! input-method-v2 平台壳：绑 seat → get_input_method → grab → engine。
 //! 未消费的键经 zwp_virtual_keyboard_v1 原样送回，避免 grab 吞掉回车/快捷键。
 
-use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::io::Read;
@@ -14,6 +13,7 @@ use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Key, Outcome};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::tray::TrayIconManager;
+use platform_wayland::SwallowTracker;
 use platform_wayland::{Layout, Renderer};
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
@@ -365,8 +365,9 @@ struct AppState {
     ctrl: bool,
     alt: bool,
     shift: bool,
-    /// grab 吃掉 press 的键，release 也不转发，避免半截按键
-    swallowed: HashSet<u32>,
+    /// press/release 配对记账（见 SwallowTracker）：press 被引擎吃掉的键，release 也不转发，
+    /// 避免半截按键；press 一旦转发给应用，记账必须销掉，release 同样转发。
+    swallowed: SwallowTracker,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
     /// 候选窗：候选条 + 一次性模式闪现；text_input_rectangle 只留日志
@@ -396,7 +397,7 @@ impl AppState {
             ctrl: false,
             alt: false,
             shift: false,
-            swallowed: HashSet::new(),
+            swallowed: SwallowTracker::default(),
             compositor: None,
             shm: None,
             popup: None,
@@ -550,7 +551,7 @@ impl AppState {
             let pe = engine.preedit().to_string();
             log(&format!("consumed preedit={pe}"));
             if let Some(im) = &self.input_method {
-                let cursor = pe.len() as i32;
+                let cursor = engine.preedit_cursor() as i32;
                 im.set_preedit_string(pe.clone(), 0, cursor);
                 im.commit(self.im_serial);
             }
@@ -919,7 +920,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 }
 
                 if released {
-                    if state.swallowed.remove(&key) {
+                    if state.swallowed.release(key) {
                         return;
                     }
                     state.forward_key(time, key, false);
@@ -936,7 +937,12 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 }
 
                 let is_shift = matches!(key, 42 | 54);
-                if state.alt || state.ctrl {
+                // Alt 组合一律直通应用（不改）。Ctrl 组合交给引擎：组合内光标编辑
+                // （C-b/C-f/C-h）、翻页 C-n/C-p、C-. 标点切换都从这里进；引擎返回
+                // Ignored 时照常放行 —— 无组合时 Ctrl+C/V/W 等必须原样到达应用，
+                // 否则用户连复制都不能用。Ctrl 键本身（code 29/97，ch=None）在引擎
+                // 里落不进任何组合分支 → Ignored → 转发，Ctrl 按下/松开与应用一致。
+                if state.alt {
                     state.forward_key(time, key, true);
                     return;
                 }
@@ -958,14 +964,18 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 };
                 match engine.key(key_struct) {
                     Outcome::Consumed => {
-                        state.swallowed.insert(key);
+                        state.swallowed.consume(key);
                         state.apply_consumed(qh);
                     }
                     Outcome::Commit(text) => {
-                        state.swallowed.insert(key);
+                        state.swallowed.consume(key);
                         state.apply_commit(text, qh);
                     }
                     Outcome::Ignored => {
+                        // 长按自动重复可能让同一个键从「被消费」中途变成「放行」（组合恰被删空）。
+                        // 转发 press 前必须销掉旧记账：否则 release 被残留标记吃掉，
+                        // 应用以为键一直没松 → 幽灵连发（backspace 停不下来的根因）。
+                        state.swallowed.forward(key);
                         state.forward_key(time, key, true);
                     }
                 }

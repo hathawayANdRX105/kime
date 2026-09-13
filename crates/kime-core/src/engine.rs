@@ -58,6 +58,9 @@ pub struct Engine {
     fuzzy_map: std::collections::HashMap<String, String>,
     /// 当前累积的拼音串（如 "niha"）
     letters: String,
+    /// letters 内的光标位置（字符索引）。不变式：0..=letters.len()；
+    /// letters 只由 a-z（ASCII）组成 → 字符索引==字节索引，直接当字节下标用是安全的。
+    cursor: usize,
     /// 最近一次查询得到的候选；commit / clear 时一并清空。
     candidates: Vec<Candidate>,
     /// 双拼解码表（如小鹤/自然码），用于 shuangpin 模式
@@ -99,6 +102,7 @@ impl Engine {
             config,
             chinese: true,
             letters: String::new(),
+            cursor: 0,
             candidates: Vec::new(),
             sp: shuangpin.map(kime_shuangpin::Table::new),
             last_reading: Vec::new(),
@@ -133,8 +137,44 @@ impl Engine {
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
     }
+    /// letters 空间的光标字符索引（平台无关，测试/诊断用）。
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
 
-    /// 唯一入口。字母累积 / 退格删音节 / 数字选词 / 空格首选 / shift 中英切换
+    /// preedit 显示串内的光标字符索引 —— 壳报给 `set_preedit_string` 的 caret 位置。
+    /// 全拼（含双拼解码失败回退全拼）时 preedit 恒等于 letters，逐字符 1:1；
+    /// 双拼显示态两键对一个音节：光标前的完整键对贡献整音节长度，
+    /// 奇数位光标补上半截键所代表的声母（与 refresh 的 pending 同一算法）。
+    pub fn preedit_cursor(&self) -> usize {
+        let pe_len = self.preedit.chars().count();
+        if self.sp.is_none() || self.preedit == self.letters {
+            return self.cursor.min(pe_len);
+        }
+        let full_pairs = self.cursor / 2;
+        let mut idx: usize = self.last_reading[..full_pairs.min(self.last_reading.len())]
+            .iter()
+            .map(|s| s.chars().count())
+            .sum();
+        if self.cursor % 2 == 1 {
+            if let Some(c) = self.letters.chars().nth(self.cursor - 1) {
+                idx += self.sp.as_ref().unwrap().initial_of(c).chars().count();
+            }
+        }
+        idx.min(pe_len)
+    }
+    /// 全量清空组合：候选/读音/preedit/页码/光标一并归位。所有上屏与 Esc 路径共用。
+    fn clear_composition(&mut self) {
+        self.letters.clear();
+        self.candidates.clear();
+        self.last_reading.clear();
+        self.preedit.clear();
+        self.page_index = 0;
+        self.cursor = 0;
+    }
+
+    /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
+    /// / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
         // 成对标点状态机入口：同一个引号键连按交替 开→闭→开；任何其它键（字母、
         // 空格、ESC、英文模式下的任何东西）都重置回「下一次出开引号」。
@@ -157,11 +197,7 @@ impl Engine {
                 return Outcome::Consumed;
             }
             let text = self.letters.clone();
-            self.letters.clear();
-            self.candidates.clear();
-            self.last_reading.clear();
-            self.preedit.clear();
-            self.page_index = 0;
+            self.clear_composition();
             self.chinese = false;
             return Outcome::Commit(text);
         }
@@ -172,12 +208,17 @@ impl Engine {
             return Outcome::Ignored;
         }
 
-        // Backspace — evdev KEY_BACKSPACE（14），ch 通常为 None。
+        // Backspace — evdev KEY_BACKSPACE（14），ch 通常为 None。删光标**前**一个字符
+        // （组合内光标语义）。空组合 → Ignored 放行给应用；长按的自动重复按 press
+        // 逐次到达，每次消费删一个字符，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
             if self.letters.is_empty() {
                 return Outcome::Ignored;
             }
-            self.letters.pop();
+            if self.cursor > 0 {
+                self.letters.remove(self.cursor - 1);
+                self.cursor -= 1;
+            }
             self.refresh_candidates();
             self.page_index = 0;
             return Outcome::Consumed;
@@ -185,11 +226,7 @@ impl Engine {
 
         // Esc — 清空当前组合。
         if k.ch.is_none() && k.code == KEY_ESC {
-            self.letters.clear();
-            self.candidates.clear();
-            self.last_reading.clear();
-            self.preedit.clear();
-            self.page_index = 0;
+            self.clear_composition();
             return Outcome::Consumed;
         }
 
@@ -233,15 +270,42 @@ impl Engine {
             }
         }
 
-        // Ctrl+f / Ctrl+b 翻页（Emacs 风格，无候选 Ignored，越界钳位）
+        // 组合内光标编辑（用户要求）：Ctrl+B 左移一格、Ctrl+F 右移一格、Ctrl+H 删光标前
+        // 一个字符。**Ctrl+F/B 不再翻页**——翻页让位给 - / = 与 Ctrl+N/Ctrl+P（下方），
+        // 这是用户的明确取舍（「C-f 前进一个字符、C-b 后退一个字符」）。
+        // 只在有组合时拦截：空组合下 Ctrl+F/B/H 一律 Ignored，应用的 emacs 移动键照旧可用。
+        if k.ctrl && !k.alt && !self.letters.is_empty() {
+            match k.ch {
+                Some('b') => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    return Outcome::Consumed;
+                }
+                Some('f') => {
+                    self.cursor = (self.cursor + 1).min(self.letters.len());
+                    return Outcome::Consumed;
+                }
+                Some('h') => {
+                    // 删空即清组合，与 Backspace 同一条路径（refresh 里判空）。
+                    if self.cursor > 0 {
+                        self.letters.remove(self.cursor - 1);
+                        self.cursor -= 1;
+                        self.refresh_candidates();
+                        self.page_index = 0;
+                    }
+                    return Outcome::Consumed;
+                }
+                _ => {}
+            }
+        }
+        // Ctrl+n / Ctrl+p 翻页（Emacs 风格，无候选 Ignored，越界钳位）
         if k.ctrl && !k.alt && !k.shift && !self.candidates.is_empty() {
             let total_pages = self.candidates.len().div_ceil(self.page_size());
             match k.ch {
-                Some('f') | Some('n') => {
+                Some('n') => {
                     self.page_index = (self.page_index + 1).min(total_pages - 1);
                     return Outcome::Consumed;
                 }
-                Some('b') | Some('p') => {
+                Some('p') => {
                     self.page_index = self.page_index.saturating_sub(1);
                     return Outcome::Consumed;
                 }
@@ -254,11 +318,7 @@ impl Engine {
             if let Some(top) = self.candidates.first().cloned() {
                 let text = top.text.clone();
                 self.learn_or_warn(&text);
-                self.letters.clear();
-                self.candidates.clear();
-                self.last_reading.clear();
-                self.preedit.clear();
-                self.page_index = 0;
+                self.clear_composition();
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
@@ -299,20 +359,12 @@ impl Engine {
                         let text = top.text.clone();
                         let commit_text = format!("{}{}", text, mapped);
                         self.learn_or_warn(&text);
-                        self.letters.clear();
-                        self.candidates.clear();
-                        self.last_reading.clear();
-                        self.preedit.clear();
-                        self.page_index = 0;
+                        self.clear_composition();
                         return Outcome::Commit(commit_text);
                     } else {
                         // 情况 C：无候选词，直接上屏并清空
                         let commit_text = format!("{}{}", self.letters, mapped);
-                        self.letters.clear();
-                        self.candidates.clear();
-                        self.last_reading.clear();
-                        self.preedit.clear();
-                        self.page_index = 0;
+                        self.clear_composition();
                         return Outcome::Commit(commit_text);
                     }
                 }
@@ -324,7 +376,8 @@ impl Engine {
                     return Outcome::Ignored;
                 }
                 let lc = c.to_ascii_lowercase();
-                self.letters.push(lc);
+                self.letters.insert(self.cursor, lc);
+                self.cursor += 1;
                 self.refresh_candidates();
                 return Outcome::Consumed;
             }
@@ -337,11 +390,7 @@ impl Engine {
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
                         self.learn_or_warn(&text);
-                        self.letters.clear();
-                        self.candidates.clear();
-                        self.last_reading.clear();
-                        self.preedit.clear();
-                        self.page_index = 0;
+                        self.clear_composition();
                         return Outcome::Commit(text);
                     }
                     return Outcome::Ignored;
@@ -356,11 +405,7 @@ impl Engine {
         if k.ch.is_none() && k.code == 28 {
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
-                self.letters.clear();
-                self.candidates.clear();
-                self.last_reading.clear();
-                self.preedit.clear();
-                self.page_index = 0;
+                self.clear_composition();
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
