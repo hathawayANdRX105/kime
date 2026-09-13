@@ -349,22 +349,11 @@ impl Engine {
             }
         }
 
-        // Enter（code 28）— 有候选时提交当前高亮项（与候选窗反色一致），照选词走 learn；
-        // 无候选但有字母串（英文/网址）时原样上屏。两条分支都不碰中英文模式——
-        // 切模式只属于 Shift（见本函数开头）。旧行为「有预编辑一律上屏字母」让用户
-        // 以为 Enter 切了中英（工单第 3 条），改掉。
+        // Enter（code 28）— 工单第 3 条契约：中文模式下打英文/网址的习惯。
+        // 有组合（letters 非空）→ 原样上屏字母串，清空组合，**不改中英模式**、
+        // 不 learn（选词是空格/数字的事，Enter 是「这不是拼音」的声明）。
+        // 无组合 → Ignored，回车正常放行给应用。
         if k.ch.is_none() && k.code == 28 {
-            if !self.candidates.is_empty() {
-                let idx = self.highlight().min(self.candidates.len() - 1);
-                let text = self.candidates[idx].text.clone();
-                self.learn_or_warn(&text);
-                self.letters.clear();
-                self.candidates.clear();
-                self.last_reading.clear();
-                self.preedit.clear();
-                self.page_index = 0;
-                return Outcome::Commit(text);
-            }
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
                 self.letters.clear();
@@ -394,6 +383,19 @@ fn fuzzy_expand(map: &std::collections::HashMap<String, String>, s: &str) -> Vec
         }
     }
     out
+}
+
+/// 与 `Dict::lookup_prefix` 完全同式的 key 拼接：音节 `'` 连接，尾部半截音节续在最后。
+/// 整句落位要靠它识别「候选/句子是否恰好消耗完当前输入」。
+fn joined_key(syllables: &[String], tail: &str) -> String {
+    let mut joined = syllables.join("'");
+    if !tail.is_empty() {
+        if !joined.is_empty() {
+            joined.push('\'');
+        }
+        joined.push_str(tail);
+    }
+    joined
 }
 
 impl Engine {
@@ -459,16 +461,18 @@ impl Engine {
                     // 整句联想：词库没有整串词条时（「我不知道你说的是什么」这类长句），
                     // Viterbi 组词是唯一的候选来源。双拼分支此前完全没接，长句一律 0 候选。
                     if syllables.len() >= 2 {
-                        if let Some(sentence) =
-                            crate::lattice::viterbi_sentence(&self.dict, &syllables)
-                        {
-                            if self.candidates.is_empty() {
-                                // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
-                                self.last_reading = syllables.clone();
-                                self.preedit = format!("{}{}", syllables.join(""), pending);
-                            }
-                            Self::place_sentence(&mut self.candidates, sentence);
+                        let sentences = crate::lattice::viterbi_sentences(&self.dict, &syllables);
+                        if !sentences.is_empty() && self.candidates.is_empty() {
+                            // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
+                            self.last_reading = syllables.clone();
+                            self.preedit = format!("{}{}", syllables.join(""), pending);
                         }
+                        // pending（半截键对）非空时句子没有消耗全部输入 → 不抢层一名次。
+                        Self::place_sentences(
+                            &mut self.candidates,
+                            sentences,
+                            &joined_key(&syllables, pending),
+                        );
                     }
                 }
                 Err(_) => {
@@ -564,29 +568,43 @@ impl Engine {
         // 句级联想（M8/Task 5）：如果有完整音节切分且长度 >= 2，尝试通过 Viterbi 构词成句
         if let Some(full_reading) = segs.first() {
             if full_reading.len() >= 2 {
-                if let Some(sentence) = crate::lattice::viterbi_sentence(&self.dict, full_reading) {
-                    Self::place_sentence(&mut cands, sentence);
-                }
+                let sentences = crate::lattice::viterbi_sentences(&self.dict, full_reading);
+                // 全拼路径：full_reading == reading + [tail]，句子读音恒等于 joined。
+                Self::place_sentences(&mut cands, sentences, &joined_key(&reading, &tail));
             }
         }
 
         self.candidates = cands;
     }
 
-    /// 整句候选只当兜底：没有任何直接命中该读音的候选时才许它排第一，否则挂到末尾。
-    ///
-    /// lattice 的代价是 `ln(freq)` 可加的，于是「两个超高频单字」永远比「一个真词」
-    /// 便宜 —— 词库频率修好后实测 `ufme`→神么 压过 什么、`jintian`→级虐差 压过 今天。
-    /// 修数据前是单字 freq 全为 0 恰好把这条错误路径盖住，不是模型对。
-    /// 不动代价模型（那要真正的语料概率），只固定它的名次。
-    fn place_sentence(cands: &mut Vec<Candidate>, sentence: Candidate) {
-        if cands.iter().any(|c| c.text == sentence.text) {
-            return;
-        }
-        if cands.is_empty() {
-            cands.insert(0, sentence);
-        } else {
-            cands.push(sentence);
+    /// 整句候选名次（工单第 4 条）：覆盖全部输入音节的句子属层一——
+    /// **永不压过层一的精确命中词**（ln(freq) 可加的代价模型里「两个超高频单字」
+    /// 永远比一个真词便宜，`ufme`→神么 压过 什么 是实测过的回归），
+    /// 但在补全区里按自身频率（`lattice::sentence_score` 的联合概率折算值）落位：
+    /// 精确块为空时，覆盖句因此排进 `我们确信`/`最近好吗` 这类
+    /// 「还要继续敲」的补全之前，而不是无条件钉死在列表末尾。
+    /// 没覆盖全输入的句子（双拼半截键 pending）不参与落位，挂末尾。
+    fn place_sentences(cands: &mut Vec<Candidate>, sentences: Vec<Candidate>, joined: &str) {
+        let l1_end = cands.iter().take_while(|c| c.pinyin == joined).count();
+        // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
+        // 否则频率折算会把更优的切分反-sort 到后面。
+        let mut cursor = l1_end;
+        for sentence in sentences {
+            if cands.iter().any(|c| c.text == sentence.text) {
+                continue;
+            }
+            let pos = if sentence.pinyin == joined {
+                // 补全区是 freq 降序的：落在第一个比它弱的候选之前；层一永不被越过。
+                cursor
+                    + cands[cursor..]
+                        .iter()
+                        .position(|c| c.freq < sentence.freq)
+                        .unwrap_or(cands.len() - cursor)
+            } else {
+                cands.len()
+            };
+            cands.insert(pos, sentence);
+            cursor = pos + 1;
         }
     }
 
@@ -1361,9 +1379,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_commits_highlighted_candidate_without_toggling_mode() {
-        // 工单第 3 条：Enter = 提交选中候选 + learn + 清空组合；绝不切中英模式。
-        // （旧行为「原样上屏 nihao」已删，新契约的无候选分支见 tests/enter_commit_test.rs。）
+    fn enter_commits_raw_letters_without_learning_or_toggling() {
+        // 工单第 3 条（用户定稿契约）：有组合时 Enter 原样上屏字母（打英文/网址），
+        // 中文模式不变、不 learn（选词归空格/数字）。完整断言集见 tests/enter_commit_test.rs。
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1376,10 +1394,16 @@ mod tests {
             ctrl: false,
             alt: false,
         });
-        assert_eq!(outcome, Outcome::Commit("你好".to_string()));
+        assert_eq!(outcome, Outcome::Commit("nihao".to_string()));
         assert!(e.chinese(), "Enter 之后必须仍是中文模式");
         assert!(e.preedit().is_empty());
         assert!(e.candidates().is_empty());
+        drop(e);
+        let d2 = Dict::open(&db).unwrap();
+        assert!(
+            d2.top_user(10).unwrap().is_empty(),
+            "Enter 不是选词，不许产生用户词"
+        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

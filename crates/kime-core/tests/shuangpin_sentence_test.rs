@@ -1,5 +1,5 @@
 //! 双拼整句联想：词库里没有整串词条时，Viterbi 组词是唯一的候选来源。
-//! 修复前双拼分支从不调用 `viterbi_sentence`，长句一律 0 候选、preedit 退回原始键串。
+//! 修复前双拼分支从不调用整句 Viterbi，长句一律 0 候选、preedit 退回原始键串。
 
 use kime_core::config::Config;
 use kime_core::{Engine, Key};

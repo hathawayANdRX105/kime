@@ -375,7 +375,9 @@ impl Dict {
         }
     }
 
-    /// 用户词覆盖基底词（同文本以用户词频为准），去重后按 (freq DESC, text ASC) 截断。
+    /// 单层合并：用户词覆盖基底同文本（以用户词频为准），结果仅在本层内按
+    /// (freq DESC, text ASC) 截断。层间顺序由调用方（`lookup_prefix`）拼接，
+    /// 这里绝不允许拿到跨层的列表来排序——那会把「精确命中先于补全」打平。
     fn merge_overlay(base: Vec<Candidate>, user: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
         if user.is_empty() {
             // 绝大多数按键走这里：基底已是 freq DESC 有序，不必重排。
@@ -427,14 +429,17 @@ impl Dict {
     }
 
     /// 前缀查询（两层合并）：层一 = key 恰等于输入（joined）的词条，层二 = 合法补全。
-    /// 每层内部 `(freq DESC, text ASC)`。limit 分配：层一不满时层二填满到 limit；
+    /// 每层内部 `(freq DESC, text ASC)`，拼接时层一整体在前——合并阶段绝不允许
+    /// 对跨层列表做一次性频率排序（那正是「我们去 被 我们确信 压住」的形态）。
+    /// limit 分配：层一不满时层二填满到 limit；
     /// 层一溢出时——仅当 tail 非空（还在打最后一个音节）——层二至少保留一半名额，
     /// 「`mi` 仍要够得着 `min`/`ming` 的字」是显式验收，否则 `mi` 这种几百字的精确块
     /// 会把补全整段挤出列表。tail 为空 = 音节已收口，层一独占到底。
     ///
     /// FST 路径与纯 SQLite 内存索引路径必须同语义（上一轮 `lookup_exact` 的 bug 就出在
     /// 两条路径不一致）。用户词 overlay 按层合并：只有 pinyin == joined 的词进层一，
-    /// 不许在层二借高频插队到精确命中之前。
+    /// 不许在层二借高频插队到精确命中之前；用户词与层一基底同文本时频率以用户词为准、
+    /// 层归属沿用原条目（不许跨层跳跃），且任何与层一重复的文本不进层二。
     pub fn lookup_prefix(
         &self,
         syllables: &[String],
@@ -452,16 +457,35 @@ impl Dict {
             return Ok(Vec::new());
         }
         let user_exact = self.overlay_exact(&joined);
-        let user_comps = self.overlay_comps(&joined, tail);
+        let mut user_comps = self.overlay_comps(&joined, tail);
 
         if let Some(store) = &self.store {
-            let (base_exact, base_comps) = store.lookup_prefix_layers(syllables, tail, limit);
+            let (mut base_exact, mut base_comps) =
+                store.lookup_prefix_layers(syllables, tail, limit);
+            // 用户词文本命中层一基底（哪怕学的时候用的是别的读音）：
+            // 频率以用户词为准，层归属沿用原条目，并从层二候选里剔除，不许复制。
+            let mut exact_dirty = false;
+            user_comps.retain(|u| match base_exact.iter_mut().find(|b| b.text == u.text) {
+                Some(b) => {
+                    b.freq = u.freq;
+                    exact_dirty = true;
+                    false
+                }
+                None => true,
+            });
+            if exact_dirty {
+                base_exact.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+            }
             let l1_cap = if tail.is_empty() {
                 limit
             } else {
                 limit.div_ceil(2)
             };
             let mut out = Self::merge_overlay(base_exact, user_exact, l1_cap);
+            let l1_texts: std::collections::HashSet<&str> =
+                out.iter().map(|c| c.text.as_str()).collect();
+            base_comps.retain(|c| !l1_texts.contains(c.text.as_str()));
+            user_comps.retain(|c| !l1_texts.contains(c.text.as_str()));
             let rest = limit - out.len().min(limit);
             out.extend(Self::merge_overlay(base_comps, user_comps, rest));
             out.truncate(limit);
@@ -499,9 +523,27 @@ impl Dict {
                 self.index.partition_point(|e| e.pinyin < upper),
             )
         };
+        // 与 FST 路径同语义：用户词（另一读音下学的）与层一同文本时频率以用户词为准、
+        // 层归属不变；层二不得重复层一已展示的文本。
+        let mut l1_dirty = false;
+        for entry in &self.index[lo..hi] {
+            if entry.user != 1 {
+                continue;
+            }
+            if let Some(o) = out.iter_mut().find(|o| o.text == entry.text) {
+                if o.freq != entry.freq.max(0) as u64 {
+                    o.freq = entry.freq.max(0) as u64;
+                    l1_dirty = true;
+                }
+            }
+        }
+        if l1_dirty {
+            out.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+        }
         let mut comps: Vec<Candidate> = self.index[lo..hi]
             .iter()
             .map(Self::entry_to_candidate)
+            .filter(|c| !out.iter().any(|o| o.text == c.text))
             .collect();
         comps.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
         comps.truncate(limit - out.len());

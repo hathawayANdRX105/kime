@@ -1,6 +1,6 @@
-//! 工单第 3 条：Enter（code 28）不再「看起来切换中英文」。
-//! 新契约：有候选 → 提交高亮候选并 learn；无候选 → 原样上屏字母。
-//! 两条分支都绝不改 `chinese` 模式（切模式只属于 Shift）。
+//! 工单第 3 条（用户定稿契约）：中文模式下按 Enter ＝「这串不是拼音」。
+//! 有组合 → 原样上屏字母串（打英文/网址的习惯），中文模式保持不变、不 learn；
+//! 无组合 → Ignored，回车照常放行给应用。选词是空格/数字的事，与 Enter 无关。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,7 +59,6 @@ fn code(code: u32) -> Key {
 }
 
 const KEY_ENTER: u32 = 28;
-const KEY_EQUAL: u32 = 13;
 
 fn type_str(e: &mut Engine, s: &str) {
     for c in s.chars() {
@@ -68,61 +67,40 @@ fn type_str(e: &mut Engine, s: &str) {
 }
 
 #[test]
-fn enter_with_candidates_commits_highlight_and_keeps_chinese() {
-    let db = tmp_db("top");
+fn enter_with_candidates_commits_raw_letters_not_the_word() {
+    let db = tmp_db("raw");
     let mut e = engine(
         &db,
         "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
            ('ni''hao','你好',5000,'nh',0);",
     );
     type_str(&mut e, "nihao");
-    assert_eq!(e.preedit(), "nihao");
+    assert!(
+        e.candidates().iter().any(|c| c.text == "你好"),
+        "种子词库下 nihao 应有候选"
+    );
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::Commit("你好".into()),
-        "Enter 必须上屏选中候选而非字母"
+        Outcome::Commit("nihao".into()),
+        "Enter 上屏的是原始字母串，不是高亮候选（选词归空格/数字）"
     );
-    assert!(e.chinese(), "Enter 不得切换中英文模式");
+    assert!(e.chinese(), "Enter 绝不切换中英文模式");
     assert!(e.preedit().is_empty(), "组合必须清空");
     assert!(e.candidates().is_empty(), "候选必须清空");
-    // learn 确实发生：提交走的是与空格选词相同的用户词回写（重开库看 user 行）。
+    // 不 learn：Enter 是「这不是拼音」的声明，不该污染用户词。
     drop(e);
     let d2 = Dict::open(&db).unwrap();
-    let top = d2.top_user(10).unwrap();
     assert!(
-        top.iter().any(|c| c.text == "你好"),
-        "Enter 提交后应有用户词记录，实际 {top:?}"
+        d2.top_user(10).unwrap().is_empty(),
+        "Enter 提交字母后不应产生用户词"
     );
-    let _ = fs::remove_file(&db);
-}
-
-#[test]
-fn enter_commits_the_page_highlight_not_the_global_top() {
-    // 12 个同读音候选，翻到第 2 页按 Enter → 上屏第 11 个（页首 = 高亮项）。
-    let db = tmp_db("page");
-    let mut rows =
-        String::from("INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES");
-    for i in 0..12 {
-        rows.push_str(&format!(
-            "('ni','词{i}',{},'n',0){}\n",
-            100 - i,
-            if i == 11 { ";" } else { "," }
-        ));
-    }
-    let mut e = engine(&db, &rows);
-    type_str(&mut e, "ni");
-    e.key(code(KEY_EQUAL));
-    assert_eq!(e.page().0, 1, "应翻到第 2 页");
-    let out = e.key(code(KEY_ENTER));
-    assert_eq!(out, Outcome::Commit("词10".into()));
-    assert!(e.chinese());
     let _ = fs::remove_file(&db);
 }
 
 #[test]
 fn enter_without_candidates_commits_raw_letters_and_keeps_chinese() {
-    let db = tmp_db("raw");
+    let db = tmp_db("nocands");
     let mut e = engine(
         &db,
         "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
