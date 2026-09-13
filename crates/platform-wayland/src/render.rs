@@ -24,7 +24,8 @@ const HL: Color = Color::rgba(255, 220, 120, 255);
 /// 模式字：青绿系，与 FG/HL 及其抗锯齿混色都不撞
 const CHIP: Color = Color::rgba(122, 207, 214, 255);
 
-/// 模式标识字：中文 = 候选条开头的 chip；英文 = 无候选时唯一的提示内容。
+/// 模式标识字：只出现在切换瞬间的 `chip_layout` 小窗里（工单第 1 条），
+/// 不再常驻候选条。
 pub fn mode_chip(chinese: bool) -> &'static str {
     if chinese {
         "中"
@@ -42,8 +43,8 @@ pub struct PlacedItem {
     pub chip: bool,
 }
 
-/// 一帧的完整摆放结果。中文 + 空候选 → 1×1（隐藏帧，像素全透明）；
-/// 英文 + 空候选 → 只含 `英` 字的提示小窗。
+/// 一帧的完整摆放结果。空候选 → 1×1（隐藏帧，像素全透明）。
+/// 模式提示不占常驻帧：中英切换瞬间单独走 `chip_layout`。
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub width: u32,
@@ -107,24 +108,17 @@ impl Renderer {
         w.ceil().max(0.0) as u32
     }
 
-    /// 横排单行摆放：模式字打头（不编号），其后每项 "N. 候选"，定宽分隔，
-    /// 总宽随内容自适应。candidates 已是当前页（调用方切好片），这里不再截断。
+    /// 横排单行摆放：每项 "N. 候选"，定宽分隔，总宽随内容自适应。
+    /// candidates 已是当前页（调用方切好片），这里不再截断。
     /// 高度只含边距 + 行高：合成器已把 popup 摆在光标旁，表面内不再留光标行空行。
-    pub fn layout(&mut self, candidates: &[String], chinese: bool) -> Layout {
-        if candidates.is_empty() && chinese {
+    /// 模式字不进候选条（工单第 1 条）：中英切换瞬间走 `chip_layout`。
+    /// 空候选 → 隐藏帧。
+    pub fn layout(&mut self, candidates: &[String]) -> Layout {
+        if candidates.is_empty() {
             return Layout::hidden();
         }
-        let mut items = Vec::with_capacity(candidates.len() + 1);
+        let mut items = Vec::with_capacity(candidates.len());
         let mut x = MARGIN_X;
-        let chip = mode_chip(chinese);
-        let w = self.measure(chip);
-        items.push(PlacedItem {
-            x,
-            w,
-            text: chip.to_string(),
-            chip: true,
-        });
-        x += w + SEP;
         for (i, text) in candidates.iter().enumerate() {
             let label = format!("{}. {}", i + 1, text);
             let w = self.measure(&label);
@@ -142,6 +136,24 @@ impl Renderer {
             width,
             height,
             items,
+        }
+    }
+
+    /// 模式提示的一次性闪现小窗：只含 `中`/`英` 单字，下一次按键即清。
+    /// 高度与候选条同律（MARGIN_Y*2 + 行高），宽度 = 单字实测宽 + 左右留白。
+    pub fn chip_layout(&mut self, chinese: bool) -> Layout {
+        let text = mode_chip(chinese).to_string();
+        let w = self.measure(&text);
+        let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
+        Layout {
+            width: MARGIN_X * 2 + w,
+            height,
+            items: vec![PlacedItem {
+                x: MARGIN_X,
+                w,
+                text,
+                chip: true,
+            }],
         }
     }
 

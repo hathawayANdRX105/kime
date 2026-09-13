@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::fs::File;
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -10,6 +12,7 @@ use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Key, Outcome};
+use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::tray::TrayIconManager;
 use platform_wayland::{Layout, Renderer};
 use wayland_client::{
@@ -50,54 +53,6 @@ fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
         None
     } else {
         Some(unsafe { OwnedFd::from_raw_fd(raw) })
-    }
-}
-
-/// US QWERTY evdev KEY_* → 字符。功能键 ch=None，靠 code 走 engine。
-fn evdev_char(code: u32) -> Option<char> {
-    match code {
-        16 => Some('q'),
-        17 => Some('w'),
-        18 => Some('e'),
-        19 => Some('r'),
-        20 => Some('t'),
-        21 => Some('y'),
-        22 => Some('u'),
-        23 => Some('i'),
-        24 => Some('o'),
-        25 => Some('p'),
-        30 => Some('a'),
-        31 => Some('s'),
-        32 => Some('d'),
-        33 => Some('f'),
-        34 => Some('g'),
-        35 => Some('h'),
-        36 => Some('j'),
-        37 => Some('k'),
-        38 => Some('l'),
-        44 => Some('z'),
-        45 => Some('x'),
-        46 => Some('c'),
-        47 => Some('v'),
-        48 => Some('b'),
-        49 => Some('n'),
-        50 => Some('m'),
-        2 => Some('1'),
-        3 => Some('2'),
-        4 => Some('3'),
-        5 => Some('4'),
-        6 => Some('5'),
-        7 => Some('6'),
-        8 => Some('7'),
-        9 => Some('8'),
-        10 => Some('9'),
-        11 => Some('0'),
-        12 => Some('-'),
-        13 => Some('='),
-        26 => Some('['),
-        27 => Some(']'),
-        52 => Some('.'),
-        _ => None,
     }
 }
 
@@ -193,8 +148,9 @@ struct PopupCanvas {
     /// 待显示内容：当前页候选 + 页内高亮下标
     content: Vec<String>,
     highlight: usize,
-    /// 引擎中英模式：英文 + 无候选 = 画 `英` 提示小窗；中文 + 无候选 = 隐藏
-    chinese: bool,
+    /// 模式提示闪现：Some = 刚发生中英切换，画只含 中/英 的小窗；
+    /// 下一次任意按键（Key 处理开头）清掉。
+    chip: Option<bool>,
 }
 
 impl PopupCanvas {
@@ -218,7 +174,7 @@ impl PopupCanvas {
             dirty: false,
             content: Vec::new(),
             highlight: 0,
-            chinese: true,
+            chip: None,
         };
         canvas.present(qh);
         canvas
@@ -228,22 +184,38 @@ impl PopupCanvas {
         &mut self,
         candidates: Vec<String>,
         highlight: usize,
-        chinese: bool,
         qh: &QueueHandle<AppState>,
     ) {
-        if self.content == candidates && self.highlight == highlight && self.chinese == chinese {
+        if self.content == candidates && self.highlight == highlight {
             return;
         }
         self.content = candidates;
         self.highlight = highlight;
-        self.chinese = chinese;
         self.present(qh);
     }
 
-    /// 强制隐藏（deactivate 用）：即便引擎在英文模式也不留提示窗。
-    /// 中文 + 空候选正是 layout() 的隐藏帧条件。
+    /// 中英切换瞬间：闪现一次只含 中/英 的小窗（工单第 1 条）。
+    fn flash_chip(&mut self, chinese: bool, qh: &QueueHandle<AppState>) {
+        self.chip = Some(chinese);
+        self.present(qh);
+    }
+
+    /// 下一次按键收掉闪现；没闪现时零成本。
+    fn clear_chip(&mut self, qh: &QueueHandle<AppState>) {
+        if self.chip.take().is_some() {
+            self.present(qh);
+        }
+    }
+
+    /// 强制隐藏（deactivate 用）：候选与未清的闪现窗一并抹掉。
     fn hide(&mut self, qh: &QueueHandle<AppState>) {
-        self.set_content(Vec::new(), 0, true, qh);
+        let visible = self.chip.is_some() || !self.content.is_empty() || self.highlight != 0;
+        self.chip = None;
+        self.content.clear();
+        self.highlight = 0;
+        if visible {
+            self.present(qh);
+        }
     }
 
     fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
@@ -265,7 +237,10 @@ impl PopupCanvas {
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
     fn present(&mut self, qh: &QueueHandle<AppState>) {
         self.dirty = false;
-        let layout = self.renderer.layout(&self.content, self.chinese);
+        let layout = match self.chip {
+            Some(chinese) => self.renderer.chip_layout(chinese),
+            None => self.renderer.layout(&self.content),
+        };
         let Some(slot) = self.pick_slot(&layout) else {
             self.dirty = true;
             return;
@@ -394,8 +369,10 @@ struct AppState {
     swallowed: HashSet<u32>,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
-    /// 候选窗：画候选词 + 中英模式提示；text_input_rectangle 只留日志
+    /// 候选窗：候选条 + 一次性模式闪现；text_input_rectangle 只留日志
     popup: Option<PopupCanvas>,
+    /// xkb 解码：keymap/modifiers 事件喂状态，Key 事件取字符（取代旧手写码表）
+    keyboard: Keyboard,
 }
 
 impl AppState {
@@ -423,6 +400,7 @@ impl AppState {
             compositor: None,
             shm: None,
             popup: None,
+            keyboard: Keyboard::new(),
         }
     }
 
@@ -533,12 +511,12 @@ impl AppState {
         log("input popup 候选窗已建（已提交 1×1 透明首帧）");
     }
 
-    /// 引擎当前页候选 + 页内高亮 + 中英模式 → 进程内渲染层。
+    /// 引擎当前页候选 + 页内高亮 → 进程内渲染层。
     /// 只画当前页：highlight() 是页首全局下标，页内 = highlight()-start；
     /// 数字键 1..=9/0 与标号天然对齐。不画 preedit（应用自己内联显示）。
-    /// 英文模式候选恒为空 → 渲染层退化为只画 `英` 的提示小窗。
+    /// 中英模式不进候选条（工单第 1 条）；切换闪现由 Key 处理里的 flash_chip 管。
     fn popup_show(&mut self, qh: &QueueHandle<AppState>) {
-        let (page, hl, chinese) = match &self.engine {
+        let (page, hl) = match &self.engine {
             Some(engine) => {
                 let (start, ps) = (engine.highlight(), engine.page().1);
                 let all = engine.candidates();
@@ -546,21 +524,17 @@ impl AppState {
                     .iter()
                     .map(|c| c.text.clone())
                     .collect();
-                (
-                    page,
-                    engine.highlight().saturating_sub(start),
-                    engine.chinese(),
-                )
+                (page, engine.highlight().saturating_sub(start))
             }
-            None => (Vec::new(), 0, true),
+            None => (Vec::new(), 0),
         };
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.set_content(page, hl, chinese, qh);
+            canvas.set_content(page, hl, qh);
         }
     }
 
     /// 隐藏 = 1×1 全透明帧，绝不 destroy surface（可见性归 IM active 状态管）。
-    /// 只在 deactivate 用；键流上的清空走 popup_show（英文模式要显示提示窗）。
+    /// 只在 deactivate 用；键流上的清空走 popup_show。
     fn popup_hide(&mut self, qh: &QueueHandle<AppState>) {
         if let Some(canvas) = self.popup.as_mut() {
             canvas.hide(qh);
@@ -595,8 +569,8 @@ impl AppState {
             im.set_preedit_string(String::new(), 0, 0);
             im.commit(self.im_serial);
         }
-        // 走 popup_show 而非 hide：Shift 上屏原串会同时切到英文模式，
-        // 此时要显示 `英` 提示窗；中文模式下候选已被引擎清空 → 自然回到隐藏帧。
+        // 走 popup_show 而非 hide：中文模式下候选已被引擎清空 → 自然回到隐藏帧；
+        // 若这次提交同时翻转了中英模式（Shift 上屏原串），翻转检测在 Key 处理里闪窗。
         self.popup_show(qh);
     }
 }
@@ -737,8 +711,6 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 state.input_method = Some(im.clone());
                 state.ensure_engine();
                 state.ensure_popup(im, qh);
-                // 英文模式下 activate 也要立刻见 `英` 提示，不等第一次按键
-                state.popup_show(qh);
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
@@ -879,12 +851,30 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
         match event {
             ZwpInputMethodKeyboardGrabEvent::Keymap { format, fd, size } => {
                 log(&format!("grab keymap size={size}"));
+                let fmt = match format {
+                    WEnum::Value(v) => v as u32,
+                    WEnum::Unknown(v) => v,
+                };
+                // 自解码：grab 建立时合成器就发一次 keymap，之后变化时再发；
+                // 这里把它编译成 xkb Keymap，失败/格式不支持则沿用上一份（比没有强，也比错表强）。
+                if fmt == KEYMAP_FORMAT_XKB_V1 {
+                    let loaded = dup_fd(&fd)
+                        .map(File::from)
+                        .and_then(|mut f| {
+                            let mut text = String::new();
+                            f.read_to_string(&mut text).ok().map(|_| text)
+                        })
+                        .is_some_and(|text| state.keyboard.set_keymap(&text));
+                    log(if loaded {
+                        "xkb keymap 已编译"
+                    } else {
+                        "xkb keymap 读取/编译失败"
+                    });
+                } else {
+                    log(&format!("不支持的 keymap format {fmt}，xkb 解码未就绪"));
+                }
                 if let Some(vk) = &state.vk {
                     if let Some(dup) = dup_fd(&fd) {
-                        let fmt = match format {
-                            WEnum::Value(v) => v as u32,
-                            WEnum::Unknown(v) => v,
-                        };
                         vk.keymap(fmt, dup.as_fd(), size);
                         state.vk_keymap_ready = true;
                         log("vk keymap set");
@@ -902,6 +892,10 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 group,
                 ..
             } => {
+                // 自己的 xkb state 必须跟着合成器走：shift 层字符全靠它
+                state
+                    .keyboard
+                    .update_mods(mods_depressed, mods_latched, mods_locked, group);
                 if let Some(vk) = &state.vk {
                     if state.vk_keymap_ready {
                         vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
@@ -934,17 +928,23 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 if !pressed {
                     return;
                 }
+
+                // 模式闪现生命周期：任何一次按下（消费或放行都算）先收掉上一次闪现。
+                // release 不收：切换发生在 Shift 按下的瞬间，抬起若也清，闪现活不过一个手势。
+                if let Some(canvas) = state.popup.as_mut() {
+                    canvas.clear_chip(qh);
+                }
+
                 let is_shift = matches!(key, 42 | 54);
                 if state.alt || state.ctrl {
                     state.forward_key(time, key, true);
                     return;
                 }
-                let ch = if matches!(key, 1 | 14 | 28 | 42 | 54 | 57) {
-                    None
-                } else {
-                    evdev_char(key)
-                };
+                // xkb 取代手写码表：功能键（含空格/Enter/Esc）utf32 为空或控制字符
+                // → None，由引擎按 code 处理。
+                let ch = state.keyboard.key_char(key);
 
+                let mode_before = state.engine.as_ref().map_or(true, |e| e.chinese());
                 let Some(engine) = state.engine.as_mut() else {
                     state.forward_key(time, key, true);
                     return;
@@ -967,6 +967,14 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     }
                     Outcome::Ignored => {
                         state.forward_key(time, key, true);
+                    }
+                }
+                // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
+                // 闪一次对应模式字，下一次按键收掉。
+                let mode_now = state.engine.as_ref().map_or(mode_before, |e| e.chinese());
+                if mode_now != mode_before {
+                    if let Some(canvas) = state.popup.as_mut() {
+                        canvas.flash_chip(mode_now, qh);
                     }
                 }
                 state.try_recv_llm(qh);
