@@ -11,6 +11,8 @@
 //!   user    INTEGER NOT NULL DEFAULT 0  -- 0=词库(导入只增) 1=用户词(学习写)
 //! );
 //! -- 索引：(pinyin)、(abbrev) —— 查询恒为 index scan + freq 排序 LIMIT n
+//! -- 英文词另立一表（`english(text PRIMARY KEY, freq)`），见 `import_english`：
+//! -- 它们不是拼音，进 `phrase` 会污染前缀查询。
 //! ```
 //!
 //! 主路延迟（P99 < 20ms）由这里的索引形状保证。
@@ -50,6 +52,14 @@ pub struct IndexEntry {
     pub user: i64,
 }
 
+/// 英文词条目。`key` = `text` 的小写形式（text 恒为纯 ASCII 字母，见 `import_english`）；
+/// 整个 Vec 按 (key ASC, freq DESC, text ASC) 排序，`lookup_english` 的前缀区间靠它二分。
+struct EnglishEntry {
+    key: String,
+    text: String,
+    freq: i64,
+}
+
 pub struct Dict {
     conn: Connection,
     /// 内存排序索引：按 (pinyin ASC, freq DESC, text ASC) 排序
@@ -69,6 +79,9 @@ pub struct Dict {
     /// 在开库时算一次：92 万行无索引全扫约 150ms，但那会儿用户还没开始打字。
     /// 首次组句时懒算试过，结果这 150ms 正好砸在第一下按键上（实测 `zuiqi` 一键 52–120ms）。
     total_freq: u64,
+    /// 英文词全量常驻内存：rime-ice 两表去重后 21,708 条、约 2 MB。开库时一次性读出来
+    /// （见 `load_english`，实测多花 28ms），之后每次按键只做二分，绝不再碰 SQLite。
+    english: Vec<EnglishEntry>,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -85,6 +98,18 @@ fn increment_prefix(prefix: &str) -> Option<String> {
         char::from_u32(c as u32 + 1).unwrap_or(c)
     };
     Some(chars.into_iter().collect())
+}
+
+/// 打开 rime `.dict.yaml`，交回 `...` 分隔线**之后**的正文行。中文/英文两条导入路径共用。
+fn dict_body_lines(path: &Path) -> Result<impl Iterator<Item = String>> {
+    let f = File::open(path).map_err(io_to_sqlite)?;
+    let mut lines = BufReader::new(f).lines().map_while(Result::ok);
+    for line in &mut lines {
+        if line.trim() == "..." {
+            break;
+        }
+    }
+    Ok(lines)
 }
 
 impl Dict {
@@ -115,7 +140,13 @@ impl Dict {
              CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);
              -- 部分索引：只收 user = 1 的行（个位到几十条）。开库时载入用户词 overlay
              -- 靠它一次 seek 拿到，否则 `WHERE user = 1` 无索引可用 → 全表扫 192 万行（实测 2.6s）。
-             CREATE INDEX IF NOT EXISTS idx_phrase_user ON phrase(pinyin) WHERE user = 1;",
+             CREATE INDEX IF NOT EXISTS idx_phrase_user ON phrase(pinyin) WHERE user = 1;
+             -- 英文词：独立表，绝不与 phrase 混用（见 `import_english` 的注释）。
+             -- text 即上屏文本，也是匹配键的来源（小写化后），故 PRIMARY KEY = text。
+             CREATE TABLE IF NOT EXISTS english (
+               text  TEXT    NOT NULL PRIMARY KEY,
+               freq  INTEGER NOT NULL DEFAULT 0
+             );",
         )?;
         // Try to load FST binary if present alongside DB
         let bin_path = Self::dict_bin_path(path);
@@ -172,6 +203,7 @@ impl Dict {
             Vec::new()
         };
         let total_freq = Self::query_total_freq(&conn);
+        let english = Self::load_english(&conn)?;
         Ok(Self {
             conn,
             index,
@@ -179,7 +211,70 @@ impl Dict {
             store,
             user_overlay,
             total_freq,
+            english,
         })
+    }
+
+    /// 英文表全量入内存。排序交给 SQL：`lower(text)` 就是匹配键（text 恒为 ASCII，
+    /// SQLite 的 `lower()` 只处理 ASCII，正好是我们要的语义），省掉 Rust 端一次重排。
+    /// 表空/不存在时返回空 Vec，开销是一次 prepare。
+    fn load_english(conn: &Connection) -> Result<Vec<EnglishEntry>> {
+        let mut stmt = conn
+            .prepare("SELECT lower(text), text, freq FROM english ORDER BY 1 ASC, 3 DESC, 2 ASC")?;
+        let rows = stmt.query_map(params![], |row| {
+            Ok(EnglishEntry {
+                key: row.get(0)?,
+                text: row.get(1)?,
+                freq: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 英文词查询：拿**原始按键串**匹配，不做拼音解码（对齐 rime 的 english translator）。
+    ///
+    /// 两层契约与中文 `lookup_prefix` 一致：层一 = key 恰等于输入的条目，层二 = 以输入为
+    /// 前缀的补全；**每层各自**按 `(freq DESC, text ASC)`，层一整体在前，绝不跨层打平——
+    /// 否则打 `help` 会被 `helper` 顶掉首候选。层二必须重排：内存 Vec 的主序是 key 升序，
+    /// 一段前缀区间里跨了多个 key，天然不是频率序（中文那条路径同理）。
+    /// 输入大小写不敏感，上屏文本保持词库原写法（`AA` 与 `aa` 是两条独立条目，都能被 `aa` 命中）。
+    pub fn lookup_english(&self, raw: &str, limit: usize) -> Vec<Candidate> {
+        if raw.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let key = raw.to_ascii_lowercase();
+        let start = self
+            .english
+            .partition_point(|e| e.key.as_str() < key.as_str());
+        let exact_len = self.english[start..]
+            .iter()
+            .take_while(|e| e.key == key)
+            .count();
+        let mut out: Vec<Candidate> = self.english[start..start + exact_len]
+            .iter()
+            .map(Self::english_to_candidate)
+            .take(limit)
+            .collect();
+        let mut comps: Vec<Candidate> = self.english[start + exact_len..]
+            .iter()
+            .take_while(|e| e.key.starts_with(&key))
+            .map(Self::english_to_candidate)
+            .collect();
+        // ponytail: 整段重排（最坏 `a` 命中 ~4k 条，release 下几 µs）；哪天真嫌慢再换 top-k 堆。
+        comps.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+        comps.truncate(limit - out.len());
+        out.extend(comps);
+        out
+    }
+
+    fn english_to_candidate(e: &EnglishEntry) -> Candidate {
+        Candidate {
+            text: e.text.clone(),
+            // pinyin 填词本身：主控的分层判断靠它区分「消耗完输入」与「补全」
+            pinyin: e.text.clone(),
+            freq: e.freq.max(0) as u64,
+            ai: false,
+        }
     }
 
     /// 读出全部 `user = 1` 行，按 pinyin ASC 排序（前缀二分要求）。
@@ -230,15 +325,7 @@ impl Dict {
     /// 返回值 = 实际写入的行数（新插入 + 频率被抬高的）。冲突但频率没涨的行不计入，
     /// 因此重复导入同一文件返回 0，幂等语义与旧实现一致。
     pub fn import(&mut self, dict_yaml: impl AsRef<Path>) -> Result<usize> {
-        let f = File::open(dict_yaml).map_err(io_to_sqlite)?;
-        let reader = BufReader::new(f);
-        // Skip YAML front-matter
-        let mut lines = reader.lines().map_while(Result::ok);
-        for line in &mut lines {
-            if line.trim() == "..." {
-                break;
-            }
-        }
+        let lines = dict_body_lines(dict_yaml.as_ref())?;
         let tx = self.conn.transaction()?;
         let mut count = 0usize;
         for line in lines {
@@ -311,6 +398,54 @@ impl Dict {
         self.abbrev_index = abbrev_index;
         // 批量灌词后总量变了，缓存必须跟着刷新（否则刚导入的库整句代价用旧概率）
         self.total_freq = Self::query_total_freq(&self.conn);
+        Ok(count)
+    }
+
+    /// 导入 rime-ice 英文表（`en_dicts/en.dict.yaml`、`en_ext.dict.yaml`；格式同样是
+    /// `文字\t拼音\t权重`，但英文表基本没有第三列，freq 落 0 是正常状态）。
+    ///
+    /// **英文绝不进 `phrase`**：那张表的 `UNIQUE(pinyin, text)` 与 `idx_phrase_pinyin`
+    /// 服务的是拼音前缀查询，混进 `hello`/`help` 这类纯字母 key 之后，打 `he` 就会在
+    /// 中文候选里捞出英文词（`help` 频次高于「何」）—— 正是本设计最容易坏的地方。
+    /// 所以走独立表 + 独立内存索引，匹配规则也不同（原始按键串直查，不做音节切分）。
+    ///
+    /// 清洗规则（实测两表 24,999 行正文 → 21,967 行通过 → 去重后 **21,708 条**入库）：
+    /// - 只收 `text` 为**纯 ASCII 字母**的条目，一条谓词同时挡掉两类垃圾：
+    ///   `# ab\tab` 形式的注释行（rime-ice 用它注释掉不想要的词，1,877 条）和带
+    ///   `'` `-` `.` 空格 数字 非 ASCII 的条目（`he'll`、`e-mail`、`.NET`、`iPhone 17`、
+    ///   `café`，1,155 条）。后者本来就打不出来——引擎的组合缓冲只收 a-z——收了只会给
+    ///   二分的排序键添符号分支。`en_ext` 里那几十条靠 `拼音` 列做同形别名的行
+    ///   （`he'll`→`hell`、`.NET`→`net`）连带失效；要支持得改成按拼音列匹配，是另一件事。
+    /// - 空 `text` 必须单独挡：`starts_with("")` 会把全表变成前缀命中。
+    /// - 大小写：`text` 原样入库用于上屏，匹配键在读取时小写化。主键是 `text`，所以
+    ///   `AA` 与 `aa` 是两行，互不覆盖。
+    ///
+    /// 同 `text` 重复时频率取大（与 `import` 同策略），因此重复导入返回 0，幂等。
+    /// 返回实际写入行数，并刷新内存索引（同进程导入后立刻可查）。
+    pub fn import_english(&mut self, dict_yaml: impl AsRef<Path>) -> Result<usize> {
+        let lines = dict_body_lines(dict_yaml.as_ref())?;
+        let tx = self.conn.transaction()?;
+        let mut count = 0usize;
+        for line in lines {
+            let mut cols = line.split('\t');
+            let text = match cols.next() {
+                Some(t) => t,
+                None => continue,
+            };
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_alphabetic()) {
+                continue;
+            }
+            cols.next(); // 第二列是 rime 的 `拼音`（英文表里它就是词本身，偶尔是 `hell` 这种
+                         // 同形别名）—— 我们按 text 匹配，不参与，直接跳过；第三列才是权重。
+            let freq: i64 = cols.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            count += tx.execute(
+                "INSERT INTO english(text, freq) VALUES (?1, ?2)
+                 ON CONFLICT(text) DO UPDATE SET freq = excluded.freq WHERE english.freq < excluded.freq",
+                params![text, freq],
+            )?;
+        }
+        tx.commit()?;
+        self.english = Self::load_english(&self.conn)?;
         Ok(count)
     }
 

@@ -14,6 +14,9 @@
 //! [topk_fst: fst::Map<前缀, 桶偏移>] [topk_blob]  // 首段前缀全局 top-64，桶=[count u16]{key_idx,freq,tlen,text}
 //! [abbrev_offsets: (n_keys+1) × u32] [abbrev_records] // [name u8][abbrev][key_idx u32]，全局排序
 //! ```
+//!
+//! 只打包 `phrase`。`english` 表（2.2 万条英文词）**不进 dict.bin**：它由 `Dict::open`
+//! 直接从 SQLite 读成常驻内存的排序 Vec，`Dict::lookup_english` 二分直查，两条路径互不相干。
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};

@@ -3,7 +3,8 @@
 //! 用法（M9 起）：
 //!   kime build-dict --in <sqlite> --out <bin>
 //!   kime config <list|get KEY|set KEY VALUE>
-//!   kime --dict <path> [--import <yaml>]... [--shuangpin <scheme>]
+//!   kime english [--dict <path>] <字母串>...
+//!   kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
 //!
 //! 配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit
@@ -20,6 +21,45 @@ use kime_shuangpin::Scheme;
 
 // evdev keycodes — 与 platform-wayland 壳同值
 const KEY_ESC: u32 = 1;
+
+/// 默认词库路径。
+fn default_dict_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".local/share/kime/dict.sqlite3")
+}
+
+/// `kime english hello` → 直查英文表，一行一个输入串。
+///
+/// 引擎还没接线英文路径（等编辑光标轨合并后由主控接），这条子命令是词库/查询本身的出口。
+fn handle_english_cmd(args: &[String]) -> ExitCode {
+    let mut dict_path: Option<PathBuf> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dict" => dict_path = it.next().map(PathBuf::from),
+            other => words.push(other.to_string()),
+        }
+    }
+    let path = dict_path.unwrap_or_else(default_dict_path);
+    let dict = match Dict::open(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("failed to open dict {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    for w in &words {
+        let line = dict
+            .lookup_english(w, 10)
+            .iter()
+            .map(|c| format!("{}({})", c.text, c.freq))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{w}: {line}");
+    }
+    ExitCode::SUCCESS
+}
 
 fn handle_config_cmd(args: &[String]) -> Result<String, String> {
     let config_path = if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
@@ -133,6 +173,10 @@ fn main() -> ExitCode {
             println!("mode: {}, scheme: {}", mode, scheme);
             return ExitCode::SUCCESS;
         }
+        Some("english") => {
+            let sub_args: Vec<String> = args_iter.collect();
+            return handle_english_cmd(&sub_args);
+        }
         _ => {}
     }
 
@@ -140,6 +184,9 @@ fn main() -> ExitCode {
     // `--import` 可重复：rime-ice 是 5~6 张分表，一次调用要全部喂进去。
     // 旧实现用单个 Option 存路径，第二个 `--import` 会静默覆盖第一个 → 只导了一张表。
     let mut import_paths: Vec<PathBuf> = Vec::new();
+    // rime-ice 的英文表走单独入口：`Dict::import` 灌 `phrase`（拼音索引），
+    // `Dict::import_english` 灌 `english`（原始按键串索引）。喂错表会污染中文候选。
+    let mut import_english_paths: Vec<PathBuf> = Vec::new();
     let mut shuangpin: Option<Option<Scheme>> = None;
     let mut args_iter = std::env::args().skip(1).peekable();
 
@@ -151,6 +198,11 @@ fn main() -> ExitCode {
             "--import" => {
                 if let Some(p) = args_iter.next().map(PathBuf::from) {
                     import_paths.push(p);
+                }
+            }
+            "--import-english" => {
+                if let Some(p) = args_iter.next().map(PathBuf::from) {
+                    import_english_paths.push(p);
                 }
             }
             "--shuangpin" => {
@@ -203,7 +255,7 @@ fn main() -> ExitCode {
             }
             "--help" => {
                 println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime --dict <path> [--import <yaml>]... [--shuangpin <scheme>]（--import 可重复，逐个词库表导入）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
+                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -215,26 +267,17 @@ fn main() -> ExitCode {
     }
 
     // REPL
-    let dict = match dict_path {
-        Some(p) => match Dict::open(&p) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("failed to open dict {}: {e}", p.display());
-                return ExitCode::from(1);
-            }
-        },
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            match Dict::open(PathBuf::from(home).join(".local/share/kime/dict.sqlite3")) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("failed to open default dict: {e}\ntry: kime build-dict --in ... --out ~/.local/share/kime/dict.bin");
-                    return ExitCode::from(1);
-                }
-            }
+    let path = dict_path.unwrap_or_else(default_dict_path);
+    let mut dict = match Dict::open(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "failed to open dict {}: {e}\ntry: kime build-dict --in ... --out ~/.local/share/kime/dict.bin",
+                path.display()
+            );
+            return ExitCode::from(1);
         }
     };
-    let mut dict = dict;
     // 逐表导入，顺序随便：`Dict::import` 冲突时取频率较大者。
     // 旧实现是 `INSERT OR IGNORE` + 按文件名 glob，无频率列的 `cn_dicts/41448`（46,031 条，
     // 频率全空）字典序排在带真实频率的 `cn_dicts/8105`（8,783 条）之前，先落库的空 0 值
@@ -246,6 +289,16 @@ fn main() -> ExitCode {
             Ok(n) => eprintln!("imported {}: {n} rows", yaml.display()),
             Err(e) => {
                 eprintln!("import failed for {}: {e}", yaml.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
+    // 英文表同理：顺序随便，同 `text` 重复时频率取大，幂等。
+    for yaml in &import_english_paths {
+        match dict.import_english(yaml) {
+            Ok(n) => eprintln!("imported english {}: {n} rows", yaml.display()),
+            Err(e) => {
+                eprintln!("english import failed for {}: {e}", yaml.display());
                 return ExitCode::from(1);
             }
         }

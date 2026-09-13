@@ -525,10 +525,27 @@ impl Engine {
                     self.refresh_full_pinyin();
                 }
             }
+            self.merge_english();
             return;
         }
 
         self.refresh_full_pinyin();
+        self.merge_english();
+    }
+
+    /// 英文词候选：rime 的英文走独立 translator，匹配**原始按键串**、不做拼音解码，
+    /// 所以双拼/全拼下行为一致。落位：追加在全部中文候选之后（打 `day` 时先看到
+    /// 中文，翻页才有 day）；中文为空时英文独占列表，与输入完全相等的词排第一
+    /// （打 `hello` 不该被中文补全挡住）。两个字母起才查，免得单字母把
+    /// `a/AA/an` 之类的英文噪声灌进每一次按键。
+    fn merge_english(&mut self) {
+        if self.letters.len() < 2 {
+            return;
+        }
+        let en = self
+            .dict
+            .lookup_english(&self.letters, self.config.candidate_limit);
+        self.candidates.extend(en);
     }
 
     /// 全拼路径：segment 切分 + 前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
