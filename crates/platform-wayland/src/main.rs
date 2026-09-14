@@ -2,17 +2,18 @@
 //! 未消费的键经 zwp_virtual_keyboard_v1 原样送回，避免 grab 吞掉回车/快捷键。
 
 use std::env;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
-use kime_core::{Engine, Key, Outcome};
+use kime_core::{Engine, Outcome};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
-use platform_wayland::repeat::{is_repeatable_edit, KeyRepeat, ShiftComposer, ShiftRelease};
+use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
+use platform_wayland::route::{key_log_line, route_press, route_release, shell_key, PressAction};
 use platform_wayland::tray::TrayIconManager;
 use platform_wayland::SwallowTracker;
 use platform_wayland::{Layout, Renderer};
@@ -45,7 +46,23 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {}", msg);
+    eprintln!("[kime-ime] {msg}");
+}
+
+/// 逐键路由日志（第五轮「真机不生效、单测全绿」的定罪材料）：每次进
+/// engine_press 的 press 一行，固定格式
+/// `key code=<u32> ch=<char|-> mods=<c?><s?><a?> -> <Outcome>`，追加写
+/// /tmp/kime-ime.log。人打字 ≤10 键/s、长按满速重复 ~30 行/s，不引日志
+/// 框架；release 构建直接可见。写失败（只读/满盘）静默——日志不许卡键流。
+fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+    let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/kime-ime.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
@@ -373,9 +390,10 @@ struct AppState {
     tray: TrayIconManager,
     llm_worker: Option<LlmWorker>,
     llm_receiver: Option<Receiver<Vec<kime_core::dict::Candidate>>>,
+    /// Ctrl/Alt 按下旗标（键码 29/97、56/100 记账）：engine_press 构造 Key 时
+    /// 直接带进引擎。Shift 不存旗标——引擎的 shift 位看键码本身（shell_key）。
     ctrl: bool,
     alt: bool,
-    shift: bool,
     /// press/release 配对记账（见 SwallowTracker）：press 被引擎吃掉的键，release 也不转发，
     /// 避免半截按键；press 一旦转发给应用，记账必须销掉，release 同样转发。
     swallowed: SwallowTracker,
@@ -412,7 +430,6 @@ impl AppState {
             llm_receiver: None,
             ctrl: false,
             alt: false,
-            shift: false,
             swallowed: SwallowTracker::default(),
             compositor: None,
             shm: None,
@@ -599,50 +616,45 @@ impl AppState {
         let ch = self.keyboard.key_char(code);
         let (ctrl, alt) = (self.ctrl, self.alt);
         let mode_before = self.engine.as_ref().map_or(true, |e| e.chinese());
-        let Some(engine) = self.engine.as_mut() else {
-            self.repeat.clear();
-            if synthetic {
-                self.tap_pair(code);
-            } else {
+        let outcome = match self.engine.as_mut() {
+            Some(engine) => engine.key(shell_key(code, ch, ctrl, alt)),
+            None => {
+                // 词库没开成：一切键放行，重复表整体作废，永不重新起表。
+                self.repeat.clear();
+                Outcome::Ignored
+            }
+        };
+        key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
+        // 消费之后组合是否还在：重复只在「组合内编辑键」起表（契约）。
+        let composing = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| !e.preedit().is_empty());
+        let route = route_press(code, synthetic, composing, &outcome);
+        if route.disarm {
+            self.repeat.release(code);
+        }
+        if route.arm {
+            self.repeat.arm(code, now_ms());
+        }
+        match route.action {
+            PressAction::Consume => {
+                self.swallowed.consume(code);
+                match outcome {
+                    Outcome::Commit(text) => self.apply_commit(text, qh),
+                    _ => self.apply_consumed(qh),
+                }
+            }
+            PressAction::Forward => {
+                // 同一个键可能从「被消费」中途变成「放行」。转发 press 前必须销掉
+                // 旧记账：否则 release 被残留标记吃掉 → 幽灵连发（947a3a3 的根因）。
                 self.swallowed.forward(code);
                 self.forward_key(time, code, true);
             }
-            return;
-        };
-        let outcome = engine.key(Key {
-            ch,
-            code,
-            shift: matches!(code, 42 | 54),
-            ctrl,
-            alt,
-        });
-        // 消费之后组合是否还在：重复只在「组合内编辑键」起表（契约）。
-        let composing = !engine.preedit().is_empty();
-        match outcome {
-            Outcome::Consumed => {
-                self.swallowed.consume(code);
-                if !synthetic && is_repeatable_edit(code) && composing {
-                    self.repeat.arm(code, now_ms());
-                }
-                self.apply_consumed(qh);
-            }
-            Outcome::Commit(text) => {
-                self.swallowed.consume(code);
-                self.repeat.release(code);
-                self.apply_commit(text, qh);
-            }
-            Outcome::Ignored => {
-                if synthetic {
-                    // 组合恰在中途被删空：给应用一对完整 press+release（等效一次
-                    // 点击，继续删应用字符），表不撤；物理 release 到达才停。
-                    self.tap_pair(code);
-                } else {
-                    // 同一个键可能从「被消费」中途变成「放行」。转发 press 前必须销掉
-                    // 旧记账：否则 release 被残留标记吃掉 → 幽灵连发（947a3a3 的根因）。
-                    self.repeat.release(code);
-                    self.swallowed.forward(code);
-                    self.forward_key(time, code, true);
-                }
+            PressAction::Tap => {
+                // 组合恰在中途被删空：给应用一对完整 press+release（等效一次
+                // 点击，继续删应用字符），表不撤；物理 release 到达才停。
+                self.tap_pair(code);
             }
         }
         // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
@@ -1018,25 +1030,21 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 match key {
                     29 | 97 => state.ctrl = pressed,
                     56 | 100 => state.alt = pressed,
-                    42 | 54 => state.shift = pressed,
                     _ => {}
                 }
                 let is_shift = matches!(key, 42 | 54);
 
                 if released {
-                    if is_shift {
+                    if is_shift && state.shift_gesture.on_shift_release() == ShiftRelease::Toggle {
                         // 手势裁决：只有点击（其间没打过别的键）才把这一次 Shift 补交
                         // 给引擎切中英；按住打过键 → 模式不动（rime ascii_composer）。
-                        if state.shift_gesture.on_shift_release() == ShiftRelease::Toggle {
-                            state.engine_press(key, time, false, qh);
-                        }
-                    } else {
-                        state.repeat.release(key);
+                        state.engine_press(key, time, false, qh);
                     }
-                    if state.swallowed.release(key) {
-                        return;
+                    // 撤表只认自己（Shift/Ctrl 的 release 停不了 F 的重复），随后按
+                    // press 记账决定 release 吞放。route_release 见 route.rs。
+                    if route_release(key, &mut state.swallowed, &mut state.repeat) {
+                        state.forward_key(time, key, false);
                     }
-                    state.forward_key(time, key, false);
                     return;
                 }
                 if !pressed {
