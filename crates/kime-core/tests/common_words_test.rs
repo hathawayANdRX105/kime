@@ -141,14 +141,6 @@ fn first_page(word: &str, keys: &str, e: &mut Engine) -> Option<String> {
     }
 }
 
-/// 已确认的双拼缺陷（第五轮报告，修复在 kime-shuangpin 轨道）：主路径对该词跳过断言，
-/// 由 `known_bugs_are_still_locked` 锁住缺陷仍然存在。SpRare 支合入后本锁变红 →
-/// 删掉这里的跳过、恢复逐词断言（合并顺序：两支都合入后由主控跑最终全量）。
-/// 第五轮的「蛋糕」全拼缺陷（引擎只查首切分）已修：refresh_full_pinyin 现在遍历
-/// segment() 全部切分逐条查询，该词回归主路径逐词断言。
-/// - 澳大利亚：ziranma 表 y 系韵母缺 "ya"（也缺 "yo"），音节无法编成两键 → 双拼不可达。
-const KNOWN_SP_BUG: &str = "澳大利亚";
-
 /// 全拼 + 双拼两条主路径：252 词逐词断言，收集全部失败一次报完
 /// （词失败就是要暴露的 bug，别在第一条 assert 就熄火），末尾带性能护栏。
 #[test]
@@ -159,18 +151,13 @@ fn full_and_shuangpin_hit_first_page() {
     let mut full = engine("full", None);
     let mut sp = engine("sp", Some(Scheme::Ziranma));
     let mut fails = Vec::new();
-    let mut skip_sp = 0;
     for (w, syls) in &ws {
         if let Some(m) = first_page(w, &syls.concat(), &mut full) {
             fails.push(format!("全拼: {m}"));
         }
         let unenc: Vec<&String> = syls.iter().filter(|s| !enc.contains_key(*s)).collect();
         if !unenc.is_empty() {
-            if w == KNOWN_SP_BUG && unenc.iter().all(|s| s.as_str() == "ya") {
-                skip_sp += 1;
-            } else {
-                fails.push(format!("双拼: 词 {w} 的音节 {unenc:?} 在 ziranma 表无编码"));
-            }
+            fails.push(format!("双拼: 词 {w} 的音节 {unenc:?} 在 ziranma 表无编码"));
             continue;
         }
         let keys: String = syls.iter().map(|s| enc[s].clone()).collect();
@@ -183,7 +170,7 @@ fn full_and_shuangpin_hit_first_page() {
         fails.is_empty(),
         "{}/{} 路失败清单：\n{}",
         fails.len(),
-        ws.len() * 2 - skip_sp,
+        ws.len() * 2,
         fails.join("\n")
     );
     assert!(
@@ -192,23 +179,11 @@ fn full_and_shuangpin_hit_first_page() {
         ws.len()
     );
     eprintln!(
-        "常用词覆盖：全拼 {}/{}、双拼 {}/{}（缺陷跳过 {skip_sp}），总耗时 {dt:?}",
+        "常用词覆盖：全拼 {}/{}、双拼 {}/{}，总耗时 {dt:?}",
         ws.len(),
         ws.len(),
-        ws.len() - skip_sp,
+        ws.len(),
         ws.len()
-    );
-}
-
-/// 缺陷锁：确认双拼 ziranma 缺 "ya" 还在。**此测试变红 = SpRare 支已修复**，
-/// 届时删除 KNOWN_SP_BUG 跳过、恢复 澳大利亚 双拼断言。
-/// （蛋糕的全拼缺陷已由引擎多切分查询修复，回归主路径断言。）
-#[test]
-fn known_bugs_are_still_locked() {
-    let enc = ziranma_map();
-    assert!(
-        !enc.contains_key("ya"),
-        "ziranma 补上 ya 码了！→ 删除 KNOWN_SP_BUG 跳过，恢复 澳大利亚 双拼断言"
     );
 }
 
