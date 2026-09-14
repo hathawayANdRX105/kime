@@ -2,6 +2,7 @@
 
 pub mod keyboard;
 pub mod render;
+pub mod repeat;
 pub mod tray;
 
 pub use render::{Layout, PlacedItem, Renderer};
