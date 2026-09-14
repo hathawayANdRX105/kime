@@ -41,9 +41,12 @@ struct Path {
     words: usize,
 }
 
-/// 每个音节节点保留的最优路径数。2 足以给「词库里没有整串词条」的输入
-/// 多一条备选切分（`bucuobao` → 不错报 / 不错保），再多就是垃圾路了。
-const PATHS_PER_NODE: usize = 2;
+/// 每个音节节点保留的最优路径数。3 = 「节点最优 + 一条备选切分 + 一条高频
+/// 2 词组合」：2 曾把 `womenzai` 的「我们+再」整条剪掉（词库里存在整句词条时
+/// 其路径代价恒排第三），4 音节场景下 2+2 组合根本进不了候选列。
+/// 垃圾路径不会跟着变多：k≥3 的分数被 `sentence_score` 的 ÷100/词 压死，
+/// 且 place_sentences 按分数在补全区落位。
+const PATHS_PER_NODE: usize = 3;
 
 /// Viterbi 最短路径求解，返回最多 [`PATHS_PER_NODE`] 条文本互异的整句候选（代价升序）。
 ///
@@ -97,11 +100,14 @@ pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
             // `Dict::lookup` 保证按 freq 降序返回，故 cands[0] 即该跨度最佳词。
             // 每个跨度只放一条最优边：备选路径的多样性由「节点保留 K 条前缀」提供。
             let Some(best) = cands.first() else { continue };
-            // p = freq / 语料总词频。多词路径的概率是相乘的，所以「一个真词」
+            // p = 有效频率 / 语料总词频。多词路径的概率是相乘的，所以「一个真词」
             // 与「两个高频单字」现在是同量纲比较，而不是计数比大小。
-            let p = best.freq.max(1) as f64 / total;
+            // 取 dict 的排序用有效频率（用户提频参与组句：刚用过的词把整句抬上去，
+            // 停用 2 个半衰期后自动落回），与 lookup 的候选序同一量。
+            let eff = dict.effective_freq(best).max(1);
+            let p = eff as f64 / total;
             let edge_cost = BASE_COST - p.ln() * FREQ_WEIGHT + WORD_PENALTY;
-            let best_ln = (best.freq.max(1) as f64).ln();
+            let best_ln = (eff as f64).ln();
             for prev in prevs.iter() {
                 let path = Path {
                     cost: prev.cost + edge_cost,
