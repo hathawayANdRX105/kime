@@ -95,9 +95,9 @@ fn check(fixture: &str, scheme: Scheme, label: &str) -> usize {
 #[test]
 fn ziranma_table_matches_rime_algebra() {
     // fixture 被清空/截断时 helper 里的双向断言会假过，规模在这里钉住：
-    // 401 音节 × 各 ≥1 码 = 411 合法键（10 个音节带 rime derive 别名双码）
+    // 415 音节 × 各 ≥1 码 = 425 合法键（10 个音节带 rime derive 别名双码；lo 与 luo 撞键未收录）
     assert!(
-        check("rime_ziranma.tsv", Scheme::Ziranma, "自然码") >= 411,
+        check("rime_ziranma.tsv", Scheme::Ziranma, "自然码") >= 425,
         "自然码 fixture 规模异常"
     );
 }
@@ -105,7 +105,7 @@ fn ziranma_table_matches_rime_algebra() {
 #[test]
 fn xiaohe_table_matches_rime_algebra() {
     assert!(
-        check("rime_xiaohe.tsv", Scheme::Xiaohe, "小鹤") >= 411,
+        check("rime_xiaohe.tsv", Scheme::Xiaohe, "小鹤") >= 425,
         "小鹤 fixture 规模异常"
     );
 }

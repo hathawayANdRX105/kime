@@ -1,6 +1,8 @@
 # rime `double_pinyin.schema.yaml` speller/algebra 机械推导出的合法双拼码
 # 行格式：音节<TAB>合法码（多个用逗号分隔；零声母音节 rime 会同时接受原始拼写）
 # 用法见 tests/rime_algebra_test.rs —— 码表改动必须与本文件一致
+# 排除 lo：rime 对「lo」派生出键 lo，与「luo→lo」撞键。本表一键一音节（二分查找 + decode_unique），
+# 故不收录 lo；啰/罗 等 lo 音节在双拼下退全拼兜底（两方案同此，码表头注释有记录）。
 a	aa
 ai	ai,al
 an	aj,an
@@ -16,6 +18,7 @@ ben	bf
 beng	bg
 bi	bi
 bian	bm
+biang	bd
 biao	bc
 bie	bx
 bin	bn
@@ -28,6 +31,7 @@ can	cj
 cang	ch
 cao	ck
 ce	ce
+cei	cz
 cen	cf
 ceng	cg
 cha	ia
@@ -64,8 +68,10 @@ dang	dh
 dao	dk
 de	de
 dei	dz
+den	df
 deng	dg
 di	di
+dia	dw
 dian	dm
 diao	dc
 die	dx
@@ -89,6 +95,7 @@ fang	fh
 fei	fz
 fen	ff
 feng	fg
+fiao	fc
 fo	fo
 fou	fb
 fu	fu
@@ -150,6 +157,7 @@ kan	kj
 kang	kh
 kao	kk
 ke	ke
+kei	kz
 ken	kf
 keng	kg
 kong	ks
@@ -216,6 +224,7 @@ nei	nz
 nen	nf
 neng	ng
 ni	ni
+nia	nw
 nian	nm
 niang	nd
 niao	nc
@@ -224,8 +233,10 @@ nin	nn
 ning	ny
 niu	nq
 nong	ns
+nou	nb
 nu	nu
 nuan	nr
+nun	np
 nuo	no
 nv	nv
 nve	nt
@@ -272,6 +283,7 @@ ri	ri
 rong	rs
 rou	rb
 ru	ru
+rua	rw
 ruan	rr
 rui	rv
 run	rp
@@ -317,6 +329,7 @@ tan	tj
 tang	th
 tao	tk
 te	te
+tei	tz
 teng	tg
 ti	ti
 tian	tm
@@ -353,6 +366,7 @@ xu	xu,xv
 xuan	xr
 xue	xt
 xun	xp
+ya	ya
 yan	yj
 yang	yh
 yao	yk
@@ -360,6 +374,7 @@ ye	ye
 yi	yi
 yin	yn
 ying	yy
+yo	yo
 yong	ys
 you	yb
 yu	yu,yv
@@ -399,6 +414,7 @@ zi	zi
 zong	zs
 zou	zb
 zu	zu
+zuan	zr
 zui	zv
 zun	zp
 zuo	zo
