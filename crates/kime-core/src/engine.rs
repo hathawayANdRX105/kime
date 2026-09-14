@@ -344,11 +344,11 @@ impl Engine {
             };
             return Outcome::Consumed;
         }
-        // 标点处理（中文模式）：映射键走全角表；未映射可打印符号（rime half_shape 映射为
-        // 自身，如 @ # % & * / = |）在组合态也顶字上屏；数字紧跟 ` , . : ` 半角直通。
+        // 标点处理（中文模式）：全表对齐 rime half_shape（32 条，parity 测试钉死）；
+        // digit_sep/ctrl/alt 组合不入映射，落到底部 Ignored 直通。
         if let Some(c) = k.ch {
             let digit_sep = after_digit && matches!(c, ',' | '.' | ':');
-            if let Some(mapped) = punct::map_punct(c).filter(|_| !digit_sep) {
+            if let Some(mapped) = punct::map_punct(c).filter(|_| !digit_sep && !k.ctrl && !k.alt) {
                 // 英文标点模式：不转换，原样输出（也不维护引号状态）
                 if self.punct_mode == crate::config::PunctMode::English {
                     self.quote_open = None;
@@ -383,25 +383,6 @@ impl Engine {
                         return Outcome::Commit(commit_text);
                     }
                 }
-            } else if !digit_sep
-                && !self.letters.is_empty()
-                && !k.ctrl
-                && !k.alt
-                && c.is_ascii_graphic()
-                && !c.is_ascii_alphanumeric()
-            {
-                // 未映射可打印标点 + 组合非空：rime 同款顶字上屏（情况 B/C），符号原样续后。
-                // 组合为空不拦（Ctrl+C / 独立符号照旧直达应用）。走到这里且 !digit_sep
-                // 意味着 map_punct 未命中：映射键非 digit_sep 时必进上面的分支。
-                if let Some(top) = self.candidates.first().cloned() {
-                    let text = top.text.clone();
-                    self.learn_or_warn(&text);
-                    self.clear_composition();
-                    return Outcome::Commit(format!("{text}{c}"));
-                }
-                let commit_text = format!("{}{c}", self.letters);
-                self.clear_composition();
-                return Outcome::Commit(commit_text);
             }
         }
         if let Some(c) = k.ch {

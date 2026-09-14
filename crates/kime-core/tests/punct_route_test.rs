@@ -1,11 +1,11 @@
-//! 标点路由两条新契约（第四轮反馈第 2/6 条，rime 对齐）：
+//! 标点路由契约（rime-ice half_shape 已全量 32 条目入表，见 punct_rime_parity_test.rs）：
 //!
-//! 1. **未映射可打印标点**（rime half_shape 映射为自身：@ # % & * / = | …）在组合态
-//!    顶字上屏（Commit 首选/字母串 + 原字符），组合为空时保持 Ignored 直通
-//!    （Ctrl+C、独立符号照旧直达应用）。旧的「一律放行」实现会让组合吊在屏幕上。
-//! 2. **digit_separators**（rime `,:.` 同款）：上一个键是数字（无论 outcome 是选词
-//!    还是放行），紧跟的 ` , . : ` 跳过半角→全角映射直通宿主 —— 打 `23.8` 得 `23.8`
-//!    而不是 `23。8`。
+//! 1. **恒等映射条目**（rime 里 `/ | @ # % & * - + =` 映射为自身）走 map_punct 映射分支：
+//!    组合态顶字上屏、原字符续后（与全角标点情况 B/C 同构）；无组合时 Commit 该半角字符。
+//!    屏面结果与宿主透传一致，只是上屏路径归引擎。
+//! 2. **Ctrl/Alt 组合键放行**：rime punctuator 不做带修饰键的标点映射，
+//!    Ctrl+- / Ctrl+= / Ctrl+/ 等组合直达宿主。
+//! 3. **digit_separators**（rime `,:.` 同款）：数字后紧跟的 ` , . : ` 跳过映射直通。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,9 +60,9 @@ fn type_letters(e: &mut Engine, s: &str) {
     }
 }
 
-/// 组合态 + 有候选：`@` 顶字上屏，符号原样续后。
+/// 组合态 + 有候选：恒等映射的 `@` 顶字上屏，符号原样续后。
 #[test]
-fn unmapped_punct_commits_top_candidate() {
+fn identity_punct_commits_top_candidate() {
     let (mut e, dir) = engine();
     type_letters(&mut e, "ni");
     assert_eq!(press(&mut e, '@'), Outcome::Commit("你@".into()));
@@ -72,7 +72,7 @@ fn unmapped_punct_commits_top_candidate() {
 
 /// 组合态 + 无候选（解不出的键串）：原样字母 + 符号上屏，与映射标点情况 C 同构。
 #[test]
-fn unmapped_punct_commits_raw_letters_without_candidates() {
+fn identity_punct_commits_raw_letters_without_candidates() {
     let (mut e, dir) = engine();
     type_letters(&mut e, "xq");
     assert!(e.candidates().is_empty(), "种子词库下 xq 应无候选");
@@ -80,11 +80,21 @@ fn unmapped_punct_commits_raw_letters_without_candidates() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 无组合：未映射符号保持 Ignored，宿主原样收到（Ctrl/Alt+符号组合同样不被顶字路径吞掉）。
+/// 无组合：恒等符号 Commit 自身（rime half_shape 直接上屏，屏面等价于透传）。
 #[test]
-fn unmapped_punct_without_composition_is_ignored() {
+fn identity_punct_without_composition_commits_self() {
     let (mut e, dir) = engine();
-    assert_eq!(press(&mut e, '@'), Outcome::Ignored);
+    assert_eq!(press(&mut e, '@'), Outcome::Commit("@".into()));
+    assert_eq!(press(&mut e, '/'), Outcome::Commit("/".into()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Ctrl/Alt + 符号：punctuator 不映射带修饰键的组合，一律放行宿主
+/// （Ctrl+- / Ctrl+= 是浏览器缩放、Ctrl+/ 是应用搜索，绝不能被吞）。
+#[test]
+fn ctrl_alt_symbol_chords_pass_through() {
+    let (mut e, dir) = engine();
+    type_letters(&mut e, "ni");
     let mut chord = Key {
         ch: Some('#'),
         code: 0,
@@ -92,16 +102,20 @@ fn unmapped_punct_without_composition_is_ignored() {
         ctrl: false,
         alt: false,
     };
-    type_letters(&mut e, "ni");
     chord.ctrl = true;
     assert_eq!(
         e.key(chord),
         Outcome::Ignored,
-        "Ctrl+符号在组合态也放行给宿主，顶字路径不拦"
+        "Ctrl+符号放行宿主，组合不被顶字路径吞掉"
     );
     chord.ctrl = false;
     chord.alt = true;
     assert_eq!(e.key(chord), Outcome::Ignored, "Alt 同理");
+    // Ctrl+`,`（映射键同样受守卫保护，此前是吞键的既有 bug）
+    chord.alt = false;
+    chord.ctrl = true;
+    chord.ch = Some(',');
+    assert_eq!(e.key(chord), Outcome::Ignored, "Ctrl+, 不再被吞为 ，");
     fs::remove_dir_all(dir).unwrap();
 }
 
