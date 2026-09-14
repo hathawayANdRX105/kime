@@ -19,8 +19,8 @@ pub const REPEAT_DELAY_MS: u64 = 500;
 pub const REPEAT_INTERVAL_MS: u64 = 33;
 
 const KEY_BACKSPACE: u32 = 14;
-const KEY_F: u32 = 41;
-const KEY_H: u32 = 43;
+const KEY_F: u32 = 33;
+const KEY_H: u32 = 35;
 const KEY_B: u32 = 48;
 
 /// 组合内可自动重复的编辑键：Backspace、C-f、C-h、C-b（evdev 码）。
