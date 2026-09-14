@@ -141,13 +141,12 @@ fn first_page(word: &str, keys: &str, e: &mut Engine) -> Option<String> {
     }
 }
 
-/// 已确认的引擎缺陷（第五轮报告，src/ 不在本工单范围）：主路径对这两个词跳过断言，
-/// 由 `known_bugs_are_still_locked` 锁住缺陷仍然存在。修复后锁测试变红 → 删掉这里的
-/// 跳过、恢复逐词断言。
-/// - 蛋糕：segment("dangao") 首选 ["dang","ao"]，而 refresh_full_pinyin 只查
-///   `segs.first()`（engine.rs:604），正确切分 ["dan","gao"] 永远轮不到 → 全拼 0 候选；
+/// 已确认的双拼缺陷（第五轮报告，修复在 kime-shuangpin 轨道）：主路径对该词跳过断言，
+/// 由 `known_bugs_are_still_locked` 锁住缺陷仍然存在。SpRare 支合入后本锁变红 →
+/// 删掉这里的跳过、恢复逐词断言（合并顺序：两支都合入后由主控跑最终全量）。
+/// 第五轮的「蛋糕」全拼缺陷（引擎只查首切分）已修：refresh_full_pinyin 现在遍历
+/// segment() 全部切分逐条查询，该词回归主路径逐词断言。
 /// - 澳大利亚：ziranma 表 y 系韵母缺 "ya"（也缺 "yo"），音节无法编成两键 → 双拼不可达。
-const KNOWN_FULL_BUG: &str = "蛋糕";
 const KNOWN_SP_BUG: &str = "澳大利亚";
 
 /// 全拼 + 双拼两条主路径：252 词逐词断言，收集全部失败一次报完
@@ -160,12 +159,9 @@ fn full_and_shuangpin_hit_first_page() {
     let mut full = engine("full", None);
     let mut sp = engine("sp", Some(Scheme::Ziranma));
     let mut fails = Vec::new();
-    let mut skip_full = 0;
     let mut skip_sp = 0;
     for (w, syls) in &ws {
-        if w == KNOWN_FULL_BUG {
-            skip_full += 1;
-        } else if let Some(m) = first_page(w, &syls.concat(), &mut full) {
+        if let Some(m) = first_page(w, &syls.concat(), &mut full) {
             fails.push(format!("全拼: {m}"));
         }
         let unenc: Vec<&String> = syls.iter().filter(|s| !enc.contains_key(*s)).collect();
@@ -187,7 +183,7 @@ fn full_and_shuangpin_hit_first_page() {
         fails.is_empty(),
         "{}/{} 路失败清单：\n{}",
         fails.len(),
-        ws.len() * 2 - skip_full - skip_sp,
+        ws.len() * 2 - skip_sp,
         fails.join("\n")
     );
     assert!(
@@ -196,25 +192,19 @@ fn full_and_shuangpin_hit_first_page() {
         ws.len()
     );
     eprintln!(
-        "常用词覆盖：全拼 {}/{}（缺陷跳过 {skip_full}）、双拼 {}/{}（缺陷跳过 {skip_sp}），总耗时 {dt:?}",
-        ws.len() - skip_full,
+        "常用词覆盖：全拼 {}/{}、双拼 {}/{}（缺陷跳过 {skip_sp}），总耗时 {dt:?}",
+        ws.len(),
         ws.len(),
         ws.len() - skip_sp,
         ws.len()
     );
 }
 
-/// 缺陷锁：确认两处 bug 还在。**此测试变红 = 引擎已修好**，届时把词放回主路径断言
-/// 并删除本测试与 KNOWN_* 常量。
+/// 缺陷锁：确认双拼 ziranma 缺 "ya" 还在。**此测试变红 = SpRare 支已修复**，
+/// 届时删除 KNOWN_SP_BUG 跳过、恢复 澳大利亚 双拼断言。
+/// （蛋糕的全拼缺陷已由引擎多切分查询修复，回归主路径断言。）
 #[test]
 fn known_bugs_are_still_locked() {
-    let mut e = engine("bugfull", None);
-    esc(&mut e);
-    type_all(&mut e, "dangao");
-    assert!(
-        !e.candidates().iter().any(|c| c.text == KNOWN_FULL_BUG),
-        "蛋糕全拼可达了！引擎已支持多切分查询 → 删除 KNOWN_FULL_BUG 跳过，恢复主路径断言"
-    );
     let enc = ziranma_map();
     assert!(
         !enc.contains_key("ya"),

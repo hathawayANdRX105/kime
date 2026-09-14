@@ -65,7 +65,8 @@ pub struct Engine {
     candidates: Vec<Candidate>,
     /// 双拼解码表（如小鹤/自然码），用于 shuangpin 模式
     sp: Option<kime_shuangpin::Table>,
-    /// 当前候选对应的读音序列，commit 时用于学习
+    /// 首个切分的读音序列（preedit/光标的显示依据）；learn 仅在被选候选自带
+    /// pinyin 缺失时回退到它
     last_reading: Vec<String>,
     /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
     preedit: String,
@@ -330,7 +331,7 @@ impl Engine {
         if k.ch.is_none() && k.code == KEY_SPACE {
             if let Some(top) = self.candidates.first().cloned() {
                 let text = top.text.clone();
-                self.learn_or_warn(&text);
+                self.learn_or_warn(&top);
                 self.clear_composition();
                 return Outcome::Commit(text);
             }
@@ -373,7 +374,7 @@ impl Engine {
                         // 情况 B：顶字上屏，拼接标点
                         let text = top.text.clone();
                         let commit_text = format!("{}{}", text, mapped);
-                        self.learn_or_warn(&text);
+                        self.learn_or_warn(&top);
                         self.clear_composition();
                         return Outcome::Commit(commit_text);
                     } else {
@@ -404,7 +405,7 @@ impl Engine {
                     let idx = self.page_index * self.page_size() + offset;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
-                        self.learn_or_warn(&text);
+                        self.learn_or_warn(&cand);
                         self.clear_composition();
                         return Outcome::Commit(text);
                     }
@@ -459,11 +460,20 @@ fn joined_key(syllables: &[String], tail: &str) -> String {
 }
 
 impl Engine {
-    /// 上屏后记录用户选择。学习失败不影响本次上屏（文本已交给应用），
-    /// 但必须可见：静默丢弃会让用户词永久不生效且无从排查。
-    fn learn_or_warn(&mut self, text: &str) {
-        if let Err(e) = self.dict.learn(&self.last_reading, text) {
-            eprintln!("[kime] 用户词学习失败 ({} → {}): {}", self.preedit, text, e);
+    /// 学习以**被选候选自己的 pinyin** 为准：多切分查询后 last_reading 只反映首切分
+    /// （打 "dangao" 选「蛋糕」时它是 ["dang"]），拿它学习会把用户词学到错误读音下。
+    /// 候选自带读音 = pinyin 按 `'` 切分；外部注入（AI）候选没带时回退 last_reading。
+    fn learn_or_warn(&mut self, cand: &Candidate) {
+        let reading: Vec<String> = if cand.pinyin.is_empty() {
+            self.last_reading.clone()
+        } else {
+            cand.pinyin.split('\'').map(str::to_string).collect()
+        };
+        if let Err(e) = self.dict.learn(&reading, &cand.text) {
+            eprintln!(
+                "[kime] 用户词学习失败 ({} → {}): {}",
+                self.preedit, cand.text, e
+            );
         }
     }
 
@@ -579,7 +589,7 @@ impl Engine {
         self.candidates.extend_from_slice(&en[exact_end..]);
     }
 
-    /// 全拼路径：segment 切分 + 前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
+    /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
     fn refresh_full_pinyin(&mut self) {
         let segs = segment(&self.letters);
         let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.first().cloned() {
@@ -605,7 +615,7 @@ impl Engine {
         self.preedit = self.letters.clone();
         self.last_joined = joined_key(&reading, &tail);
 
-        // 主路径查询
+        // 主路径查询（首切分，显示与层一契约以它为准）
         let mut cands: Vec<Candidate> = self
             .dict
             .lookup_prefix(&reading, &tail, self.config.candidate_limit)
@@ -649,7 +659,32 @@ impl Engine {
             cands.truncate(self.config.candidate_limit);
         }
 
-        // 若主路径与模糊路径都无候选，回退到缩写查询
+        // 多切分查询（蛋糕 bug）：只查首切分会漏掉整个正确切分——"dangao" 贪心切成
+        // ["dang","ao"]，真词「蛋糕」只在 ["dan","gao"] 里。segment() 的切分数有界
+        // （≤12 字母实测 2–4 条，Fibonacci 级），每条同样带 candidate_limit 查询；
+        // 结果按文本去重后**续在首切分之后**——首切分总序零变化（preedit/层一/英文
+        // 层一的落位契约都不受影响），重复文本保留频率更高的出现。
+        let mut seen_at: std::collections::HashMap<String, usize> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.text.clone(), i))
+            .collect();
+        for extra in segs.iter().skip(1) {
+            let mut r = extra.clone();
+            let t = r.pop().unwrap_or_default();
+            if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
+                for c in vc {
+                    match seen_at.get(&c.text).copied() {
+                        Some(i) => cands[i].freq = cands[i].freq.max(c.freq),
+                        None => {
+                            seen_at.insert(c.text.clone(), cands.len());
+                            cands.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        // 若全部切分的主路径与模糊路径都无候选，回退到缩写查询
         if cands.is_empty() {
             if let Ok(ab) = self
                 .dict
