@@ -28,6 +28,12 @@
 //! `yao`=yk(ao→K)、`ye`=ye。把 `y` 当介音 `i` 去套 `iu/ian/iao/ie` 的键
 //! （yq/ym/yc/yx）是错的 —— rime `double_pinyin` 的 algebra 没有那个替换。
 //! 守卫见 `tests/rime_algebra_test.rs`。
+//!
+//! 一音节多合法码：rime `double_pinyin` 的 algebra 用 `derive`（保留原拼写）
+//! 让 10 个音节同时有双拼形和原拼写两个合法键 —— ai[ai|al] an[aj|an] ao[ak|ao]
+//! ei[ei|ez] en[ef|en] ju[ju|jv] ou[ob|ou] qu[qu|qv] xu[xu|xv] yu[yu|yv]。
+//! 下表为每个这样的音节列两行（键互不相同，二分查找不受影响）。
+//! 缺原拼写键的代价：`quzo` 解码失败退回全拼前缀，候选成 取走(qu'zou)。
 
 #[cfg(test)]
 use kime_pinyin::Reading;
@@ -35,9 +41,12 @@ use kime_pinyin::Reading;
 pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("a", *b"aa"),
     ("ang", *b"ah"),
+    ("ai", *b"ai"),
     ("an", *b"aj"),
     ("ao", *b"ak"),
     ("ai", *b"al"),
+    ("an", *b"an"),
+    ("ao", *b"ao"),
     ("ba", *b"ba"),
     ("biao", *b"bc"),
     ("ben", *b"bf"),
@@ -94,6 +103,8 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("e", *b"ee"),
     ("en", *b"ef"),
     ("eng", *b"eg"),
+    ("ei", *b"ei"),
+    ("en", *b"en"),
     ("er", *b"er"),
     ("ei", *b"ez"),
     ("fa", *b"fa"),
@@ -172,6 +183,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("juan", *b"jr"),
     ("jiong", *b"js"),
     ("jue", *b"jt"),
+    ("ju", *b"ju"),
     ("ju", *b"jv"),
     ("jia", *b"jw"),
     ("jie", *b"jx"),
@@ -263,6 +275,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("nei", *b"nz"),
     ("ou", *b"ob"),
     ("o", *b"oo"),
+    ("ou", *b"ou"),
     ("pa", *b"pa"),
     ("pou", *b"pb"),
     ("piao", *b"pc"),
@@ -290,6 +303,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("quan", *b"qr"),
     ("qiong", *b"qs"),
     ("que", *b"qt"),
+    ("qu", *b"qu"),
     ("qu", *b"qv"),
     ("qia", *b"qw"),
     ("qie", *b"qx"),
@@ -401,6 +415,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xuan", *b"xr"),
     ("xiong", *b"xs"),
     ("xue", *b"xt"),
+    ("xu", *b"xu"),
     ("xu", *b"xv"),
     ("xia", *b"xw"),
     ("xie", *b"xx"),
@@ -416,6 +431,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
     ("yue", *b"yt"),
+    ("yu", *b"yu"),
     ("yu", *b"yv"),
     ("ying", *b"yy"),
     ("za", *b"za"),
@@ -491,15 +507,32 @@ pub(crate) fn to_syllables(keys: &str) -> Result<Reading, String> {
 mod tests {
     use super::*;
 
+    /// 全表 round-trip：每个键（含别名键）解回本音节；encode() 取表内首键（规范码），
+    /// 对每个音节 编码→解码→编码 必须稳定。
     #[test]
     fn round_trip_all() {
         for &(syl, key) in TABLE {
-            assert_eq!(encode(syl), Some(key), "encode({syl})");
             assert_eq!(decode(key[0], key[1]), Some(syl), "decode({key:?})");
-            let decoded = decode(key[0], key[1]).unwrap();
-            let re_encoded = encode(decoded).unwrap();
-            assert_eq!(re_encoded, key, "encode∘decode({syl}) round-trip");
         }
+        // 同一音节的多行（rime derive 别名）键互不相同，首行为规范码
+        let mut seen = std::collections::HashSet::new();
+        for &(syl, key) in TABLE {
+            if !seen.insert(syl) {
+                continue;
+            }
+            assert_eq!(encode(syl), Some(key), "encode({syl}) 应为表内首键");
+            let decoded = decode(key[0], key[1]).unwrap();
+            assert_eq!(
+                encode(decoded),
+                Some(key),
+                "encode∘decode({syl}) round-trip"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            401,
+            "音节数应为 401（411 行 = 401 音节 + 10 别名）"
+        );
     }
 
     #[test]
