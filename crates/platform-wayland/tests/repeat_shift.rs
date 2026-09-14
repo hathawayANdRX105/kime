@@ -7,8 +7,8 @@ use platform_wayland::repeat::{
 };
 
 const BACKSPACE: u32 = 14;
-const CTRL_F: u32 = 41; // KEY_F
-const CTRL_H: u32 = 43; // KEY_H
+const CTRL_F: u32 = 33; // KEY_F
+const CTRL_H: u32 = 35; // KEY_H
 const CTRL_B: u32 = 48; // KEY_B
 const LETTER_A: u32 = 30; // 不在重复集内
 
