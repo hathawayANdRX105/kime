@@ -33,8 +33,11 @@
 //! 让 10 个音节同时有双拼形和原拼写两个合法键 —— ai[ad|ai] an[aj|an] ao[ac|ao]
 //! ei[ew|ei] en[ef|en] ju[jv|ju] ou[oz|ou] qu[qv|qu] xu[xv|xu] yu[yv|yu]。
 //! 下表为每个这样的音节列两行（键互不相同，二分查找不受影响）。
+//!
+//! 撞键排除：`lo`（啰）——rime algebra 把 lo 与 luo 都派生成键 `lo`，本表一键一音节，
+//! `lo` 键让给常用字所在的 luo；lo 音节在双拼下退全拼兜底。fixture 同步注明。
 
-/// 把 401 音节里属于本方案的「音节→键对」手工列出来。
+/// 把 415 音节里属于本方案的「音节→键对」从 rime algebra 机械展开出来。
 /// 编码 = `声母键 + 韵母键`；零声母单韵母双写（如 `a→aa`）。
 #[cfg(test)]
 use kime_pinyin::Reading;
@@ -58,6 +61,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("bi", *b"bi"),
     ("ban", *b"bj"),
     ("bing", *b"bk"),
+    ("biang", *b"bl"),
     ("bian", *b"bm"),
     ("biao", *b"bn"),
     ("bo", *b"bo"),
@@ -78,12 +82,14 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("cong", *b"cs"),
     ("cu", *b"cu"),
     ("cui", *b"cv"),
+    ("cei", *b"cw"),
     ("cun", *b"cy"),
     ("cou", *b"cz"),
     ("da", *b"da"),
     ("dao", *b"dc"),
     ("dai", *b"dd"),
     ("de", *b"de"),
+    ("den", *b"df"),
     ("deng", *b"dg"),
     ("dang", *b"dh"),
     ("di", *b"di"),
@@ -99,6 +105,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("du", *b"du"),
     ("dui", *b"dv"),
     ("dei", *b"dw"),
+    ("dia", *b"dx"),
     ("dun", *b"dy"),
     ("dou", *b"dz"),
     ("e", *b"ee"),
@@ -113,6 +120,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("feng", *b"fg"),
     ("fang", *b"fh"),
     ("fan", *b"fj"),
+    ("fiao", *b"fn"),
     ("fo", *b"fo"),
     ("fu", *b"fu"),
     ("fei", *b"fw"),
@@ -204,6 +212,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("kong", *b"ks"),
     ("ku", *b"ku"),
     ("kui", *b"kv"),
+    ("kei", *b"kw"),
     ("kua", *b"kx"),
     ("kun", *b"ky"),
     ("kou", *b"kz"),
@@ -274,6 +283,9 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("nu", *b"nu"),
     ("nv", *b"nv"),
     ("nei", *b"nw"),
+    ("nia", *b"nx"),
+    ("nun", *b"ny"),
+    ("nou", *b"nz"),
     ("o", *b"oo"),
     ("ou", *b"ou"),
     ("ou", *b"oz"),
@@ -321,6 +333,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("rong", *b"rs"),
     ("ru", *b"ru"),
     ("rui", *b"rv"),
+    ("rua", *b"rx"),
     ("run", *b"ry"),
     ("rou", *b"rz"),
     ("sa", *b"sa"),
@@ -356,6 +369,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("tong", *b"ts"),
     ("tu", *b"tu"),
     ("tui", *b"tv"),
+    ("tei", *b"tw"),
     ("tun", *b"ty"),
     ("tou", *b"tz"),
     ("sha", *b"ua"),
@@ -421,6 +435,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xu", *b"xv"),
     ("xia", *b"xx"),
     ("xun", *b"xy"),
+    ("ya", *b"ya"),
     ("yin", *b"yb"),
     ("yao", *b"yc"),
     ("ye", *b"ye"),
@@ -428,6 +443,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("yi", *b"yi"),
     ("yan", *b"yj"),
     ("ying", *b"yk"),
+    ("yo", *b"yo"),
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
     ("yue", *b"yt"),
@@ -445,6 +461,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("zi", *b"zi"),
     ("zan", *b"zj"),
     ("zuo", *b"zo"),
+    ("zuan", *b"zr"),
     ("zong", *b"zs"),
     ("zu", *b"zu"),
     ("zui", *b"zv"),
@@ -454,9 +471,9 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
 ];
 
 #[cfg(test)]
-/// 401 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突。
+/// 415 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突（lo 除外）。
 pub(crate) fn encode(syll: &str) -> Option<[u8; 2]> {
-    // ponytail: linear scan over 401 entries is faster than the binary search
+    // ponytail: linear scan over 425 entries is faster than the binary search
     // we'd need if we kept two sort orders; the hot path here is decode, not encode.
     TABLE.iter().find(|&&(k, _)| k == syll).map(|&(_, v)| v)
 }
@@ -531,8 +548,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            401,
-            "音节数应为 401（411 行 = 401 音节 + 10 别名）"
+            415,
+            "音节数应为 415（425 行 = 415 音节 + 10 别名；lo 与 luo 撞键未收录）"
         );
     }
 

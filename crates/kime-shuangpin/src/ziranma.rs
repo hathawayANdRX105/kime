@@ -34,6 +34,9 @@
 //! ei[ei|ez] en[ef|en] ju[ju|jv] ou[ob|ou] qu[qu|qv] xu[xu|xv] yu[yu|yv]。
 //! 下表为每个这样的音节列两行（键互不相同，二分查找不受影响）。
 //! 缺原拼写键的代价：`quzo` 解码失败退回全拼前缀，候选成 取走(qu'zou)。
+//!
+//! 撞键排除：`lo`（啰）——rime algebra 把 lo 与 luo 都派生成键 `lo`，本表一键一音节，
+//! `lo` 键让给常用字所在的 luo；lo 音节在双拼下退全拼兜底。fixture 同步注明。
 
 #[cfg(test)]
 use kime_pinyin::Reading;
@@ -49,6 +52,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("ao", *b"ao"),
     ("ba", *b"ba"),
     ("biao", *b"bc"),
+    ("biang", *b"bd"),
     ("ben", *b"bf"),
     ("beng", *b"bg"),
     ("bang", *b"bh"),
@@ -79,10 +83,12 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("cong", *b"cs"),
     ("cu", *b"cu"),
     ("cui", *b"cv"),
+    ("cei", *b"cz"),
     ("da", *b"da"),
     ("dou", *b"db"),
     ("diao", *b"dc"),
     ("de", *b"de"),
+    ("den", *b"df"),
     ("deng", *b"dg"),
     ("dang", *b"dh"),
     ("di", *b"di"),
@@ -97,6 +103,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("dong", *b"ds"),
     ("du", *b"du"),
     ("dui", *b"dv"),
+    ("dia", *b"dw"),
     ("die", *b"dx"),
     ("ding", *b"dy"),
     ("dei", *b"dz"),
@@ -109,6 +116,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("ei", *b"ez"),
     ("fa", *b"fa"),
     ("fou", *b"fb"),
+    ("fiao", *b"fc"),
     ("fen", *b"ff"),
     ("feng", *b"fg"),
     ("fang", *b"fh"),
@@ -206,6 +214,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("kui", *b"kv"),
     ("kua", *b"kw"),
     ("kuai", *b"ky"),
+    ("kei", *b"kz"),
     ("la", *b"la"),
     ("lou", *b"lb"),
     ("liao", *b"lc"),
@@ -251,6 +260,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("ming", *b"my"),
     ("mei", *b"mz"),
     ("na", *b"na"),
+    ("nou", *b"nb"),
     ("niao", *b"nc"),
     ("niang", *b"nd"),
     ("ne", *b"ne"),
@@ -264,12 +274,14 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("nian", *b"nm"),
     ("nin", *b"nn"),
     ("nuo", *b"no"),
+    ("nun", *b"np"),
     ("niu", *b"nq"),
     ("nuan", *b"nr"),
     ("nong", *b"ns"),
     ("nve", *b"nt"),
     ("nu", *b"nu"),
     ("nv", *b"nv"),
+    ("nia", *b"nw"),
     ("nie", *b"nx"),
     ("ning", *b"ny"),
     ("nei", *b"nz"),
@@ -322,6 +334,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("rong", *b"rs"),
     ("ru", *b"ru"),
     ("rui", *b"rv"),
+    ("rua", *b"rw"),
     ("sa", *b"sa"),
     ("sou", *b"sb"),
     ("se", *b"se"),
@@ -357,6 +370,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("tui", *b"tv"),
     ("tie", *b"tx"),
     ("ting", *b"ty"),
+    ("tei", *b"tz"),
     ("sha", *b"ua"),
     ("shou", *b"ub"),
     ("shuang", *b"ud"),
@@ -420,6 +434,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xia", *b"xw"),
     ("xie", *b"xx"),
     ("xing", *b"xy"),
+    ("ya", *b"ya"),
     ("you", *b"yb"),
     ("ye", *b"ye"),
     ("yang", *b"yh"),
@@ -427,6 +442,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("yan", *b"yj"),
     ("yao", *b"yk"),
     ("yin", *b"yn"),
+    ("yo", *b"yo"),
     ("yun", *b"yp"),
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
@@ -446,6 +462,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("zai", *b"zl"),
     ("zuo", *b"zo"),
     ("zun", *b"zp"),
+    ("zuan", *b"zr"),
     ("zong", *b"zs"),
     ("zu", *b"zu"),
     ("zui", *b"zv"),
@@ -453,9 +470,9 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
 ];
 
 #[cfg(test)]
-/// 401 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突。
+/// 415 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突（lo 除外）。
 pub(crate) fn encode(syll: &str) -> Option<[u8; 2]> {
-    // ponytail: linear scan over 401 entries is faster than the binary search
+    // ponytail: linear scan over 425 entries is faster than the binary search
     // we'd need if we kept two sort orders; the hot path here is decode, not encode.
     TABLE.iter().find(|&&(k, _)| k == syll).map(|&(_, v)| v)
 }
@@ -530,8 +547,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            401,
-            "音节数应为 401（411 行 = 401 音节 + 10 别名）"
+            415,
+            "音节数应为 415（425 行 = 415 音节 + 10 别名；lo 与 luo 撞键未收录）"
         );
     }
 
