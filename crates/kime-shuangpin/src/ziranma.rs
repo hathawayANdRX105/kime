@@ -28,6 +28,15 @@
 //! `yao`=yk(ao→K)、`ye`=ye。把 `y` 当介音 `i` 去套 `iu/ian/iao/ie` 的键
 //! （yq/ym/yc/yx）是错的 —— rime `double_pinyin` 的 algebra 没有那个替换。
 //! 守卫见 `tests/rime_algebra_test.rs`。
+//!
+//! 一音节多合法码：rime `double_pinyin` 的 algebra 用 `derive`（保留原拼写）
+//! 让 10 个音节同时有双拼形和原拼写两个合法键 —— ai[ai|al] an[aj|an] ao[ak|ao]
+//! ei[ei|ez] en[ef|en] ju[ju|jv] ou[ob|ou] qu[qu|qv] xu[xu|xv] yu[yu|yv]。
+//! 下表为每个这样的音节列两行（键互不相同，二分查找不受影响）。
+//! 缺原拼写键的代价：`quzo` 解码失败退回全拼前缀，候选成 取走(qu'zou)。
+//!
+//! 撞键排除：`lo`（啰）——rime algebra 把 lo 与 luo 都派生成键 `lo`，本表一键一音节，
+//! `lo` 键让给常用字所在的 luo；lo 音节在双拼下退全拼兜底。fixture 同步注明。
 
 #[cfg(test)]
 use kime_pinyin::Reading;
@@ -35,11 +44,15 @@ use kime_pinyin::Reading;
 pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("a", *b"aa"),
     ("ang", *b"ah"),
+    ("ai", *b"ai"),
     ("an", *b"aj"),
     ("ao", *b"ak"),
     ("ai", *b"al"),
+    ("an", *b"an"),
+    ("ao", *b"ao"),
     ("ba", *b"ba"),
     ("biao", *b"bc"),
+    ("biang", *b"bd"),
     ("ben", *b"bf"),
     ("beng", *b"bg"),
     ("bang", *b"bh"),
@@ -70,10 +83,12 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("cong", *b"cs"),
     ("cu", *b"cu"),
     ("cui", *b"cv"),
+    ("cei", *b"cz"),
     ("da", *b"da"),
     ("dou", *b"db"),
     ("diao", *b"dc"),
     ("de", *b"de"),
+    ("den", *b"df"),
     ("deng", *b"dg"),
     ("dang", *b"dh"),
     ("di", *b"di"),
@@ -88,16 +103,20 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("dong", *b"ds"),
     ("du", *b"du"),
     ("dui", *b"dv"),
+    ("dia", *b"dw"),
     ("die", *b"dx"),
     ("ding", *b"dy"),
     ("dei", *b"dz"),
     ("e", *b"ee"),
     ("en", *b"ef"),
     ("eng", *b"eg"),
+    ("ei", *b"ei"),
+    ("en", *b"en"),
     ("er", *b"er"),
     ("ei", *b"ez"),
     ("fa", *b"fa"),
     ("fou", *b"fb"),
+    ("fiao", *b"fc"),
     ("fen", *b"ff"),
     ("feng", *b"fg"),
     ("fang", *b"fh"),
@@ -172,6 +191,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("juan", *b"jr"),
     ("jiong", *b"js"),
     ("jue", *b"jt"),
+    ("ju", *b"ju"),
     ("ju", *b"jv"),
     ("jia", *b"jw"),
     ("jie", *b"jx"),
@@ -194,6 +214,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("kui", *b"kv"),
     ("kua", *b"kw"),
     ("kuai", *b"ky"),
+    ("kei", *b"kz"),
     ("la", *b"la"),
     ("lou", *b"lb"),
     ("liao", *b"lc"),
@@ -239,6 +260,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("ming", *b"my"),
     ("mei", *b"mz"),
     ("na", *b"na"),
+    ("nou", *b"nb"),
     ("niao", *b"nc"),
     ("niang", *b"nd"),
     ("ne", *b"ne"),
@@ -252,17 +274,20 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("nian", *b"nm"),
     ("nin", *b"nn"),
     ("nuo", *b"no"),
+    ("nun", *b"np"),
     ("niu", *b"nq"),
     ("nuan", *b"nr"),
     ("nong", *b"ns"),
     ("nve", *b"nt"),
     ("nu", *b"nu"),
     ("nv", *b"nv"),
+    ("nia", *b"nw"),
     ("nie", *b"nx"),
     ("ning", *b"ny"),
     ("nei", *b"nz"),
     ("ou", *b"ob"),
     ("o", *b"oo"),
+    ("ou", *b"ou"),
     ("pa", *b"pa"),
     ("pou", *b"pb"),
     ("piao", *b"pc"),
@@ -290,6 +315,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("quan", *b"qr"),
     ("qiong", *b"qs"),
     ("que", *b"qt"),
+    ("qu", *b"qu"),
     ("qu", *b"qv"),
     ("qia", *b"qw"),
     ("qie", *b"qx"),
@@ -308,6 +334,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("rong", *b"rs"),
     ("ru", *b"ru"),
     ("rui", *b"rv"),
+    ("rua", *b"rw"),
     ("sa", *b"sa"),
     ("sou", *b"sb"),
     ("se", *b"se"),
@@ -343,6 +370,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("tui", *b"tv"),
     ("tie", *b"tx"),
     ("ting", *b"ty"),
+    ("tei", *b"tz"),
     ("sha", *b"ua"),
     ("shou", *b"ub"),
     ("shuang", *b"ud"),
@@ -401,10 +429,12 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("xuan", *b"xr"),
     ("xiong", *b"xs"),
     ("xue", *b"xt"),
+    ("xu", *b"xu"),
     ("xu", *b"xv"),
     ("xia", *b"xw"),
     ("xie", *b"xx"),
     ("xing", *b"xy"),
+    ("ya", *b"ya"),
     ("you", *b"yb"),
     ("ye", *b"ye"),
     ("yang", *b"yh"),
@@ -412,10 +442,12 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("yan", *b"yj"),
     ("yao", *b"yk"),
     ("yin", *b"yn"),
+    ("yo", *b"yo"),
     ("yun", *b"yp"),
     ("yuan", *b"yr"),
     ("yong", *b"ys"),
     ("yue", *b"yt"),
+    ("yu", *b"yu"),
     ("yu", *b"yv"),
     ("ying", *b"yy"),
     ("za", *b"za"),
@@ -430,6 +462,7 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("zai", *b"zl"),
     ("zuo", *b"zo"),
     ("zun", *b"zp"),
+    ("zuan", *b"zr"),
     ("zong", *b"zs"),
     ("zu", *b"zu"),
     ("zui", *b"zv"),
@@ -437,9 +470,9 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
 ];
 
 #[cfg(test)]
-/// 401 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突。
+/// 415 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突（lo 除外）。
 pub(crate) fn encode(syll: &str) -> Option<[u8; 2]> {
-    // ponytail: linear scan over 401 entries is faster than the binary search
+    // ponytail: linear scan over 425 entries is faster than the binary search
     // we'd need if we kept two sort orders; the hot path here is decode, not encode.
     TABLE.iter().find(|&&(k, _)| k == syll).map(|&(_, v)| v)
 }
@@ -491,15 +524,32 @@ pub(crate) fn to_syllables(keys: &str) -> Result<Reading, String> {
 mod tests {
     use super::*;
 
+    /// 全表 round-trip：每个键（含别名键）解回本音节；encode() 取表内首键（规范码），
+    /// 对每个音节 编码→解码→编码 必须稳定。
     #[test]
     fn round_trip_all() {
         for &(syl, key) in TABLE {
-            assert_eq!(encode(syl), Some(key), "encode({syl})");
             assert_eq!(decode(key[0], key[1]), Some(syl), "decode({key:?})");
-            let decoded = decode(key[0], key[1]).unwrap();
-            let re_encoded = encode(decoded).unwrap();
-            assert_eq!(re_encoded, key, "encode∘decode({syl}) round-trip");
         }
+        // 同一音节的多行（rime derive 别名）键互不相同，首行为规范码
+        let mut seen = std::collections::HashSet::new();
+        for &(syl, key) in TABLE {
+            if !seen.insert(syl) {
+                continue;
+            }
+            assert_eq!(encode(syl), Some(key), "encode({syl}) 应为表内首键");
+            let decoded = decode(key[0], key[1]).unwrap();
+            assert_eq!(
+                encode(decoded),
+                Some(key),
+                "encode∘decode({syl}) round-trip"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            415,
+            "音节数应为 415（425 行 = 415 音节 + 10 别名；lo 与 luo 撞键未收录）"
+        );
     }
 
     #[test]

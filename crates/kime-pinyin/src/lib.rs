@@ -1,6 +1,6 @@
 //! 拼音音节切分 — 纯逻辑，零依赖。
 //!
-//! 契约：ascii 小写字母串 → 所有合法切分，最优在前。
+//! 契约：ascii 小写字母串 → 所有合法切分，DFS 展开序（见 [`segment`]）。
 //! "xian" → [["xian"], ["xi","an"]]；"nihao" → [["ni","hao"], ["ni","ha","o"]]；
 //! 空串 / 非 a-z 字符 / 无法切分 → 空 vec。
 //!
@@ -10,10 +10,10 @@
 /// 一次切分：音节序列，如 ["ni","hao"]
 pub type Reading = Vec<String>;
 
-/// 全部合法切分，最优排序（音节数最少优先；同长度按字典序）
-//
-/// 算法：DFS 从左到右探索，每步尝试 6→1 字母的音节前缀；先吃完更长的音节
-/// → 产生的切分自然按"总音节数从少到多"排列。空串/非法字符/无解 → 空 vec。
+/// 全部合法切分，DFS 展开序：每步先尝试更长的音节前缀，因此更长首音节、通常也是
+/// 音节数更少的切分排在前面；**同音节数之间没有字典序或其他二次排序**。
+/// 消费者要覆盖歧义必须遍历全部切分，不得押注首条（引擎侧正因此修过「蛋糕」bug）。
+/// 算法：DFS 从左到右探索，每步尝试 6→1 字母的音节前缀。空串/非法字符/无解 → 空 vec。
 pub fn segment(input: &str) -> Vec<Reading> {
     if input.is_empty() {
         return Vec::new();
@@ -49,43 +49,50 @@ fn dfs(bytes: &[u8], pos: usize, path: &mut Vec<String>, out: &mut Vec<Reading>)
     }
 }
 
-/// 标准普通话无调音节表（401 条；按字典序排好）。
+/// 无调音节表（416 条；按字典序排好）。
+///
+/// 全集依据：线上词库 dict.sqlite3 phrase.pinyin 的全部去重音节（416）——
+/// 词库里有的读音必须能切出来，否则该词在全拼下打不到。逐条核对为
+/// rime-luna-pinyin.dict.yaml 音节集（424）的子集：新增 15 条均为词典在册音节
+/// （ya 丫、yo 哟、lo 啰、den 扽、nou、nun、kei、cei、tei、dia、nia、rua、zuan、
+/// fiao 覅、biang），未收录 luna 独有的 eh/fong/lvan/sei/wong/yai（词库无字）。
 const SYLLABLES: &[&str] = &[
     "a", "ai", "an", "ang", "ao", "ba", "bai", "ban", "bang", "bao", "bei", "ben", "beng", "bi",
-    "bian", "biao", "bie", "bin", "bing", "bo", "bu", "ca", "cai", "can", "cang", "cao", "ce",
-    "cen", "ceng", "cha", "chai", "chan", "chang", "chao", "che", "chen", "cheng", "chi", "chong",
-    "chou", "chu", "chua", "chuai", "chuan", "chuang", "chui", "chun", "chuo", "ci", "cong", "cou",
-    "cu", "cuan", "cui", "cun", "cuo", "da", "dai", "dan", "dang", "dao", "de", "dei", "deng",
-    "di", "dian", "diao", "die", "ding", "diu", "dong", "dou", "du", "duan", "dui", "dun", "duo",
-    "e", "ei", "en", "eng", "er", "fa", "fan", "fang", "fei", "fen", "feng", "fo", "fou", "fu",
-    "ga", "gai", "gan", "gang", "gao", "ge", "gei", "gen", "geng", "gong", "gou", "gu", "gua",
-    "guai", "guan", "guang", "gui", "gun", "guo", "ha", "hai", "han", "hang", "hao", "he", "hei",
-    "hen", "heng", "hong", "hou", "hu", "hua", "huai", "huan", "huang", "hui", "hun", "huo", "ji",
-    "jia", "jian", "jiang", "jiao", "jie", "jin", "jing", "jiong", "jiu", "ju", "juan", "jue",
-    "jun", "ka", "kai", "kan", "kang", "kao", "ke", "ken", "keng", "kong", "kou", "ku", "kua",
-    "kuai", "kuan", "kuang", "kui", "kun", "kuo", "la", "lai", "lan", "lang", "lao", "le", "lei",
-    "leng", "li", "lia", "lian", "liang", "liao", "lie", "lin", "ling", "liu", "long", "lou", "lu",
-    "luan", "lun", "luo", "lv", "lve", "ma", "mai", "man", "mang", "mao", "me", "mei", "men",
-    "meng", "mi", "mian", "miao", "mie", "min", "ming", "miu", "mo", "mou", "mu", "na", "nai",
-    "nan", "nang", "nao", "ne", "nei", "nen", "neng", "ni", "nian", "niang", "niao", "nie", "nin",
-    "ning", "niu", "nong", "nu", "nuan", "nuo", "nv", "nve", "o", "ou", "pa", "pai", "pan", "pang",
-    "pao", "pei", "pen", "peng", "pi", "pian", "piao", "pie", "pin", "ping", "po", "pou", "pu",
-    "qi", "qia", "qian", "qiang", "qiao", "qie", "qin", "qing", "qiong", "qiu", "qu", "quan",
-    "que", "qun", "ran", "rang", "rao", "re", "ren", "reng", "ri", "rong", "rou", "ru", "ruan",
-    "rui", "run", "ruo", "sa", "sai", "san", "sang", "sao", "se", "sen", "seng", "sha", "shai",
-    "shan", "shang", "shao", "she", "shei", "shen", "sheng", "shi", "shou", "shu", "shua", "shuai",
-    "shuan", "shuang", "shui", "shun", "shuo", "si", "song", "sou", "su", "suan", "sui", "sun",
-    "suo", "ta", "tai", "tan", "tang", "tao", "te", "teng", "ti", "tian", "tiao", "tie", "ting",
-    "tong", "tou", "tu", "tuan", "tui", "tun", "tuo", "wa", "wai", "wan", "wang", "wei", "wen",
-    "weng", "wo", "wu", "xi", "xia", "xian", "xiang", "xiao", "xie", "xin", "xing", "xiong", "xiu",
-    "xu", "xuan", "xue", "xun", "yan", "yang", "yao", "ye", "yi", "yin", "ying", "yong", "you",
-    "yu", "yuan", "yue", "yun", "za", "zai", "zan", "zang", "zao", "ze", "zei", "zen", "zeng",
-    "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhei", "zhen", "zheng", "zhi", "zhong", "zhou",
-    "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou", "zu",
-    "zui", "zun", "zuo",
+    "bian", "biang", "biao", "bie", "bin", "bing", "bo", "bu", "ca", "cai", "can", "cang", "cao",
+    "ce", "cei", "cen", "ceng", "cha", "chai", "chan", "chang", "chao", "che", "chen", "cheng",
+    "chi", "chong", "chou", "chu", "chua", "chuai", "chuan", "chuang", "chui", "chun", "chuo",
+    "ci", "cong", "cou", "cu", "cuan", "cui", "cun", "cuo", "da", "dai", "dan", "dang", "dao",
+    "de", "dei", "den", "deng", "di", "dia", "dian", "diao", "die", "ding", "diu", "dong", "dou",
+    "du", "duan", "dui", "dun", "duo", "e", "ei", "en", "eng", "er", "fa", "fan", "fang", "fei",
+    "fen", "feng", "fiao", "fo", "fou", "fu", "ga", "gai", "gan", "gang", "gao", "ge", "gei",
+    "gen", "geng", "gong", "gou", "gu", "gua", "guai", "guan", "guang", "gui", "gun", "guo", "ha",
+    "hai", "han", "hang", "hao", "he", "hei", "hen", "heng", "hong", "hou", "hu", "hua", "huai",
+    "huan", "huang", "hui", "hun", "huo", "ji", "jia", "jian", "jiang", "jiao", "jie", "jin",
+    "jing", "jiong", "jiu", "ju", "juan", "jue", "jun", "ka", "kai", "kan", "kang", "kao", "ke",
+    "kei", "ken", "keng", "kong", "kou", "ku", "kua", "kuai", "kuan", "kuang", "kui", "kun", "kuo",
+    "la", "lai", "lan", "lang", "lao", "le", "lei", "leng", "li", "lia", "lian", "liang", "liao",
+    "lie", "lin", "ling", "liu", "lo", "long", "lou", "lu", "luan", "lun", "luo", "lv", "lve",
+    "ma", "mai", "man", "mang", "mao", "me", "mei", "men", "meng", "mi", "mian", "miao", "mie",
+    "min", "ming", "miu", "mo", "mou", "mu", "na", "nai", "nan", "nang", "nao", "ne", "nei", "nen",
+    "neng", "ni", "nia", "nian", "niang", "niao", "nie", "nin", "ning", "niu", "nong", "nou", "nu",
+    "nuan", "nun", "nuo", "nv", "nve", "o", "ou", "pa", "pai", "pan", "pang", "pao", "pei", "pen",
+    "peng", "pi", "pian", "piao", "pie", "pin", "ping", "po", "pou", "pu", "qi", "qia", "qian",
+    "qiang", "qiao", "qie", "qin", "qing", "qiong", "qiu", "qu", "quan", "que", "qun", "ran",
+    "rang", "rao", "re", "ren", "reng", "ri", "rong", "rou", "ru", "rua", "ruan", "rui", "run",
+    "ruo", "sa", "sai", "san", "sang", "sao", "se", "sen", "seng", "sha", "shai", "shan", "shang",
+    "shao", "she", "shei", "shen", "sheng", "shi", "shou", "shu", "shua", "shuai", "shuan",
+    "shuang", "shui", "shun", "shuo", "si", "song", "sou", "su", "suan", "sui", "sun", "suo", "ta",
+    "tai", "tan", "tang", "tao", "te", "tei", "teng", "ti", "tian", "tiao", "tie", "ting", "tong",
+    "tou", "tu", "tuan", "tui", "tun", "tuo", "wa", "wai", "wan", "wang", "wei", "wen", "weng",
+    "wo", "wu", "xi", "xia", "xian", "xiang", "xiao", "xie", "xin", "xing", "xiong", "xiu", "xu",
+    "xuan", "xue", "xun", "ya", "yan", "yang", "yao", "ye", "yi", "yin", "ying", "yo", "yong",
+    "you", "yu", "yuan", "yue", "yun", "za", "zai", "zan", "zang", "zao", "ze", "zei", "zen",
+    "zeng", "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhei", "zhen", "zheng", "zhi", "zhong",
+    "zhou", "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou",
+    "zu", "zuan", "zui", "zun", "zuo",
 ];
 
-/// 二分查表：401 条 → log2 ≈ 9 次比较，零运行时分配。
+/// 二分查表：416 条 → log2 ≈ 9 次比较，零运行时分配。
 fn is_syllable(s: &str) -> bool {
     SYLLABLES.binary_search(&s).is_ok()
 }
@@ -184,15 +191,15 @@ mod tests {
         assert_eq!(r, want);
     }
 
-    /// 全表完整性 sanity：401 条，全部 1-6 字母、小写、无重复。
+    /// 全表完整性 sanity：416 条，全部 1-6 字母、小写、无重复。
     /// 注：含 a/o/e 三个单字母音节（"啊"/"哦"/"鹅"），所以下界是 1 而非 2。
     #[test]
     fn table_sanity() {
         use std::collections::HashSet;
-        assert!(
-            (400..=420).contains(&SYLLABLES.len()),
-            "count out of range: {}",
-            SYLLABLES.len()
+        assert_eq!(
+            SYLLABLES.len(),
+            416,
+            "音节表规模漂移：改表请同步 tests/coverage_test.rs 的期望集"
         );
         let mut seen = HashSet::new();
         for s in SYLLABLES {

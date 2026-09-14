@@ -2,16 +2,18 @@
 //! 未消费的键经 zwp_virtual_keyboard_v1 原样送回，避免 grab 吞掉回车/快捷键。
 
 use std::env;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
-use kime_core::{Engine, Key, Outcome};
+use kime_core::{Engine, Outcome};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
+use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
+use platform_wayland::route::{key_log_line, route_press, route_release, shell_key, PressAction};
 use platform_wayland::tray::TrayIconManager;
 use platform_wayland::SwallowTracker;
 use platform_wayland::{Layout, Renderer};
@@ -44,7 +46,23 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {}", msg);
+    eprintln!("[kime-ime] {msg}");
+}
+
+/// 逐键路由日志（第五轮「真机不生效、单测全绿」的定罪材料）：每次进
+/// engine_press 的 press 一行，固定格式
+/// `key code=<u32> ch=<char|-> mods=<c?><s?><a?> -> <Outcome>`，追加写
+/// /tmp/kime-ime.log。人打字 ≤10 键/s、长按满速重复 ~30 行/s，不引日志
+/// 框架；release 构建直接可见。写失败（只读/满盘）静默——日志不许卡键流。
+fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+    let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/kime-ime.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
@@ -54,6 +72,16 @@ fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
     } else {
         Some(unsafe { OwnedFd::from_raw_fd(raw) })
     }
+}
+/// CLOCK_MONOTONIC 毫秒——与 wlroots 系合成器 key 事件 time 同一起点，
+/// poll 超时、重复节奏、透传时间戳共用这一把表。
+fn now_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 }
 
 struct LlmWorker {
@@ -362,9 +390,10 @@ struct AppState {
     tray: TrayIconManager,
     llm_worker: Option<LlmWorker>,
     llm_receiver: Option<Receiver<Vec<kime_core::dict::Candidate>>>,
+    /// Ctrl/Alt 按下旗标（键码 29/97、56/100 记账）：engine_press 构造 Key 时
+    /// 直接带进引擎。Shift 不存旗标——引擎的 shift 位看键码本身（shell_key）。
     ctrl: bool,
     alt: bool,
-    shift: bool,
     /// press/release 配对记账（见 SwallowTracker）：press 被引擎吃掉的键，release 也不转发，
     /// 避免半截按键；press 一旦转发给应用，记账必须销掉，release 同样转发。
     swallowed: SwallowTracker,
@@ -374,6 +403,11 @@ struct AppState {
     popup: Option<PopupCanvas>,
     /// xkb 解码：keymap/modifiers 事件喂状态，Key 事件取字符（取代旧手写码表）
     keyboard: Keyboard,
+    /// 组合内长按自动重复：合成器不向 IM grab 投递 repeat（libinput 吞 value=2；
+    /// mango 自研重复只喂全局键位），到点由主循环 poll 超时唤醒后合成（见 repeat.rs）。
+    repeat: KeyRepeat,
+    /// Shift 点击=切换 / 按住期间打字=临时英文不改模式（rime ascii_composer 语义）。
+    shift_gesture: ShiftComposer,
 }
 
 impl AppState {
@@ -396,12 +430,13 @@ impl AppState {
             llm_receiver: None,
             ctrl: false,
             alt: false,
-            shift: false,
             swallowed: SwallowTracker::default(),
             compositor: None,
             shm: None,
             popup: None,
             keyboard: Keyboard::new(),
+            repeat: KeyRepeat::default(),
+            shift_gesture: ShiftComposer::default(),
         }
     }
 
@@ -574,6 +609,82 @@ impl AppState {
         // 若这次提交同时翻转了中英模式（Shift 上屏原串），翻转检测在 Key 处理里闪窗。
         self.popup_show(qh);
     }
+
+    /// 引擎按键的唯一路径：真 press、Shift 手势裁决补交的 toggle、长按合成的
+    /// tick（synthetic=true）都从这里进，消费/放行的记账只有一份。
+    fn engine_press(&mut self, code: u32, time: u32, synthetic: bool, qh: &QueueHandle<Self>) {
+        let ch = self.keyboard.key_char(code);
+        let (ctrl, alt) = (self.ctrl, self.alt);
+        let mode_before = self.engine.as_ref().map_or(true, |e| e.chinese());
+        let outcome = match self.engine.as_mut() {
+            Some(engine) => engine.key(shell_key(code, ch, ctrl, alt)),
+            None => {
+                // 词库没开成：一切键放行，重复表整体作废，永不重新起表。
+                self.repeat.clear();
+                Outcome::Ignored
+            }
+        };
+        key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
+        // 消费之后组合是否还在：重复只在「组合内编辑键」起表（契约）。
+        let composing = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| !e.preedit().is_empty());
+        let route = route_press(code, synthetic, composing, &outcome);
+        if route.disarm {
+            self.repeat.release(code);
+        }
+        if route.arm {
+            self.repeat.arm(code, now_ms());
+        }
+        match route.action {
+            PressAction::Consume => {
+                self.swallowed.consume(code);
+                match outcome {
+                    Outcome::Commit(text) => self.apply_commit(text, qh),
+                    _ => self.apply_consumed(qh),
+                }
+            }
+            PressAction::Forward => {
+                // 同一个键可能从「被消费」中途变成「放行」。转发 press 前必须销掉
+                // 旧记账：否则 release 被残留标记吃掉 → 幽灵连发（947a3a3 的根因）。
+                self.swallowed.forward(code);
+                self.forward_key(time, code, true);
+            }
+            PressAction::Tap => {
+                // 组合恰在中途被删空：给应用一对完整 press+release（等效一次
+                // 点击，继续删应用字符），表不撤；物理 release 到达才停。
+                self.tap_pair(code);
+            }
+        }
+        // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
+        // 闪一次对应模式字，下一次按键收掉。
+        let mode_now = self.engine.as_ref().map_or(mode_before, |e| e.chinese());
+        if mode_now != mode_before {
+            if let Some(canvas) = self.popup.as_mut() {
+                canvas.flash_chip(mode_now, qh);
+            }
+        }
+        self.try_recv_llm(qh);
+    }
+
+    /// 向应用发一次完整的按键点击（合成 tick 撞上组合已清空时用）。
+    fn tap_pair(&mut self, code: u32) {
+        let t = now_ms() as u32;
+        self.swallowed.forward(code);
+        self.forward_key(t, code, true);
+        self.forward_key(t, code, false);
+        // 这对点击已闭环：重新记账，物理 release 到达时须被吞、不得再外发。
+        self.swallowed.consume(code);
+    }
+
+    /// 主循环 poll 超时唤醒时调用：到点的重复在这里合成。
+    fn tick_repeats(&mut self, qh: &QueueHandle<Self>) {
+        let now = now_ms();
+        if let Some(code) = self.repeat.tick(now) {
+            self.engine_press(code, now as u32, true, qh);
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for AppState {
@@ -716,11 +827,15 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
                 state.swallowed.clear();
+                state.repeat.clear();
+                state.shift_gesture.reset();
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
                 state.grab = None;
                 state.swallowed.clear();
+                state.repeat.clear();
+                state.shift_gesture.reset();
                 state.popup_hide(qh);
             }
             ZwpInputMethodEvent::Done { .. } => {
@@ -915,15 +1030,21 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 match key {
                     29 | 97 => state.ctrl = pressed,
                     56 | 100 => state.alt = pressed,
-                    42 | 54 => state.shift = pressed,
                     _ => {}
                 }
+                let is_shift = matches!(key, 42 | 54);
 
                 if released {
-                    if state.swallowed.release(key) {
-                        return;
+                    if is_shift && state.shift_gesture.on_shift_release() == ShiftRelease::Toggle {
+                        // 手势裁决：只有点击（其间没打过别的键）才把这一次 Shift 补交
+                        // 给引擎切中英；按住打过键 → 模式不动（rime ascii_composer）。
+                        state.engine_press(key, time, false, qh);
                     }
-                    state.forward_key(time, key, false);
+                    // 撤表只认自己（Shift/Ctrl 的 release 停不了 F 的重复），随后按
+                    // press 记账决定 release 吞放。route_release 见 route.rs。
+                    if route_release(key, &mut state.swallowed, &mut state.repeat) {
+                        state.forward_key(time, key, false);
+                    }
                     return;
                 }
                 if !pressed {
@@ -931,63 +1052,38 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 }
 
                 // 模式闪现生命周期：任何一次按下（消费或放行都算）先收掉上一次闪现。
-                // release 不收：切换发生在 Shift 按下的瞬间，抬起若也清，闪现活不过一个手势。
+                // release 不收：切换裁决在 Shift 松手处，抬起若也清，闪现活不过一个手势。
                 if let Some(canvas) = state.popup.as_mut() {
                     canvas.clear_chip(qh);
                 }
 
-                let is_shift = matches!(key, 42 | 54);
-                // Alt 组合一律直通应用（不改）。Ctrl 组合交给引擎：组合内光标编辑
-                // （C-b/C-f/C-h）、翻页 C-n/C-p、C-. 标点切换都从这里进；引擎返回
-                // Ignored 时照常放行 —— 无组合时 Ctrl+C/V/W 等必须原样到达应用，
-                // 否则用户连复制都不能用。Ctrl 键本身（code 29/97，ch=None）在引擎
-                // 里落不进任何组合分支 → Ignored → 转发，Ctrl 按下/松开与应用一致。
-                if state.alt {
+                if is_shift {
+                    // 引擎就绪且无组合 → press 什么都不做，裁决推迟到 release；
+                    // 有组合/引擎缺失 → 老路径原样（press 立即喂引擎，可触发顶串切英文）。
+                    if state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|e| e.preedit().is_empty())
+                    {
+                        state.swallowed.consume(key);
+                        state.shift_gesture.on_shift_press(now_ms());
+                    } else {
+                        state.engine_press(key, time, false, qh);
+                    }
+                    return;
+                }
+                // Shift 按住期间的任何其他键（含方向/Home/End、Ctrl/Alt 组合、字母）：
+                // 一律原样透传，不碰引擎 → 不进拼音、不改模式。字母呈大写形态，靠的
+                // 是 vk.modifiers 实时同步的合成器 shift 位，应用自己 xkb 解码。
+                // Alt 组合一律直通应用（不改）也走这同一条 forward。
+                if state.shift_gesture.on_key_press() || state.alt {
                     state.forward_key(time, key, true);
                     return;
                 }
                 // xkb 取代手写码表：功能键（含空格/Enter/Esc）utf32 为空或控制字符
-                // → None，由引擎按 code 处理。
-                let ch = state.keyboard.key_char(key);
-
-                let mode_before = state.engine.as_ref().map_or(true, |e| e.chinese());
-                let Some(engine) = state.engine.as_mut() else {
-                    state.forward_key(time, key, true);
-                    return;
-                };
-                let key_struct = Key {
-                    ch,
-                    code: key,
-                    shift: is_shift,
-                    ctrl: state.ctrl,
-                    alt: state.alt,
-                };
-                match engine.key(key_struct) {
-                    Outcome::Consumed => {
-                        state.swallowed.consume(key);
-                        state.apply_consumed(qh);
-                    }
-                    Outcome::Commit(text) => {
-                        state.swallowed.consume(key);
-                        state.apply_commit(text, qh);
-                    }
-                    Outcome::Ignored => {
-                        // 长按自动重复可能让同一个键从「被消费」中途变成「放行」（组合恰被删空）。
-                        // 转发 press 前必须销掉旧记账：否则 release 被残留标记吃掉，
-                        // 应用以为键一直没松 → 幽灵连发（backspace 停不下来的根因）。
-                        state.swallowed.forward(key);
-                        state.forward_key(time, key, true);
-                    }
-                }
-                // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
-                // 闪一次对应模式字，下一次按键收掉。
-                let mode_now = state.engine.as_ref().map_or(mode_before, |e| e.chinese());
-                if mode_now != mode_before {
-                    if let Some(canvas) = state.popup.as_mut() {
-                        canvas.flash_chip(mode_now, qh);
-                    }
-                }
-                state.try_recv_llm(qh);
+                // → None，由引擎按 code 处理。引擎路径（消费/上屏/放行 + 重复起表）
+                // 收敛在 engine_press 一处。
+                state.engine_press(key, time, false, qh);
             }
             _ => {}
         }
@@ -1075,8 +1171,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.try_bind_vk(&qh);
     log("event loop");
 
+    // 手写 poll 循环取代 blocking_dispatch：合成器不给 IM grab 投 repeat，长按节奏
+    // 要靠本循环在「无 wayland 事件」时也被定时器叫醒；poll 超时本身充当计时器，
+    // 不引 calloop/timerfd 任何新依赖（libc 已在依赖树）。
+    let backend = app.conn.as_ref().expect("conn set above").backend();
+    let display_fd = backend.poll_fd().as_raw_fd();
     while !app.should_exit {
-        event_queue.blocking_dispatch(&mut app)?;
+        event_queue.flush()?;
+        let timeout_ms: i32 = match app.repeat.next_due() {
+            Some(due) => due.saturating_sub(now_ms()).min(i32::MAX as u64) as i32,
+            None => -1,
+        };
+        let mut pfd = [libc::pollfd {
+            fd: display_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: pfd 是有效的单个 pollfd，nfds=1。
+        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), pfd.len() as libc::nfds_t, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err.into());
+        }
+        let woke = pfd[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0;
+        if woke {
+            // 只在 socket 确实可读时进 prepare_read().read()（它会阻塞等数据）。
+            if let Some(guard) = event_queue.prepare_read() {
+                guard.read()?;
+            }
+        } else {
+            app.tick_repeats(&qh);
+        }
+        event_queue.dispatch_pending(&mut app)?;
     }
     log("exit");
     Ok(())

@@ -65,7 +65,8 @@ pub struct Engine {
     candidates: Vec<Candidate>,
     /// 双拼解码表（如小鹤/自然码），用于 shuangpin 模式
     sp: Option<kime_shuangpin::Table>,
-    /// 当前候选对应的读音序列，commit 时用于学习
+    /// 首个切分的读音序列（preedit/光标的显示依据）；learn 仅在被选候选自带
+    /// pinyin 缺失时回退到它
     last_reading: Vec<String>,
     /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
     preedit: String,
@@ -74,6 +75,11 @@ pub struct Engine {
     /// 成对引号状态：`Some(q)` = 刚上屏过 `q` 的开引号，下一次再敲 `q` 出闭引号。
     /// 只覆盖 `"` 与 `'`（rime punctuator 同款最小状态机），其它键一按即重置。
     quote_open: Option<char>,
+    /// 当前中文层一精确命中块的 joined key（音节 `'` 连接，与 `lookup_prefix` 同式）——
+    /// `merge_english` 靠它认出「中文层一之后」的插入点。每次 refresh 刷新，清组合即清空。
+    last_joined: String,
+    /// 上一个键是否为数字（rime `digit_separators`：数字紧跟 ` , . : ` 时保持半角直通）。
+    after_digit: bool,
 }
 impl Engine {
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -111,6 +117,8 @@ impl Engine {
             fuzzy_map,
             punct_mode,
             quote_open: None,
+            last_joined: String::new(),
+            after_digit: false,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -171,11 +179,17 @@ impl Engine {
         self.preedit.clear();
         self.page_index = 0;
         self.cursor = 0;
+        self.last_joined.clear();
     }
 
     /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
     /// / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
+        // 数字标志：数字键无论 outcome（选词命中/放行）都置位，其余任何键清零。
+        let after_digit = std::mem::replace(
+            &mut self.after_digit,
+            k.ch.is_some_and(|c| c.is_ascii_digit()),
+        );
         // 成对标点状态机入口：同一个引号键连按交替 开→闭→开；任何其它键（字母、
         // 空格、ESC、英文模式下的任何东西）都重置回「下一次出开引号」。
         let quote_key = match k.ch {
@@ -317,7 +331,7 @@ impl Engine {
         if k.ch.is_none() && k.code == KEY_SPACE {
             if let Some(top) = self.candidates.first().cloned() {
                 let text = top.text.clone();
-                self.learn_or_warn(&text);
+                self.learn_or_warn(&top);
                 self.clear_composition();
                 return Outcome::Commit(text);
             }
@@ -331,9 +345,11 @@ impl Engine {
             };
             return Outcome::Consumed;
         }
-        // 标点处理：仅中文模式且有映射时生效
+        // 标点处理（中文模式）：全表对齐 rime half_shape（32 条，parity 测试钉死）；
+        // digit_sep/ctrl/alt 组合不入映射，落到底部 Ignored 直通。
         if let Some(c) = k.ch {
-            if let Some(mapped) = punct::map_punct(c) {
+            let digit_sep = after_digit && matches!(c, ',' | '.' | ':');
+            if let Some(mapped) = punct::map_punct(c).filter(|_| !digit_sep && !k.ctrl && !k.alt) {
                 // 英文标点模式：不转换，原样输出（也不维护引号状态）
                 if self.punct_mode == crate::config::PunctMode::English {
                     self.quote_open = None;
@@ -358,7 +374,7 @@ impl Engine {
                         // 情况 B：顶字上屏，拼接标点
                         let text = top.text.clone();
                         let commit_text = format!("{}{}", text, mapped);
-                        self.learn_or_warn(&text);
+                        self.learn_or_warn(&top);
                         self.clear_composition();
                         return Outcome::Commit(commit_text);
                     } else {
@@ -389,7 +405,7 @@ impl Engine {
                     let idx = self.page_index * self.page_size() + offset;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
                         let text = cand.text.clone();
-                        self.learn_or_warn(&text);
+                        self.learn_or_warn(&cand);
                         self.clear_composition();
                         return Outcome::Commit(text);
                     }
@@ -444,11 +460,20 @@ fn joined_key(syllables: &[String], tail: &str) -> String {
 }
 
 impl Engine {
-    /// 上屏后记录用户选择。学习失败不影响本次上屏（文本已交给应用），
-    /// 但必须可见：静默丢弃会让用户词永久不生效且无从排查。
-    fn learn_or_warn(&mut self, text: &str) {
-        if let Err(e) = self.dict.learn(&self.last_reading, text) {
-            eprintln!("[kime] 用户词学习失败 ({} → {}): {}", self.preedit, text, e);
+    /// 学习以**被选候选自己的 pinyin** 为准：多切分查询后 last_reading 只反映首切分
+    /// （打 "dangao" 选「蛋糕」时它是 ["dang"]），拿它学习会把用户词学到错误读音下。
+    /// 候选自带读音 = pinyin 按 `'` 切分；外部注入（AI）候选没带时回退 last_reading。
+    fn learn_or_warn(&mut self, cand: &Candidate) {
+        let reading: Vec<String> = if cand.pinyin.is_empty() {
+            self.last_reading.clone()
+        } else {
+            cand.pinyin.split('\'').map(str::to_string).collect()
+        };
+        if let Err(e) = self.dict.learn(&reading, &cand.text) {
+            eprintln!(
+                "[kime] 用户词学习失败 ({} → {}): {}",
+                self.preedit, cand.text, e
+            );
         }
     }
 
@@ -459,6 +484,7 @@ impl Engine {
             self.candidates.clear();
             self.last_reading.clear();
             self.preedit.clear();
+            self.last_joined.clear();
             return;
         }
 
@@ -484,8 +510,10 @@ impl Engine {
             match decoded {
                 Ok(syllables) => {
                     let pending = pending.as_str();
+                    let sp_joined = joined_key(&syllables, pending);
                     self.last_reading = syllables.clone();
                     self.preedit = format!("{}{}", syllables.join(""), pending);
+                    self.last_joined = sp_joined.clone();
                     self.candidates = self
                         .dict
                         .lookup_prefix(&syllables, pending, self.config.candidate_limit)
@@ -511,13 +539,10 @@ impl Engine {
                             // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                             self.last_reading = syllables.clone();
                             self.preedit = format!("{}{}", syllables.join(""), pending);
+                            self.last_joined = sp_joined.clone();
                         }
                         // pending（半截键对）非空时句子没有消耗全部输入 → 不抢层一名次。
-                        Self::place_sentences(
-                            &mut self.candidates,
-                            sentences,
-                            &joined_key(&syllables, pending),
-                        );
+                        Self::place_sentences(&mut self.candidates, sentences, &sp_joined);
                     }
                 }
                 Err(_) => {
@@ -534,10 +559,10 @@ impl Engine {
     }
 
     /// 英文词候选：rime 的英文走独立 translator，匹配**原始按键串**、不做拼音解码，
-    /// 所以双拼/全拼下行为一致。落位：追加在全部中文候选之后（打 `day` 时先看到
-    /// 中文，翻页才有 day）；中文为空时英文独占列表，与输入完全相等的词排第一
-    /// （打 `hello` 不该被中文补全挡住）。两个字母起才查，免得单字母把
-    /// `a/AA/an` 之类的英文噪声灌进每一次按键。
+    /// 所以双拼/全拼下行为一致。落位按层一契约（与 `place_sentences` 同源）：
+    /// **精确消耗输入的英文词属层一**——插到中文层一块之后（中文层一空时即打头），
+    /// 不许被「哦可哦可」这类层二补全压住；前缀补全英文仍挂全部中文之后（打 `day`
+    /// 先看到中文）。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声灌进每一次按键。
     fn merge_english(&mut self) {
         if self.letters.len() < 2 {
             return;
@@ -545,10 +570,26 @@ impl Engine {
         let en = self
             .dict
             .lookup_english(&self.letters, self.config.candidate_limit);
-        self.candidates.extend(en);
+        if en.is_empty() {
+            return;
+        }
+        // lookup_english 恒「精确词在前、补全在后」（见其层内排序契约）；英文条目的
+        // pinyin 就是词本身 → 大小写不敏感相等即精确消耗输入。
+        let exact_end = en
+            .iter()
+            .take_while(|c| c.pinyin.eq_ignore_ascii_case(&self.letters))
+            .count();
+        let l1_end = self
+            .candidates
+            .iter()
+            .take_while(|c| c.pinyin == self.last_joined)
+            .count();
+        self.candidates
+            .splice(l1_end..l1_end, en[..exact_end].iter().cloned());
+        self.candidates.extend_from_slice(&en[exact_end..]);
     }
 
-    /// 全拼路径：segment 切分 + 前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
+    /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
     fn refresh_full_pinyin(&mut self) {
         let segs = segment(&self.letters);
         let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.first().cloned() {
@@ -572,8 +613,9 @@ impl Engine {
 
         self.last_reading = reading.clone();
         self.preedit = self.letters.clone();
+        self.last_joined = joined_key(&reading, &tail);
 
-        // 主路径查询
+        // 主路径查询（首切分，显示与层一契约以它为准）
         let mut cands: Vec<Candidate> = self
             .dict
             .lookup_prefix(&reading, &tail, self.config.candidate_limit)
@@ -617,7 +659,32 @@ impl Engine {
             cands.truncate(self.config.candidate_limit);
         }
 
-        // 若主路径与模糊路径都无候选，回退到缩写查询
+        // 多切分查询（蛋糕 bug）：只查首切分会漏掉整个正确切分——"dangao" 贪心切成
+        // ["dang","ao"]，真词「蛋糕」只在 ["dan","gao"] 里。segment() 的切分数有界
+        // （≤12 字母实测 2–4 条，Fibonacci 级），每条同样带 candidate_limit 查询；
+        // 结果按文本去重后**续在首切分之后**——首切分总序零变化（preedit/层一/英文
+        // 层一的落位契约都不受影响），重复文本保留频率更高的出现。
+        let mut seen_at: std::collections::HashMap<String, usize> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.text.clone(), i))
+            .collect();
+        for extra in segs.iter().skip(1) {
+            let mut r = extra.clone();
+            let t = r.pop().unwrap_or_default();
+            if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
+                for c in vc {
+                    match seen_at.get(&c.text).copied() {
+                        Some(i) => cands[i].freq = cands[i].freq.max(c.freq),
+                        None => {
+                            seen_at.insert(c.text.clone(), cands.len());
+                            cands.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        // 若全部切分的主路径与模糊路径都无候选，回退到缩写查询
         if cands.is_empty() {
             if let Ok(ab) = self
                 .dict
@@ -632,7 +699,7 @@ impl Engine {
             if full_reading.len() >= 2 {
                 let sentences = crate::lattice::viterbi_sentences(&self.dict, full_reading);
                 // 全拼路径：full_reading == reading + [tail]，句子读音恒等于 joined。
-                Self::place_sentences(&mut cands, sentences, &joined_key(&reading, &tail));
+                Self::place_sentences(&mut cands, sentences, &self.last_joined);
             }
         }
 

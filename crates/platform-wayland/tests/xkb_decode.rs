@@ -101,3 +101,72 @@ fn functional_keys_and_space_stay_charless() {
         );
     }
 }
+
+/// evdev：b/f/h，Ctrl 兜底回归用。
+const KEY_B: u32 = 48;
+const KEY_F: u32 = 33;
+const KEY_H: u32 = 35;
+
+/// wl 标准键图 real mod 序号：bit2 = Control。
+const WL_CTRL: u32 = 1 << 2;
+
+#[test]
+fn ctrl_held_letters_decode_via_keysym_fallback() {
+    // 第五轮根因：libxkbcommon 的 key_get_utf32 在 Control 激活时做 XkbToControl
+    // （'f'→0x06），旧 key_char 把它当控制字符过滤成 None → 引擎 C-b/f/h/n/p/.
+    // 分支永不可达（真机不生效、引擎单测却全绿）。兜底改走 key_get_one_sym。
+    let mut kb = us_keyboard();
+    assert_eq!(kb.key_char(KEY_F), Some('f'), "无 Ctrl 时基线不变");
+    kb.update_mods(WL_CTRL, 0, 0, 0);
+    assert_eq!(kb.key_char(KEY_F), Some('f'), "Ctrl+f 必须解出 f 喂引擎");
+    assert_eq!(kb.key_char(KEY_H), Some('h'), "Ctrl+h 必须解出 h");
+    assert_eq!(kb.key_char(KEY_B), Some('b'), "Ctrl+b 必须解出 b");
+    // Ctrl+. 标点模式切换：'.'(0x2e) 不被 XkbToControl 打断，主路径直出——钉住防回归。
+    assert_eq!(kb.key_char(KEY_PERIOD), Some('.'), "Ctrl+. 解出句点");
+    // Shift 与 Ctrl 同按时字母按 shift 层解（大写 F），引擎 ctrl 组合仍命中它的路径。
+    kb.update_mods(WL_CTRL | WL_SHIFT, 0, 0, 0);
+    assert_eq!(kb.key_char(KEY_F), Some('F'), "Ctrl+Shift+f 解出大写 F");
+}
+
+#[test]
+fn ctrl_held_non_letter_combos_stay_charless() {
+    // 白名单只放行 ASCII 字母 + '.'。Ctrl 把下面这些键的 utf32 打成控制字符
+    // （'2'→0x00、'3'→0x1b、'/'→0x1f、Tab/Enter/Esc/Space/BS→0x09/0d/1b/00/08），
+    // 主路径已 None；若兜底不加白名单，key_get_one_sym 会把 '2'/'3'/'/' 重新解出
+    // ——那样浏览器 Ctrl+2 切标签、Ctrl+/ 看快捷键都会被引擎误吞。白名单必须挡住。
+    let mut kb = us_keyboard();
+    kb.update_mods(WL_CTRL, 0, 0, 0);
+    const KEY_2: u32 = 3;
+    const KEY_3: u32 = 4;
+    const KEY_LEFTBRACE: u32 = 26;
+    const KEY_BACKSPACE: u32 = 14;
+    for code in [
+        KEY_2,
+        KEY_3,
+        KEY_SLASH,
+        KEY_LEFTBRACE,
+        KEY_ENTER,
+        KEY_TAB,
+        SPACE,
+        KEY_ESC,
+        KEY_BACKSPACE,
+    ] {
+        assert_eq!(kb.key_char(code), None, "Ctrl+{code} 不该被兜底解成字符");
+    }
+}
+
+#[test]
+fn ctrl_held_printable_survivors_go_through_primary_path() {
+    // 反例锁定：libxkbcommon 的 XkbToControl 只对 >=0x40 生效，'1'/'9'/'0'/','/';' 在
+    // Ctrl 下 utf32 未被打断 → 主路径直接给字符，与我的兜底白名单无关。这是既有行为
+    // （改动前后 key_char 对这些键返回一致），钉住以防兜底误改主路径。
+    let mut kb = us_keyboard();
+    kb.update_mods(WL_CTRL, 0, 0, 0);
+    assert_eq!(kb.key_char(KEY_1), Some('1'));
+    assert_eq!(kb.key_char(KEY_9), Some('9'));
+    assert_eq!(kb.key_char(KEY_COMMA), Some(','));
+    assert_eq!(kb.key_char(KEY_SEMICOLON), Some(';'));
+    // Ctrl+字母全解出：兜底没误伤引擎其余 ctrl 组合（C-n/C-p 翻页等）。
+    assert_eq!(kb.key_char(49 /* n */), Some('n'));
+    assert_eq!(kb.key_char(25 /* p */), Some('p'));
+}
