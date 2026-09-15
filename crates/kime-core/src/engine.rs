@@ -85,8 +85,21 @@ pub struct Engine {
     /// 上下文与组合生命周期无关：commit / Esc 清组合时**保留**它，
     /// 只由平台壳在 surrounding_text 事件到来时整体替换。
     context: Option<String>,
+    /// 词图格子候选缓存（M14）：learn/import 失效，见 lattice::SpanCache。
+    span_cache: crate::lattice::SpanCache,
 }
+
 impl Engine {
+    /// 诊断/测试用：当前词图格子缓存跨度数。
+    pub fn span_cache_len(&self) -> usize {
+        self.span_cache.len()
+    }
+
+    /// 诊断/测试用：词图格子缓存是否为空。
+    pub fn span_cache_is_empty(&self) -> bool {
+        self.span_cache.is_empty()
+    }
+
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
     fn page_size(&self) -> usize {
         if self.config.page_size > 0 {
@@ -120,6 +133,7 @@ impl Engine {
             preedit: String::new(),
             page_index: 0,
             fuzzy_map,
+            span_cache: crate::lattice::SpanCache::default(),
             punct_mode,
             quote_open: None,
             last_joined: String::new(),
@@ -492,6 +506,8 @@ impl Engine {
                 self.preedit, cand.text, e
             );
         }
+        // learn 改了条目 eff → 词图格子缓存整体作废（失效点：凡词库内容/eff 变化）
+        self.span_cache.clear();
     }
 
     /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
@@ -593,8 +609,12 @@ impl Engine {
                     // Viterbi 组词是唯一的候选来源。双拼分支此前完全没接，长句一律 0 候选。
                     if syllables.len() >= 2 {
                         let seed = self.context_seed();
-                        let sentences =
-                            crate::lattice::viterbi_sentences_seeded(&self.dict, &syllables, seed);
+                        let sentences = crate::lattice::viterbi_sentences_seeded(
+                            &self.dict,
+                            &syllables,
+                            seed,
+                            &mut self.span_cache,
+                        );
                         if !sentences.is_empty() && self.candidates.is_empty() {
                             // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                             self.last_reading = syllables.clone();
@@ -801,8 +821,12 @@ impl Engine {
         if let Some(full_reading) = segs.first() {
             if full_reading.len() >= 2 {
                 let seed = self.context_seed();
-                let sentences =
-                    crate::lattice::viterbi_sentences_seeded(&self.dict, full_reading, seed);
+                let sentences = crate::lattice::viterbi_sentences_seeded(
+                    &self.dict,
+                    full_reading,
+                    seed,
+                    &mut self.span_cache,
+                );
                 // 全拼路径：full_reading == reading + [tail]，句子读音恒等于 joined。
                 Self::place_sentences(&mut cands, sentences, &self.last_joined);
             }

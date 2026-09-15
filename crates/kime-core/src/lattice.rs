@@ -67,7 +67,63 @@ pub struct Seed {
 
 /// [`viterbi_sentences_seeded`] 的无种子转发（不变量 b：同输入同输出，含 PATHS_PER_NODE）。
 pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
-    viterbi_sentences_seeded(dict, reading, None)
+    viterbi_sentences_seeded(dict, reading, None, &mut SpanCache::default())
+}
+
+/// 词图格子候选缓存：键 = 跨度的 `'` 连接拼音串，值 = 排好序的 `lookup` 结果。
+///
+/// 敲键是增量的：第 n+1 键的词图只**新增**以它结尾的几个跨度，其余跨度上一键
+/// 都查过——而格子查词是整句转换最贵的一步（qingjian 同款结论，他们借此
+/// 12ms→1ms）。缓存失效由持有方负责：凡词库内容或条目 eff 可能变（learn /
+/// import），整个 clear。超 [`MAX_SPAN_CACHE_ENTRIES`] 上限整体丢弃重建。
+pub struct SpanCache {
+    entries: std::collections::HashMap<String, std::sync::Arc<[Candidate]>>,
+}
+
+/// 缓存容量上限：一次整句的跨度数 = n(n+1)/2，几十音节的句子几百个，8192 足够；
+/// 超过说明失效逻辑漏了，宁可整清不可无限增长。
+pub const MAX_SPAN_CACHE_ENTRIES: usize = 8192;
+
+impl Default for SpanCache {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl SpanCache {
+    /// 取缓存跨度候选；没有就 `compute` 一次并存入。
+    pub fn get_or_compute(
+        &mut self,
+        key: String,
+        compute: impl FnOnce() -> Vec<Candidate>,
+    ) -> std::sync::Arc<[Candidate]> {
+        if let Some(found) = self.entries.get(&key) {
+            return std::sync::Arc::clone(found);
+        }
+        if self.entries.len() >= MAX_SPAN_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        let words: std::sync::Arc<[Candidate]> = compute().into();
+        self.entries.insert(key, std::sync::Arc::clone(&words));
+        words
+    }
+
+    /// 词库内容或条目 eff 变了（learn / import）：全部作废。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// 当前缓存跨度数（测试/诊断用）。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 缓存是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Viterbi 最短路径求解，返回最多 [`PATHS_PER_NODE`] 条文本互异的整句候选（代价升序）。
@@ -92,6 +148,7 @@ pub fn viterbi_sentences_seeded(
     dict: &Dict,
     reading: &[String],
     seed: Option<Seed>,
+    cache: &mut SpanCache,
 ) -> Vec<Candidate> {
     if reading.len() < 2 {
         return Vec::new();
@@ -135,8 +192,12 @@ pub fn viterbi_sentences_seeded(
         }
         for j in (i + 1)..=n {
             let slice = &reading[i..j];
-            // 查词库：最多取 5 个候选，按频次降序
-            let cands = match dict.lookup(slice, 5) {
+            // 查词库（经格子缓存）：最多取 5 个候选，按频次降序。
+            // 跨度查词是整句转换最贵的一步，缓存键 = 跨度拼音串；
+            // lookup 失败不进缓存（词库坏了让下次再试，错误仍每次最多报一次）。
+            let key = slice.join("'");
+            let mut failed = false;
+            let cands = cache.get_or_compute(key, || match dict.lookup(slice, 5) {
                 Ok(c) => c,
                 Err(e) => {
                     // 每次调用最多报一次：词库坏了会让每个跨度都失败，别刷屏
@@ -144,9 +205,13 @@ pub fn viterbi_sentences_seeded(
                         reported_err = true;
                         eprintln!("[kime] 警告：整句联想查词失败 ({e})，本次退化为逐词候选");
                     }
-                    continue;
+                    failed = true;
+                    Vec::new()
                 }
-            };
+            });
+            if failed {
+                continue;
+            }
             // `Dict::lookup` 保证按 freq 降序返回，故 cands[0] 即该跨度最佳词。
             // 每个跨度只放一条最优边：备选路径的多样性由「节点保留 K 条前缀」提供。
             let Some(best) = cands.first() else { continue };
