@@ -23,6 +23,10 @@ pub struct Config {
     /// 模糊音替换对（"zh=z"、"n=l"、"an=ang"）；空 = 关闭
     #[serde(default)]
     pub fuzzy: Vec<String>,
+    /// 邻键纠错（全拼）：直查候选不足时按编辑距离 1（邻键替换/相邻转位）重查。
+    /// 纠错候选永远排在精确结果之后；false = 完全关闭
+    #[serde(default = "default_true")]
+    pub correction: bool,
     /// Binary dict path (optional); loads ~/.local/share/kime/dict.bin if exists
     pub dict_bin_path: Option<String>,
     /// 每页候选数（默认 10）
@@ -59,6 +63,10 @@ fn default_ai_model() -> String {
     "gpt-oss-120b".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         let dict_path = std::env::var("HOME")
@@ -72,6 +80,7 @@ impl Default for Config {
             ai_model: "gpt-oss-120b".to_string(),
             ai_realtime: false,
             fuzzy: Vec::new(),
+            correction: true,
             dict_bin_path: None,
             page_size: 10,
             candidate_limit: 50,

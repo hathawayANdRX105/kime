@@ -30,6 +30,7 @@
 pub mod builder;
 pub mod config;
 pub mod context;
+pub mod correction;
 pub mod dict;
 pub mod engine;
 pub mod lattice;

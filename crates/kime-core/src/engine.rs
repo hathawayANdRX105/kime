@@ -707,6 +707,38 @@ impl Engine {
                 }
             }
         }
+        // 邻键纠错：直查（主路径/模糊/多切分）候选不足时，对按键串生成编辑距离 1
+        // 变体（邻键替换 + 相邻转位）重查。变体复用整条现有管线（segment →
+        // lookup_prefix）；纠错候选续在精确结果之后（seen_at 去重，不抢精确的位）。
+        // correction=false 或候选充足时零开销。放在 abbrev 兜底之前：先纠错、
+        // 纠不中再落缩写垃圾。
+        if self.config.correction && cands.len() < crate::correction::CORRECTION_TRIGGER_MIN {
+            let mut corrected_seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let baseline = segs.first().cloned().unwrap_or_default();
+            for fixed in crate::correction::corrected_keys(&self.letters) {
+                let Some(full) = segment(&fixed).into_iter().next() else {
+                    continue;
+                };
+                // 与原切分完全相同的变体是白查（替换后同音节），跳过
+                if full == baseline {
+                    continue;
+                }
+                let mut r = full;
+                let t = r.pop().unwrap_or_default();
+                if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
+                    for c in vc {
+                        if corrected_seen.insert(c.text.clone()) && !seen_at.contains_key(&c.text) {
+                            seen_at.insert(c.text.clone(), cands.len());
+                            cands.push(c);
+                        }
+                    }
+                }
+                if cands.len() >= self.config.candidate_limit {
+                    break;
+                }
+            }
+        }
         // 若全部切分的主路径与模糊路径都无候选，回退到缩写查询
         if cands.is_empty() {
             if let Ok(ab) = self
