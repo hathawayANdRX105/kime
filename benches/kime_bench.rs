@@ -98,7 +98,7 @@ fn main() {
         let t = Instant::now();
         let n = 50;
         for _ in 0..n {
-            let _ = kime_core::lattice::viterbi_sentence(&dict, &reading);
+            let _ = kime_core::lattice::viterbi_sentences(&dict, &reading);
         }
         println!(
             "5. Viterbi 整句 [{} 音节]: {:.4}ms/次",
