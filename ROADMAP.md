@@ -78,8 +78,22 @@
 - [x] 翻页键增强（`+`/`=` 下一页，`Ctrl+f/b/n/p` Emacs 风格）
 - [x] Enter 原样上屏 + 数字 0 选第 10 个候选
 
-## M10 — 待规划
+## M10 — 候选词优化：用户调频 + 分词混排 ✅ 2026-09-14
+
+- [x] 用户调频（方案 B）：`effective_freq = phrase.freq + (n−1)×300_000×0.5^(age_天/30)`，30 天半衰期；计数存 `kime_kv` 旁表（独立空间，导出 freq 恒为库内原值），FST/SQLite/缩写三条查询路径统一比较器
+- [x] 分词混排：`PATHS_PER_NODE 2→3`（2+2 组合进候选），viterbi 边权改用 effective_freq；实测 `womenzai` 真词「我们再」从第 3 升至第 2，双拼碎切「我么内爱」沉到第 14
+- [x] 回归保护：`freq_boost_test`（BOOST 校准 / 90 天回落 / 前缀层一置顶 / 缩写查询提频）
+
+## M11 — 上下文感知候选 ✅ 2026-09-15
+
+- [x] input-method-v2 `surrounding_text` 四事件捕获（双缓冲 + done 提交，`cause=INPUT_METHOD` 回声过滤）
+- [x] 上文末词 `readings_of_text` 反查作 lattice 虚拟起点（种子先验，不进产出文本）
+- [x] AI 实时候补默认关闭（`ai_realtime = false`）
+- [x] 已知边界：XWayland 应用无上下文 → 优雅退化；调频加成未跨列（见 M10）
+
+## M12 — 待规划
 
 - [ ] XIM 协议前端（解决 XWayland 光标对齐）
 - [ ] 多模式输入（中英混合 + 自定义快捷短语）
 - [ ] 云同步 / 词库同步
+- [ ] 候选词优化续篇：比较器全路径统一 effective_freq（`place_sentences` / top_user）、PATHS_PER_NODE 增大下的碎切抑制、衰减函数长期稳定性
