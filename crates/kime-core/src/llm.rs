@@ -137,6 +137,7 @@ fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
             text: l.trim().to_string(),
             pinyin: syllables.join("'"),
             freq: 1,
+            eff: 1,
             ai: true,
         })
         .take(3)

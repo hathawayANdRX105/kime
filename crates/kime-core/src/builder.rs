@@ -90,6 +90,7 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
             text,
             pinyin: String::new(),
             freq,
+            eff: freq,
             ai: false,
         });
     }

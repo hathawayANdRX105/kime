@@ -66,40 +66,19 @@ fn user_bonus_of(
     (n as f64 * USER_BOOST as f64 * factor) as u64
 }
 
-/// 排序用的有效频率 = 库频 + 提频加成。加成只存在于比较器里：
-/// `Candidate.freq`/`phrase.freq` 保持原始值（「词库频率+次数」），
-/// `user_overlay_test`(5001) / `top_user_works`(5002) / `memory_vs_sql_consistency` 钉的就是它。
-fn entry_eff_freq(
-    stats: &HashMap<(String, String), (u64, u64)>,
-    today: u64,
-    e: &IndexEntry,
-) -> u64 {
-    let raw = e.freq.max(0) as u64;
-    if e.user == 1 {
-        raw + user_bonus_of(stats, today, &e.pinyin, &e.text)
-    } else {
-        raw
-    }
+/// 烘焙进条目的有效频率：user 行 = 裸频 + 提频加成（每行一次 powf，开库/learn 时算），
+/// 语料行 = 裸频。加成只落 `eff` 字段：`Candidate.freq`/`phrase.freq` 保持原始值
+/// （「词库频率+次数」），`user_overlay_test`(5001) / `top_user_works`(5002) /
+/// `memory_vs_sql_consistency` 钉的就是它。比较器因此是纯字段比较——热路径零哈希零 powf。
+fn entry_eff_freq(e: &IndexEntry) -> u64 {
+    e.eff
 }
 
-/// (pinyin ASC, 有效频率 DESC, text ASC) —— 与旧的裸频率序唯一差异在 user 行。
-/// 语料行之间、以及非 user 比较全部退化为裸 u64 比较（百万级索引排序零额外开销，
-/// 查表只可能发生在块内 user 条目参与的比较上，量级 = 用户词数 × log 块长）。
-fn entry_cmp(
-    stats: &HashMap<(String, String), (u64, u64)>,
-    today: u64,
-    a: &IndexEntry,
-    b: &IndexEntry,
-) -> std::cmp::Ordering {
+/// (pinyin ASC, 有效频率 DESC, text ASC) —— 与旧裸频率序的唯一差异在 user 行的 eff。
+fn entry_cmp(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
     a.pinyin
         .cmp(&b.pinyin)
-        .then_with(|| {
-            if a.user == 1 || b.user == 1 {
-                entry_eff_freq(stats, today, b).cmp(&entry_eff_freq(stats, today, a))
-            } else {
-                b.freq.cmp(&a.freq)
-            }
-        })
+        .then_with(|| b.eff.cmp(&a.eff))
         .then_with(|| a.text.cmp(&b.text))
 }
 /// 候选词 — 全链路统一货币：dict 查询产出、engine 排序翻页、AI 层追加
@@ -109,11 +88,15 @@ pub struct Candidate {
     /// 音节 `'` 连接（"ni'hao"）— learn 回写 / 上下文线索用
     pub pinyin: String,
     pub freq: u64,
+    /// 排序用有效频率（语料裸频 + 用户提频加成，开库/learn 时烘焙）。
+    /// `freq` 恒为库内原始值（导出契约），加成只落在这里。
+    pub eff: u64,
     /// true = 来自 AI 预测（UI 标注用）
     pub ai: bool,
 }
 
-/// 内存排序索引条目，按 (pinyin ASC, freq DESC, text ASC) 排序
+/// 内存排序索引条目，按 (pinyin ASC, freq DESC, text ASC) 排序；
+/// `eff` = 排序用有效频率（开库/learn 烘焙，比较器纯字段比较，热路径零哈希零 powf）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     /// 排序键：拼音升序
@@ -126,6 +109,8 @@ pub struct IndexEntry {
     pub abbrev: String,
     /// 用户词标记（0=词库，1=用户词）
     pub user: i64,
+    /// 排序用有效频率（user=1 时 = 裸频 + 提频加成，否则 = 裸频）
+    pub eff: u64,
 }
 
 /// 英文词条目。`key` = `text` 的小写形式（text 恒为纯 ASCII 字母，见 `import_english`）；
@@ -165,6 +150,9 @@ pub struct Dict {
     /// 所有读 freq 的路径（builder、overlay 权威读回、memory_vs_sql 一致性），
     /// 前者只有这一张几十行的旁表，learn 一次 UPSERT，开库一次全量 SELECT。
     user_stats: HashMap<(String, String), (u64, u64)>,
+    /// 有提频记录的拼音集合（user_stats 键的拼音投影）。查询时 O(1) 判断
+    /// 「该拼音块是否可能含提频行」——只有打学到过的拼音才触发块内 eff 重排。
+    user_pinyins: std::collections::HashSet<String>,
     /// `today_days()` 在开库/learn 时刷新的缓存值（比较器热路径不碰系统时钟）。
     today: u64,
 }
@@ -257,7 +245,11 @@ impl Dict {
                 }
             }
         }
-        // If no FST or load failed, load existing index from SQLite
+        // If no FST or load failed, load existing index from SQLite.
+        // SQL 的 ORDER BY 与 entry_cmp 的非用户行序完全一致；eff 在载入时逐行烘焙
+        // （user 行一次 powf，共 ~百行），因此**不再整索引重排**——旧代码在已序结果上
+        // 再跑 192 万行 × O(n log n) 次比较，纯浪费。boost 只影响 user 行在其拼音块内的
+        // 位置，查询时按 user_pinyins 条件重排（见 lookup/lookup_prefix）。
         let mut index: Vec<IndexEntry> = Vec::new();
         if store.is_none() {
             let mut stmt = conn.prepare(
@@ -270,30 +262,39 @@ impl Dict {
                     freq: row.get(2)?,
                     abbrev: row.get(3)?,
                     user: row.get(4)?,
+                    eff: 0,
                 })
             })?;
             index = rows.collect::<Result<Vec<_>, _>>()?;
-            // Sort just in case DB order changed
-            index.sort_by(|a, b| entry_cmp(&user_stats, today, a, b));
+            for e in &mut index {
+                if e.user == 1 {
+                    e.eff = e.freq.max(0) as u64
+                        + user_bonus_of(&user_stats, today, &e.pinyin, &e.text);
+                } else {
+                    e.eff = e.freq.max(0) as u64;
+                }
+            }
         }
         let mut abbrev_index = index.clone();
         abbrev_index.sort_by(|a, b| {
-            a.abbrev.cmp(&b.abbrev).then_with(|| {
-                if a.user == 1 || b.user == 1 {
-                    entry_eff_freq(&user_stats, today, b).cmp(&entry_eff_freq(
-                        &user_stats,
-                        today,
-                        a,
-                    ))
-                } else {
-                    b.freq.cmp(&a.freq)
-                }
-            })
+            a.abbrev
+                .cmp(&b.abbrev)
+                .then_with(|| b.eff.cmp(&a.eff))
+                .then_with(|| a.text.cmp(&b.text))
         });
+        // 有提频记录的拼音集合：查询时判断「该块是否需要按 eff 重排」的 O(1) 依据
+        //（集合是个位到几百条，层一块内重排只在打学到过的拼音时发生）。
+        let user_pinyins: std::collections::HashSet<String> =
+            user_stats.keys().map(|(p, _)| p.clone()).collect();
         // FST 模式下用户词 overlay 全量入内存：热路径靠它，不再每键查 SQLite。
         // 纯 SQLite 模式下 `index` 本身就含用户词，overlay 留空。
         let user_overlay = if store.is_some() {
-            Self::load_user_overlay(&conn)?
+            let mut overlay = Self::load_user_overlay(&conn)?;
+            for e in &mut overlay {
+                e.eff =
+                    e.freq.max(0) as u64 + user_bonus_of(&user_stats, today, &e.pinyin, &e.text);
+            }
+            overlay
         } else {
             Vec::new()
         };
@@ -305,6 +306,7 @@ impl Dict {
             abbrev_index,
             store,
             user_overlay,
+            user_pinyins,
             total_freq,
             english,
             user_stats,
@@ -370,6 +372,7 @@ impl Dict {
             // pinyin 填词本身：主控的分层判断靠它区分「消耗完输入」与「补全」
             pinyin: e.text.clone(),
             freq: e.freq.max(0) as u64,
+            eff: e.freq.max(0) as u64,
             ai: false,
         }
     }
@@ -385,6 +388,7 @@ impl Dict {
                 text: row.get(1)?,
                 freq: row.get(2)?,
                 abbrev: row.get(3)?,
+                eff: 0,
                 user: row.get(4)?,
             })
         })?;
@@ -415,17 +419,15 @@ impl Dict {
         Ok(out)
     }
 
-    /// 候选的排序用有效频率（语料裸频 + 用户提频加成）。
-    /// `Candidate::freq` 本身恒为库内原始值——加成只进比较器，不改导出值。
+    /// 候选的排序用有效频率。eff 在条目构造/learn 时烘焙（含用户提频加成），
+    /// `Candidate::freq` 本身恒为库内原始值——加成不改导出值。
     pub fn effective_freq(&self, c: &Candidate) -> u64 {
-        c.freq + user_bonus_of(&self.user_stats, self.today, &c.pinyin, &c.text)
+        c.eff
     }
 
-    /// (有效频率 DESC, text ASC)——候选层的统一排序键，与 `entry_cmp` 的块内序同式。
+    /// (有效频率 DESC, text ASC)——候选层的统一排序键，纯字段比较（零哈希零 powf）。
     fn cand_cmp(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-        self.effective_freq(b)
-            .cmp(&self.effective_freq(a))
-            .then_with(|| a.text.cmp(&b.text))
+        b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text))
     }
 
     /// 语料总词频。见字段注释：为什么在开库时算。
@@ -443,15 +445,6 @@ impl Dict {
     }
 
     /// 导入 rime-ice `.dict.yaml`：解析 TSV 正文（文字\t拼音\t频率）。
-    ///
-    /// 冲突策略是**频率取大**，不是「先插入者胜」：同一个 `(pinyin, text)` 只保留见过的最高频率。
-    /// rime-ice 的约定是「重复词条时最上面的权重生效」，但 `cn_dicts/41448`（大字表，正文
-    /// 46,031 条**全无频率列**）字典序排在 `cn_dicts/8105`（8,783 条带频率）之前，
-    /// 早先的 `INSERT OR IGNORE` 于是把 8105 的真实频率全部 IGNORE 掉 —— 全库 54% 的行 freq=0，
-    /// 单字在 `(freq DESC, text ASC)` 的候选序里被多音节词彻底压住。
-    /// 现在调用方以什么顺序喂这些表都不影响结果，只需保证别漏文件。
-    ///
-    /// `user = 1`（自学习词）的行完全不参与更新：它们的 freq 是学习次数，不是词库权重。
     ///
     /// 正文里两类行直接丢弃（见循环内注释）：`text` 以 `#` 开头的注释行、
     /// `pinyin` 含非 `a-z`/空格 的数字读法行。
@@ -511,25 +504,26 @@ impl Dict {
                 text: row.get(1)?,
                 freq: row.get(2)?,
                 abbrev: row.get(3)?,
+                eff: 0,
                 user: row.get(4)?,
             })
         })?;
         let mut index: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        index.sort_by(|a, b| entry_cmp(&self.user_stats, self.today, a, b));
+        for e in &mut index {
+            e.eff = if e.user == 1 {
+                e.freq.max(0) as u64
+                    + user_bonus_of(&self.user_stats, self.today, &e.pinyin, &e.text)
+            } else {
+                e.freq.max(0) as u64
+            };
+        }
         self.index = index;
         let mut abbrev_index = self.index.clone();
         abbrev_index.sort_by(|a, b| {
-            a.abbrev.cmp(&b.abbrev).then_with(|| {
-                if a.user == 1 || b.user == 1 {
-                    entry_eff_freq(&self.user_stats, self.today, b).cmp(&entry_eff_freq(
-                        &self.user_stats,
-                        self.today,
-                        a,
-                    ))
-                } else {
-                    b.freq.cmp(&a.freq)
-                }
-            })
+            a.abbrev
+                .cmp(&b.abbrev)
+                .then_with(|| b.eff.cmp(&a.eff))
+                .then_with(|| a.text.cmp(&b.text))
         });
         self.abbrev_index = abbrev_index;
         // 批量灌词后总量变了，缓存必须跟着刷新（否则刚导入的库整句代价用旧概率）
@@ -642,6 +636,7 @@ impl Dict {
             text: e.text.clone(),
             pinyin: e.pinyin.clone(),
             freq: e.freq as u64,
+            eff: e.eff,
             ai: false,
         }
     }
@@ -696,6 +691,7 @@ impl Dict {
                 text: entry.text.clone(),
                 pinyin: entry.pinyin.clone(),
                 freq: entry.freq as u64,
+                eff: entry.eff,
                 ai: false,
             });
         }
@@ -800,16 +796,30 @@ impl Dict {
             .iter()
             .take_while(|e| e.pinyin == joined)
             .count();
-        let mut out: Vec<Candidate> = self.index[start..]
-            .iter()
-            .take_while(|e| e.pinyin == joined)
-            .map(Self::entry_to_candidate)
-            .take(if tail.is_empty() {
-                limit
-            } else {
-                limit.div_ceil(2)
-            })
-            .collect();
+        // 层一：精确块。块内 eff 重排只在「打的是学到过的拼音」时发生（user_pinyins
+        // O(1) 判断）——开库不再整索引重排后，boost 在这里按需生效；此时必须先取
+        // 整块再截断，否则被 boost 抬进 top 的词还在 take 之外就被丢了。
+        let cap = if tail.is_empty() {
+            limit
+        } else {
+            limit.div_ceil(2)
+        };
+        let mut out: Vec<Candidate> = if self.user_pinyins.contains(joined.as_str()) {
+            let mut block: Vec<Candidate> = self.index[start..start + exact_len]
+                .iter()
+                .map(Self::entry_to_candidate)
+                .collect();
+            block.sort_by(|a, b| self.cand_cmp(a, b));
+            block.truncate(cap);
+            block
+        } else {
+            self.index[start..]
+                .iter()
+                .take_while(|e| e.pinyin == joined)
+                .map(Self::entry_to_candidate)
+                .take(cap)
+                .collect()
+        };
         let (lo, hi) = if tail.is_empty() {
             let lower = format!("{joined}'");
             let upper = increment_prefix(&lower).unwrap_or_else(|| lower.clone());
@@ -882,6 +892,7 @@ impl Dict {
                     text: e.text.clone(),
                     pinyin: e.pinyin.clone(),
                     freq: e.freq as u64,
+                    eff: e.eff,
                     ai: false,
                 })
                 .collect();
@@ -969,6 +980,8 @@ impl Dict {
                         params![&joined, text],
                         |row| row.get(0),
                     )?;
+                    let eff =
+                        freq as u64 + user_bonus_of(&self.user_stats, self.today, &joined, text);
                     let pos = self.user_overlay.partition_point(|e| e.pinyin < joined);
                     self.user_overlay.insert(
                         pos,
@@ -977,6 +990,7 @@ impl Dict {
                             text: text.to_string(),
                             freq,
                             abbrev,
+                            eff,
                             user: 1,
                         },
                     );
@@ -993,12 +1007,27 @@ impl Dict {
         {
             entry.freq += 1;
             entry.user = 1;
+            entry.eff = entry.freq.max(0) as u64
+                + user_bonus_of(&self.user_stats, self.today, &entry.pinyin, &entry.text);
+            // abbrev_index 同行同步：查询层的 cand_cmp 只读 eff 字段，不同步的话
+            // 缩写路径永远看不到本轮提频（旧实现靠 cand_cmp 现算 stats 掩盖）。
+            if let Some(ae) = self
+                .abbrev_index
+                .iter_mut()
+                .find(|e| e.pinyin == joined && e.text == text)
+            {
+                ae.freq = entry.freq;
+                ae.user = 1;
+                ae.eff = entry.eff;
+            }
         } else {
+            let eff = 1u64 + user_bonus_of(&self.user_stats, self.today, &joined, text);
             let new_entry = IndexEntry {
                 pinyin: joined,
                 text: text.to_string(),
                 freq: 1,
                 abbrev,
+                eff,
                 user: 1,
             };
             let pos = self.index.partition_point(|e| e.pinyin < new_entry.pinyin);
@@ -1010,15 +1039,13 @@ impl Dict {
         }
         // 使用即提升当场生效：层一候选直接按 index 的块序吐，本轮统计变了就得重排
         // joined 块（旧 +1 语义几乎不换序，加成让 n≥2 的选词立刻顶到块首）。
-        let stats = &self.user_stats;
-        let today = self.today;
         let lo = self
             .index
             .partition_point(|e| e.pinyin.as_str() < stats_key.0.as_str());
         let hi = self
             .index
             .partition_point(|e| e.pinyin.as_str() <= stats_key.0.as_str());
-        self.index[lo..hi].sort_by(|a, b| entry_cmp(stats, today, a, b));
+        self.index[lo..hi].sort_by(entry_cmp);
         Ok(())
     }
 }

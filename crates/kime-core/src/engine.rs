@@ -1568,6 +1568,7 @@ mod tests {
             text: "你好世界".to_string(),
             pinyin: "ni'hao".to_string(),
             freq: 1,
+            eff: 1,
             ai: true,
         }];
         e.merge_ai(ai);
@@ -1591,6 +1592,7 @@ mod tests {
             text: "你好".to_string(),
             pinyin: "ni'hao".to_string(),
             freq: 1,
+            eff: 1,
             ai: true,
         }];
         e.merge_ai(ai);

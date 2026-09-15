@@ -317,6 +317,7 @@ impl FstStore {
                 text: String::from_utf8_lossy(text).into_owned(),
                 pinyin,
                 freq,
+                eff: freq,
                 ai: false,
             });
         }
@@ -679,6 +680,7 @@ fn decode_block(data: &[u8], pinyin: &str, limit: usize) -> Vec<Candidate> {
             text,
             pinyin: pinyin.to_string(),
             freq,
+            eff: freq,
             ai: false,
         });
     }

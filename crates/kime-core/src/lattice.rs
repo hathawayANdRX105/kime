@@ -180,11 +180,15 @@ pub fn viterbi_sentences_seeded(
     };
     finals
         .into_iter()
-        .map(|p| Candidate {
-            text: p.text,
-            pinyin: p.pinyin,
-            freq: sentence_score(p.ln_freq_sum, p.words, total),
-            ai: false,
+        .map(|p| {
+            let score = sentence_score(p.ln_freq_sum, p.words, total);
+            Candidate {
+                text: p.text,
+                pinyin: p.pinyin,
+                freq: score,
+                eff: score,
+                ai: false,
+            }
         })
         .collect()
 }

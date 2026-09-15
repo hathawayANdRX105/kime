@@ -9,7 +9,7 @@ fn main() {
     println!("=== kime 性能基准测试 ===");
     println!("词库: {db_path} / FST: {bin_path}");
 
-    if !Path::new(db_path).exists() {
+    if !Path::new(&db_path).exists() {
         eprintln!("词库文件未找到: {}，请先运行数据准备", db_path);
         return;
     }
@@ -60,9 +60,9 @@ fn main() {
     );
 
     // 4. FST 查询 (如果存在)
-    if Path::new(bin_path).exists() {
+    if Path::new(&bin_path).exists() {
         let t = Instant::now();
-        let store = match kime_core::store::FstStore::open(Path::new(bin_path)) {
+        let store = match kime_core::store::FstStore::open(Path::new(&bin_path)) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("打开 FST 失败: {e}");
