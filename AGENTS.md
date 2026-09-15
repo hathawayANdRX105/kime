@@ -9,7 +9,7 @@
 ## 开发方式
 
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
-- 本地只跑 `cargo check`（轻量验证）；**全量构建/测试/bench 放 PR 的 CI，本地不跑**。CPU-heavy 命令必须套 `cpulimit -l 65 -i --`。
+- 本地只跑 `cargo check`（轻量验证）；**全量构建/测试放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test），本地不跑**。bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
 - 本地有 192 万词条的 SQLite 库（`~/.local/share/kime/dict.sqlite3`），跑基准时优先复用。
 
 ## `.wt/` 工作目录保护（硬约束）
