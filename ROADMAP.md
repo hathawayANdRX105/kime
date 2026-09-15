@@ -97,7 +97,21 @@
 - [x] 双拼半截键补全：零声母键（y/w/元音）公共前缀塌缩 → 枚举完整音节、末音节匹配词置顶；`ke`+`y` → ke'yi 词在前，单键 `y` → yi 系词在前（有公共前缀的键 u→sh 行为不变）
 - [x] 回归：`correction_test`（转位/替换/充足不纠错/关闭不纠错）+ `shuangpin_tail_test`（key 补全/单键简拼/偶数键不变）
 
-## M13 — 待规划
+## M13 — 性能轮：有效频率烘焙 + 纠错门控 ✅ 2026-09-15
+
+- [x] **eff 烘焙进条目**（`IndexEntry.eff` / `Candidate.eff` = 裸频 + 用户提频，开库/learn 每用户行一次 powf）：比较器变纯字段比较（消灭每次比较的 String 分配 + 哈希 + powf），Viterbi 整句 7 音节 **7.5 倍**（0.28→0.037ms）
+- [x] 删开库/导入时对已 `ORDER BY` 结果的全量重排；boost 改为查询时按 `user_pinyins` 门控的块内重排（`lookup_prefix` 层一此时先取整块再截断）
+- [x] **纠错门控**（修 20x 回归）：`kime_pinyin::is_fully_segmentable` 零分配预筛变体 + `MAX_CORRECTION_INPUT=12` 字母长度门控（长句容错归 Viterbi）；27 键长句最慢键 4.4→0.29ms
+- [x] `examples/typing_probe` 逐键探针（qingjian `--typing` 同款：逐键增量才是真实负载）+ CI `perf` 作业（合成 10 万词库基准进 job summary，continue-on-error）
+- [x] 判定记录：rayon **不加**（每键微秒级，调度反噬）；FST 层二 shen'me 慢 10 倍 = 1355 续接 key 的剪枝线性扫（算法地板，不动）；eytzinger 不适用（kime 要返回区间位置，换算成本反转收益，algorchemy doc 实测）
+
+## M14 — 词图格子缓存（SpanCache）🔨 开发中
+
+- [ ] lattice 跨度查词缓存：键 = 拼音跨度模式，值 = `Arc<[Candidate]>`；失效条件 = learn/词库变更（qingjian 同款：整句转换最贵的是格子查词，相邻两键 90% 格子重复，他们 12ms→1ms）
+- [ ] 验收：逐键探针长句平均不回退 + 缓存命中正确性对拍 + learn 后失效
+- [ ] 远期：双层词库（热层 FST 常驻堆 + 冷层 mmap 按需）——词库到千万级时的内存扩展性保险
+
+## M15 — 待规划
 
 - [ ] XIM 协议前端（解决 XWayland 光标对齐）
 - [ ] 多模式输入（中英混合 + 自定义快捷短语）
