@@ -9,7 +9,7 @@
 ## 开发方式
 
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
-- 本地只跑 `cargo check`；CPU-heavy 命令必须套 `cpulimit -l 60 -i --`。
+- 本地只跑 `cargo check`（轻量验证）；**全量构建/测试/bench 放 PR 的 CI，本地不跑**。CPU-heavy 命令必须套 `cpulimit -l 65 -i --`。
 - 本地有 192 万词条的 SQLite 库（`~/.local/share/kime/dict.sqlite3`），跑基准时优先复用。
 
 ## `.wt/` 工作目录保护（硬约束）
@@ -41,7 +41,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 ### cpulimit（硬约束）
 
-- 编译、测试、装包、基准测试一律加限制：`cpulimit -l 60 -i -- cargo <cmd>`。
+- 编译、测试、装包、基准测试一律加限制：`cpulimit -l 65 -i -- cargo <cmd>`。
 - git、grep、文件读写等轻量命令不需要。
 
 ### 键盘/输入法真机会话约定
