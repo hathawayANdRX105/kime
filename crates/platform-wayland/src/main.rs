@@ -902,6 +902,10 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                             log("context: 回声过滤（cause=INPUT_METHOD），不推引擎");
                         }
                         ContextCommit::Apply(tail) => {
+                            match &tail {
+                                Some(t) => log(&format!("context: 提交上下文尾巴（{t}）")),
+                                None => log("context: 无可用上下文（cursor 非法或句首），清空"),
+                            }
                             engine.set_context(tail);
                             // 上下文一变立刻重排（组合在途时才有可见效果；
                             // 空组合是 no-op）。不在按键路径里调。
