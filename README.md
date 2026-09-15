@@ -20,6 +20,8 @@ platform-mac/         （规划中）macOS IMKit 壳
 - **Word Lattice + Viterbi**：多切分查询（蛋糕 bug）、k-best 整句联想、概率代价模型（计数比会碎切占便宜，实测「知道」输给「知+道」的病态已钉回归）
 - **用户调频（方案 B）**：选词即提升 + 30 天半衰期衰减，`kime_kv` 旁表计数；加成只进比较器，导出频率恒为库内原值
 - **4 音节混排**：`PATHS_PER_NODE=3`，2+2 组合与整句同列按频率排
+- **邻键纠错（第七轮）**：直查候选不足时按编辑距离 1（QWERTY 邻键替换 + 相邻转位）重查，`xain`→「先/现/线」、`zhant`→zhang 词；纠错候选永远排在精确结果之后，`correction = false` 可关
+- **双拼半截键补全**：零声母半截键（y/w/元音，公共前缀塌缩为空）枚举完整音节、末音节匹配的词优先——ziranma `ke`+`y` → 「可以」类 ke'yi 词置顶，单键 `y` → yi 系词在前；有公共前缀的键（u→sh）行为不变
 
 ### 上下文感知（第六轮）
 - **surrounding_text 捕获**：input-method-v2 四事件（surrounding_text / text_change_cause / content_type / done）双缓冲批处理，done 才提交
