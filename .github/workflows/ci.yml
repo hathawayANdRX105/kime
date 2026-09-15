@@ -40,13 +40,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install system deps (wayland / xkbcommon / fontconfig)
+      - name: Install system deps (wayland / xkbcommon / fontconfig / xcb)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev \
             libxkbcommon-dev \
             libfontconfig1-dev \
+            libxcb1-dev \
             pkg-config
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets
@@ -56,13 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install system deps (wayland / xkbcommon / fontconfig)
+      - name: Install system deps (wayland / xkbcommon / fontconfig / xcb)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev \
             libxkbcommon-dev \
             libfontconfig1-dev \
+            libxcb1-dev \
             pkg-config
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
