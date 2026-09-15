@@ -2,6 +2,8 @@
 //!
 //! 给定一段由 `segment` 产生的完整音节切分 `reading: &[String]`（长度 > 1），
 //! 构建 Word Lattice 并在其上跑 Viterbi 最短路径，输出最优组合词序列。
+//! [`viterbi_sentences_seeded`] 额外把光标前已上屏的末词（[`Seed`]）当作虚拟起点词，
+//! 其先验概率计入联合概率，但不进产出候选的文本（只上屏新组合）。
 
 use crate::dict::{Candidate, Dict};
 
@@ -48,16 +50,49 @@ struct Path {
 /// 且 place_sentences 按分数在补全区落位。
 const PATHS_PER_NODE: usize = 3;
 
+/// 上文末词种子（上下文感知组句）：把光标前已上屏的最后一个词当作**虚拟起点词**。
+///
+/// - `reading` = 该词拼音（`'` 连接，如 `"wo'men"`），`freq` = 库内裸频
+///   （由 [`crate::dict::Dict::readings_of_text`] 反查得到）。
+/// - 种子贡献的是**先验概率**，不是输出词：其 `-ln(p)` 进路径代价、`ln(freq)` 进
+///   `ln_freq_sum`、`words` 计 +1，但产出候选的 `text`/`pinyin` **恒不含种子部分**
+///   （只上屏新组合，见 [`viterbi_sentences_seeded`] 的不变量 a）。
+/// - `reading` 因此不参与构造候选 pinyin，只用于诊断/可追溯：引擎据此知道种子来自
+///   哪一路反查命中，`None` = 无上下文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seed {
+    pub reading: String,
+    pub freq: u64,
+}
+
+/// [`viterbi_sentences_seeded`] 的无种子转发（不变量 b：同输入同输出，含 PATHS_PER_NODE）。
+pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
+    viterbi_sentences_seeded(dict, reading, None)
+}
+
 /// Viterbi 最短路径求解，返回最多 [`PATHS_PER_NODE`] 条文本互异的整句候选（代价升序）。
 ///
 /// - `reading`: 由 `segment` 产生的完整音节切分，长度需 ≥ 2
+/// - `seed`: 光标前已上屏的末词（[`Seed`]）。`Some` 时它占据虚拟起点 `dp[0]`，
+///   代价/概率/词数都算它的，但 `text`/`pinyin` 留空——产出的候选只含本次输入的新组合。
 /// - 代价函数：`cost = BASE_COST - ln(p) * FREQ_WEIGHT + WORD_PENALTY`，
 ///   其中 `p = freq / 语料总词频`。**必须是概率而不是计数**：多词路径的概率是相乘的，
 ///   用计数比就等于拿 `f(知)×f(道)` 压 `f(知道)`，切得越碎越占便宜（实测「知道」501,255
-///   永远输给「知+道」4.4e6×1.06e6，整句吐出「只到」这类错字）。
+///   永远输给「知+道」4.4e6×1.06e6，整句吐出「只到」这类错字）。种子与普通边同式计价。
 /// - 词数惩罚：每个词 +50，鼓励合词而非全碎成单字
 /// - 候选 `freq` 取 [`sentence_score`]，让整句在层一里按联合概率参与排序。
-pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
+///
+/// 三个不变量（`tests/context_seed_test.rs` 逐条钉住）：
+/// a) 产出 `text`/`pinyin` 恒不含种子部分（种子是先验，不进上屏文本）；
+/// b) `seed = None` 时与 [`viterbi_sentences`] 完全一致（转发即证明）；
+/// c) `sentence_score` 量纲不变：种子只把 `ln_freq_sum`/`words` 整体平移，
+///    不改变候选集合与代价序——种子让长联合（`words` 更大）按 `T` 指数与
+///    ÷100/词 惩罚相对贬值，短补真词相对升值，量纲仍在 `freq` 的可比尺度内。
+pub fn viterbi_sentences_seeded(
+    dict: &Dict,
+    reading: &[String],
+    seed: Option<Seed>,
+) -> Vec<Candidate> {
     if reading.len() < 2 {
         return Vec::new();
     }
@@ -65,16 +100,31 @@ pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
     let n = reading.len();
     // dp[i] = 到节点 i 的最优若干条路径（代价升序、文本互异）
     let mut dp: Vec<Vec<Path>> = (0..n + 1).map(|_| Vec::new()).collect();
-    dp[0].push(Path {
-        cost: 0.0,
-        text: String::new(),
-        pinyin: String::new(),
-        ln_freq_sum: 0.0,
-        words: 0,
-    });
-    let mut reported_err = false;
-    // 词频换算成概率才可比（见函数头对代价函数的说明）。一次查询，缓存住。
+    // 种子 = 虚拟起点词：占据 dp[0]，概率代价照算，text/pinyin 留空（不变量 a）。
+    // 无种子时起点与旧实现逐字段相同（不变量 b）。
     let total = dict.total_freq() as f64;
+    let start = match seed {
+        Some(s) => {
+            let eff = s.freq.max(1) as f64;
+            let p = eff / total;
+            Path {
+                cost: BASE_COST - p.ln() * FREQ_WEIGHT + WORD_PENALTY,
+                text: String::new(),
+                pinyin: String::new(),
+                ln_freq_sum: eff.ln(),
+                words: 1,
+            }
+        }
+        None => Path {
+            cost: 0.0,
+            text: String::new(),
+            pinyin: String::new(),
+            ln_freq_sum: 0.0,
+            words: 0,
+        },
+    };
+    dp[0].push(start);
+    let mut reported_err = false;
 
     // 对每个起点 i，尝试所有终点 j (i < j <= n)。边恒向前：节点 i 处理完后
     // 不会再收到新路径，整段直接 take 走，避开 dp[i] 与 dp[j] 的双重可变借用。

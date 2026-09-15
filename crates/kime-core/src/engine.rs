@@ -10,6 +10,7 @@
 
 use crate::config::Config;
 use crate::dict::{Candidate, Dict};
+use crate::lattice::Seed;
 use crate::punct;
 use kime_pinyin::segment;
 
@@ -495,7 +496,11 @@ impl Engine {
 
     /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
     /// 兜底 lookup_abbrev。维护 self.last_reading 与 self.preedit。
-    fn refresh_candidates(&mut self) {
+    ///
+    /// 平台壳在上下文变化（input-method-v2 的 `done` 提交 surrounding_text）后调一次：
+    /// 壳写完 `set_context` 立刻调它，候选即按新上下文重排，不必等下一次按键。
+    /// 按键路径内部在组合变化时自动调，壳层请勿在按键路径里重复调。
+    pub fn refresh_candidates(&mut self) {
         if self.letters.is_empty() {
             self.candidates.clear();
             self.last_reading.clear();
@@ -550,7 +555,9 @@ impl Engine {
                     // 整句联想：词库没有整串词条时（「我不知道你说的是什么」这类长句），
                     // Viterbi 组词是唯一的候选来源。双拼分支此前完全没接，长句一律 0 候选。
                     if syllables.len() >= 2 {
-                        let sentences = crate::lattice::viterbi_sentences(&self.dict, &syllables);
+                        let seed = self.context_seed();
+                        let sentences =
+                            crate::lattice::viterbi_sentences_seeded(&self.dict, &syllables, seed);
                         if !sentences.is_empty() && self.candidates.is_empty() {
                             // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                             self.last_reading = syllables.clone();
@@ -713,13 +720,55 @@ impl Engine {
         // 句级联想（M8/Task 5）：如果有完整音节切分且长度 >= 2，尝试通过 Viterbi 构词成句
         if let Some(full_reading) = segs.first() {
             if full_reading.len() >= 2 {
-                let sentences = crate::lattice::viterbi_sentences(&self.dict, full_reading);
+                let seed = self.context_seed();
+                let sentences =
+                    crate::lattice::viterbi_sentences_seeded(&self.dict, full_reading, seed);
                 // 全拼路径：full_reading == reading + [tail]，句子读音恒等于 joined。
                 Self::place_sentences(&mut cands, sentences, &self.last_joined);
             }
         }
-
         self.candidates = cands;
+    }
+
+    /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
+    ///
+    /// 窗口 = 光标前末 1..=4 字：先试 4 字词、再 3、2、1，取频率最高的命中作种子
+    /// （`readings_of_text` 每个长度内已按 freq DESC，这里跨长度取最大）。全部 miss
+    /// → `None`（无种子，`viterbi_sentences_seeded` 退化为旧行为）。每键最多 4 次
+    /// `idx_phrase_text` 点查（O(log n)）——lattice 自身已是 O(n²) 次查词，这里不构成
+    /// 新瓶颈；没加 (tail → seed) 缓存：单次索引点查在微秒级，缓存省不回它的复杂度。
+    ///
+    /// ASCII 上下文（英文/数字）直接 `None`：latin 无 lattice，且 merge_english 的
+    /// 层一排序必须与无上下文完全一致（回归测试钉住）。纯中文标点尾巴查无命中，
+    /// 同样落 `None`。
+    fn context_seed(&self) -> Option<Seed> {
+        let tail = self.context_tail()?;
+        // 末 4 字窗口（按字符，非字节）：上文末词至多按 4 字词反查。
+        let chars: Vec<char> = tail.chars().collect();
+        let window: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+        if window.bytes().any(|b| b.is_ascii()) {
+            return None;
+        }
+        let mut best: Option<(String, u64)> = None;
+        let mut text: &str = &window;
+        while !text.is_empty() {
+            if let Ok(hits) = self.dict.readings_of_text(text, 4) {
+                if let Some((reading, freq)) = hits.into_iter().next() {
+                    match &best {
+                        Some((_, bf)) if *bf >= freq => {}
+                        _ => best = Some((reading, freq)),
+                    }
+                }
+            }
+            // 砍掉窗口首字符：4 → 3 → 2 → 1，窗口始终贴着光标。
+            let next = text
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
+            text = &text[next..];
+        }
+        best.map(|(reading, freq)| Seed { reading, freq })
     }
 
     /// 整句候选名次（工单第 4 条）：覆盖全部输入音节的句子属层一——
