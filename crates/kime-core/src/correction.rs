@@ -93,3 +93,7 @@ pub fn corrected_keys(letters: &str) -> Vec<String> {
 
 /// 直查候选低于该数时才触发纠错（正常输入零开销的开关）。
 pub(crate) const CORRECTION_TRIGGER_MIN: usize = 5;
+
+/// 纠错输入长度上限（字母）：6 音节全拼 = 12。更长的输入是句子，
+/// 容错由 Viterbi 多切分承担，编辑距离枚举在那里只有成本没有收益。
+pub(crate) const MAX_CORRECTION_INPUT: usize = 12;

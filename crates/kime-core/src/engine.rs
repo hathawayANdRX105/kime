@@ -749,11 +749,22 @@ impl Engine {
         // lookup_prefix）；纠错候选续在精确结果之后（seen_at 去重，不抢精确的位）。
         // correction=false 或候选充足时零开销。放在 abbrev 兜底之前：先纠错、
         // 纠不中再落缩写垃圾。
-        if self.config.correction && cands.len() < crate::correction::CORRECTION_TRIGGER_MIN {
+        // 长度门控：纠错的职责是「词级输入打错键」（≤12 字母 = 6 音节全拼）。
+        // 长句直查候选天然少，纠错枚举只会在 Viterbi 马上要接管的场景白烧 ——
+        // 实测 27 字母长句逐键 4.4ms → 门控后 0.2ms（correction=false 同级）。
+        if self.config.correction
+            && self.letters.len() <= crate::correction::MAX_CORRECTION_INPUT
+            && cands.len() < crate::correction::CORRECTION_TRIGGER_MIN
+        {
             let mut corrected_seen: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             let baseline = segs.first().cloned().unwrap_or_default();
             for fixed in crate::correction::corrected_keys(&self.letters) {
+                // 廉价预筛（qingjian 同款）：变体绝大多数仍是非法串，先用零分配
+                // 可达性 DP 挡掉，幸存的极少数才进完整 segment + lookup。
+                if !kime_pinyin::is_fully_segmentable(&fixed) {
+                    continue;
+                }
                 let Some(full) = segment(&fixed).into_iter().next() else {
                     continue;
                 };

@@ -93,7 +93,7 @@ const SYLLABLES: &[&str] = &[
 ];
 
 /// 二分查表：416 条 → log2 ≈ 9 次比较，零运行时分配。
-fn is_syllable(s: &str) -> bool {
+pub fn is_syllable(s: &str) -> bool {
     SYLLABLES.binary_search(&s).is_ok()
 }
 
@@ -211,4 +211,52 @@ mod tests {
             assert!(seen.insert(*s), "duplicate: {s:?}");
         }
     }
+}
+
+/// 一维可达性 DP：判断按键串能否被完整切分成合法音节（不产出任何切分、零分配）。
+///
+/// 用途：纠错变体的廉价预筛——编辑距离 1 的变体绝大多数仍是非法串，先用它挡掉，
+/// 幸存的极少数才进完整 segment()（qingjian 同款教训：纠错枚举不预筛时逐变体跑
+/// 切分 DP，长句每键几十毫秒）。
+pub fn is_fully_segmentable(letters: &str) -> bool {
+    if letters.is_empty() {
+        return false;
+    }
+    let b = letters.as_bytes();
+    let n = b.len();
+    // reach[i] = 前 i 个字节可切分
+    let mut reach = [false; 33]; // kime 音节最长 6 字母；保守 33 覆盖任意输入前缀长度
+    if n >= 33 {
+        // 超长输入：用滚动窗口（窗口大小 = 最长音节长度）
+        let max_syl = 6usize;
+        let mut window = vec![false; n + 1];
+        window[0] = true;
+        for i in 0..n {
+            if !window[i] {
+                continue;
+            }
+            for l in 1..=max_syl.min(n - i) {
+                if is_syllable_bytes(&b[i..i + l]) {
+                    window[i + l] = true;
+                }
+            }
+        }
+        return window[n];
+    }
+    reach[0] = true;
+    for i in 0..n {
+        if !reach[i] {
+            continue;
+        }
+        for l in 1..=(n - i).min(6) {
+            if is_syllable_bytes(&b[i..i + l]) {
+                reach[i + l] = true;
+            }
+        }
+    }
+    reach[n]
+}
+
+fn is_syllable_bytes(b: &[u8]) -> bool {
+    std::str::from_utf8(b).ok().is_some_and(|s| is_syllable(s))
 }
