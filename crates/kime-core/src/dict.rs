@@ -10,7 +10,9 @@
 //!   abbrev  TEXT    NOT NULL,  -- 声母缩写："nh"
 //!   user    INTEGER NOT NULL DEFAULT 0  -- 0=词库(导入只增) 1=用户词(学习写)
 //! );
-//! -- 索引：(pinyin)、(abbrev) —— 查询恒为 index scan + freq 排序 LIMIT n
+//! -- 索引：(pinyin)、(abbrev)、(text) —— 查询恒为 index scan + freq 排序 LIMIT n；
+//! --   (text) 服务上下文反查 [`Dict::readings_of_text`]，老库 open 时一次性补建
+//! --   （92 万行约数百 ms，发生在用户打第一下之前，可接受）。
 //! -- 英文词另立一表（`english(text PRIMARY KEY, freq)`），见 `import_english`：
 //! -- 它们不是拼音，进 `phrase` 会污染前缀查询。
 //! ```
@@ -221,8 +223,7 @@ impl Dict {
                user    INTEGER NOT NULL DEFAULT 0,
                UNIQUE(pinyin, text)
              );
-             CREATE INDEX IF NOT EXISTS idx_phrase_pinyin  ON phrase(pinyin);
-             CREATE INDEX IF NOT EXISTS idx_phrase_abbrev  ON phrase(abbrev);
+             CREATE INDEX IF NOT EXISTS idx_phrase_text ON phrase(text);
              -- 部分索引：只收 user = 1 的行（个位到几十条）。开库时载入用户词 overlay
              -- 靠它一次 seek 拿到，否则 `WHERE user = 1` 无索引可用 → 全表扫 192 万行（实测 2.6s）。
              CREATE INDEX IF NOT EXISTS idx_phrase_user ON phrase(pinyin) WHERE user = 1;
@@ -703,6 +704,31 @@ impl Dict {
         candidates.sort_by(|a, b| self.cand_cmp(a, b));
         candidates.truncate(limit);
         Ok(candidates)
+    }
+
+    /// 由上屏文本反查读音（上下文感知：光标前已上屏的末词 → 读音 + 频率）。
+    ///
+    /// 精确 `text` 匹配 phrase 表，返回 `(pinyin, freq)`，按 (freq DESC, pinyin ASC) 排序
+    /// LIMIT `limit`——调用方据此选出「上文末词」作为组句种子（见 `lattice::Seed`）。
+    /// 一条 SQL 走 `idx_phrase_text` 点查（O(log n)），每键最多 4 次（末 1..=4 字窗口）。
+    ///
+    /// 两条存储路径共用同一条 SQL：dict.bin 只存 pinyin 键（builder 不建 text 反查索引），
+    /// 所以 FST 模式下文本反查也只能落回 SQLite——该模式 `self.index` 为空，更没有第二条路。
+    /// 返回库内裸频：上文先验是语料级统计，不掺用户提频加成（`learn` 提的频不改变语料先验）。
+    pub fn readings_of_text(&self, text: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        if text.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT pinyin, freq FROM phrase WHERE text = ?1 ORDER BY freq DESC, pinyin ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![text, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
+        })?;
+        rows.collect()
     }
 
     /// 前缀查询（两层合并）：层一 = key 恰等于输入（joined）的词条，层二 = 合法补全。

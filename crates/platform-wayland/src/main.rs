@@ -11,6 +11,7 @@ use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
 use kime_core::{Engine, Outcome};
+use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
 use platform_wayland::route::{key_log_line, route_press, route_release, shell_key, PressAction};
@@ -47,6 +48,18 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 
 fn log(msg: &str) {
     eprintln!("[kime-ime] {msg}");
+}
+
+/// 协议枚举值回退到裸 u32：合成器可能发协议未定义的值（WEnum::Unknown），
+/// 一律当原始数字看，不因枚举缺失丢事件。
+fn wenum_to_u32<T>(e: WEnum<T>) -> u32
+where
+    u32: From<T>,
+{
+    match e {
+        WEnum::Value(v) => u32::from(v),
+        WEnum::Unknown(v) => v,
+    }
 }
 
 /// 逐键路由日志（第五轮「真机不生效、单测全绿」的定罪材料）：每次进
@@ -111,14 +124,13 @@ impl LlmWorker {
             result_sender,
         }
     }
-
-    fn request(&self, syllables: Vec<String>) {
+    fn request(&self, syllables: Vec<String>, context: Option<String>) {
         let client = self.client.clone();
         let debouncer = self.debouncer.clone();
         let sender = self.result_sender.clone();
         self.runtime.spawn(async move {
             if debouncer.should_fire().await {
-                match client.request_async(syllables).await {
+                match client.request_async(syllables, context).await {
                     Ok(candidates) => {
                         let _ = sender.send(candidates);
                     }
@@ -408,6 +420,15 @@ struct AppState {
     repeat: KeyRepeat,
     /// Shift 点击=切换 / 按住期间打字=临时英文不改模式（rime ascii_composer 语义）。
     shift_gesture: ShiftComposer,
+    /// input-method-v2 双缓冲的 pending 状态：事件暂存、done 提交。
+    /// surrounding_text 的 cursor 是字节偏移；cause 缺省 0 = INPUT_METHOD。
+    pending_surrounding: Option<(String, usize)>,
+    pending_cause: u32,
+    /// content_type 本阶段只记录（日志/存字段），不参与决策。
+    pending_content_type: Option<(u32, u32)>,
+    /// 合成器告知的文本输入区（surface-local）。摆位归 zwp_input_popup_surface_v2
+    /// 的 role 与合成器，本字段是「真的被摆位了」的诊断证据，不参与布局。
+    cursor_rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl AppState {
@@ -436,6 +457,10 @@ impl AppState {
             popup: None,
             keyboard: Keyboard::new(),
             repeat: KeyRepeat::default(),
+            pending_surrounding: None,
+            pending_cause: 0,
+            pending_content_type: None,
+            cursor_rect: None,
             shift_gesture: ShiftComposer::default(),
         }
     }
@@ -521,8 +546,10 @@ impl AppState {
                 let engine = Engine::new(dict, config.clone());
                 self.tray.set_chinese(engine.chinese());
                 self.engine = Some(engine);
+                // 实时候补默认关（config.ai_realtime）：上下文分词质量优先，
+                // 想要 LLM 实时候补得显式打开。endpoint 缺失同样不 spawn。
                 let endpoint = config.ai_endpoint.clone().unwrap_or_default();
-                if !endpoint.is_empty() {
+                if config.ai_realtime && !endpoint.is_empty() {
                     let (tx, rx) = channel();
                     let model = config.ai_model.clone();
                     self.llm_worker = Some(LlmWorker::new(endpoint, model, tx));
@@ -576,9 +603,8 @@ impl AppState {
             canvas.hide(qh);
         }
     }
-
     fn apply_consumed(&mut self, qh: &QueueHandle<Self>) {
-        let syllables = {
+        let (syllables, context) = {
             let Some(engine) = self.engine.as_ref() else {
                 return;
             };
@@ -590,11 +616,16 @@ impl AppState {
                 im.set_preedit_string(pe.clone(), 0, cursor);
                 im.commit(self.im_serial);
             }
-            pe.split('\'').map(String::from).collect::<Vec<_>>()
+            // 上下文尾巴随请求一起走：LLM 拿到光标前文才能分词消歧
+            let context = engine.context_tail().map(str::to_string);
+            (
+                pe.split('\'').map(String::from).collect::<Vec<_>>(),
+                context,
+            )
         };
         self.popup_show(qh);
         if let Some(worker) = &self.llm_worker {
-            worker.request(syllables);
+            worker.request(syllables, context);
         }
     }
 
@@ -833,13 +864,55 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
                 state.grab = None;
-                state.swallowed.clear();
                 state.repeat.clear();
                 state.shift_gesture.reset();
                 state.popup_hide(qh);
             }
+            // 协议的双缓冲：这三个事件只改 pending，真正的生效在 done。
+            ZwpInputMethodEvent::SurroundingText {
+                text,
+                cursor,
+                anchor: _,
+            } => {
+                state.pending_surrounding = Some((text, cursor as usize));
+            }
+            ZwpInputMethodEvent::TextChangeCause { cause } => {
+                state.pending_cause = wenum_to_u32(cause);
+            }
+            ZwpInputMethodEvent::ContentType { hint, purpose } => {
+                let (hint, purpose) = (wenum_to_u32(hint), wenum_to_u32(purpose));
+                log(&format!("content_type hint={hint} purpose={purpose}"));
+                state.pending_content_type = Some((hint, purpose));
+            }
             ZwpInputMethodEvent::Done { .. } => {
+                // serial 与现有 im_serial 同源，保持既有 commit 流程不变；
+                // 提交语义（归一 → 截断 → set_context → 刷新）见 plan_context_commit。
                 state.im_serial += 1;
+                let action = plan_context_commit(
+                    state.pending_surrounding.as_ref(),
+                    state.pending_cause,
+                    CONTEXT_TAIL_CHARS,
+                );
+                match state.engine.as_mut() {
+                    Some(engine) => match action {
+                        ContextCommit::Unchanged => {}
+                        ContextCommit::Echo => {
+                            log("context: 回声过滤（cause=INPUT_METHOD），不推引擎");
+                        }
+                        ContextCommit::Apply(tail) => {
+                            engine.set_context(tail);
+                            // 上下文一变立刻重排（组合在途时才有可见效果；
+                            // 空组合是 no-op）。不在按键路径里调。
+                            engine.refresh_candidates();
+                        }
+                    },
+                    // 词库没开成：上下文丢了就丢了，引擎起来前的状态无意义。
+                    None => {}
+                }
+                // pending 状态是每批一次性消耗的：done 之后清零，
+                // 下一批没来 surrounding_text 就是「没变化」而非「清空」。
+                state.pending_surrounding = None;
+                state.pending_cause = 0;
             }
             ZwpInputMethodEvent::Unavailable => {
                 log("input_method UNAVAILABLE — another IM owns the seat");
@@ -849,7 +922,6 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
         }
     }
 }
-
 impl Dispatch<WlCompositor, ()> for AppState {
     fn event(
         _state: &mut Self,
@@ -861,7 +933,6 @@ impl Dispatch<WlCompositor, ()> for AppState {
     ) {
     }
 }
-
 impl Dispatch<WlSurface, ()> for AppState {
     fn event(
         _state: &mut Self,
@@ -933,10 +1004,9 @@ impl Dispatch<WlCallback, ()> for AppState {
 }
 
 /// 候选窗只画进这个 surface，摆位全权交给合成器：rect 不再参与布局，只留日志 —
-/// 它是「我们真的被 map 并被摆位了」的唯一真机验收证据。
 impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _popup: &ZwpInputPopupSurfaceV2,
         event: ZwpInputPopupSurfaceEvent,
         _data: &(),
@@ -950,7 +1020,13 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
             height,
         } = event
         {
-            log(&format!("caret rect {x},{y} {width}x{height}"));
+            // 摆位归 popup role 与合成器（surface 只 attach(0,0)）；rect 是
+            // 「我们真的被 map 并被摆位了」的诊断证据，不参与布局。
+            let rect = (x, y, width, height);
+            if state.cursor_rect != Some(rect) {
+                log(&format!("caret rect {x},{y} {width}x{height}"));
+            }
+            state.cursor_rect = Some(rect);
         }
     }
 }

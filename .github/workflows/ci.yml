@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # platform-x11 链接 libxcb；platform-wayland 的 xkb 解码测试链接 libxkbcommon
+      # （release.yml 的同款教训：缺这俩库 test 链接期就挂）
+      - run: sudo apt-get update -qq && sudo apt-get install -y libxcb1-dev libxkbcommon-dev
+
+      - run: cargo fmt --all -- --check
+
+      # workspace 根是 kime-root 包，必须 --workspace 才覆盖各 crate
+      - run: cargo test --workspace --locked
