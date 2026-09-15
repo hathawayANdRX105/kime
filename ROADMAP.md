@@ -105,10 +105,11 @@
 - [x] `examples/typing_probe` 逐键探针（qingjian `--typing` 同款：逐键增量才是真实负载）+ CI `perf` 作业（合成 10 万词库基准进 job summary，continue-on-error）
 - [x] 判定记录：rayon **不加**（每键微秒级，调度反噬）；FST 层二 shen'me 慢 10 倍 = 1355 续接 key 的剪枝线性扫（算法地板，不动）；eytzinger 不适用（kime 要返回区间位置，换算成本反转收益，algorchemy doc 实测）
 
-## M14 — 词图格子缓存（SpanCache）🔨 开发中
+## M14 — 词图格子缓存（SpanCache）✅ 2026-09-15
 
-- [ ] lattice 跨度查词缓存：键 = 拼音跨度模式，值 = `Arc<[Candidate]>`；失效条件 = learn/词库变更（qingjian 同款：整句转换最贵的是格子查词，相邻两键 90% 格子重复，他们 12ms→1ms）
-- [ ] 验收：逐键探针长句平均不回退 + 缓存命中正确性对拍 + learn 后失效
+- [x] lattice 跨度查词缓存：键 = 跨度拼音串，值 = `Arc<[Candidate]>`；Engine 持有，`learn_or_warn` 尾部整体失效（learn 改条目 eff），8192 上限整清重建
+- [x] 验收：`span_cache_test` 4/4（缓存命中 vs 全冷对拍 / learn 失效 / 前缀延长增量复用 / 上限）+ 33 套件全绿 + typing_probe 27 键长句平均 0.088ms（无回退）
+- [x] 审查：CRG 0 affected flows（risk 0.40）+ 结构化 8 项清单 PASS_WITH_NITS，记录在 PR #25 评论
 - [ ] 远期：双层词库（热层 FST 常驻堆 + 冷层 mmap 按需）——词库到千万级时的内存扩展性保险
 
 ## M15 — 待规划
