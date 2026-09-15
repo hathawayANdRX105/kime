@@ -66,3 +66,45 @@ jobs:
             libfontconfig1-dev \
             libxcb1-dev \
             pkg-config
+
+  perf:
+    name: Benchmark (synthetic dict)
+    runs-on: ubuntu-latest
+    continue-on-error: true # 基线记录用途，不阻塞合入；噪音由同 runner 对比消除
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate synthetic dict (100k unique pinyin/text pairs)
+        run: |
+          python3 - <<'EOF'
+          import itertools, pathlib
+          syls = ["a","ai","an","ang","ao","ba","bai","ban","bang","bao","bei","ben","beng","bi","bian","biao","bie","bin","bing","bo","bu","ca","cai","can","cang","cao","ce","cen","ceng","cha","chai","chan","chang","chao","che","chen","cheng","chi","chong","chou","chu","chua","chuai","chuan","chuang","chui","chun","chuo","ci","cong","cou","cu","cuan","cui","cun","cuo","da","dai","dan","dang","dao","de","den","deng","di","dia","dian","diao","die","ding","diu","dong","dou","du","duan","dui","dun","duo","e","en","er","fa","fan","fang","fei","fen","feng","fo","fou","fu","ga","gai","gan","gang","gao","ge","gen","geng","gong","gou","gu","gua","guai","guan","guang","gui","gun","guo","ha","hai","han","hang","hao","he","hei","hen","heng","hong","hou","hu","hua","huai","huan","huang","hui","hun","huo","ji","jia","jian","jiang","jiao","jie","jin","jing","jiong","jiu","ju","juan","jue","jun","ka","kai","kan","kang","kao","ke","ken","keng","kong","kou","ku","kua","kuai","kuan","kuang","kui","kun","kuo","la","lai","lan","lang","lao","le","lei","leng","li","lia","lian","liang","liao","lie","lin","ling","liu","lo","long","lou","lu","luan","lun","luo","ma","mai","man","mang","mao","me","mei","men","meng","mi","mian","miao","mie","min","ming","miu","mo","mou","mu","na","nai","nan","nang","nao","ne","nei","nen","neng","ni","nian","niang","niao","nie","nin","ning","niu","nong","nou","nu","nuan","nuo","o","ou","pa","pai","pan","pang","pao","pei","pen","peng","pi","pian","piao","pie","pin","ping","po","pou","pu","qi","qia","qian","qiang","qiao","qie","qin","qing","qiong","qiu","qu","quan","que","qun","ran","rang","rao","re","ren","reng","ri","rong","rou","ru","rua","ruan","rui","run","ruo","sa","sai","san","sang","sao","se","sen","seng","sha","shai","shan","shang","shao","she","shei","shen","sheng","shi","shou","shu","shua","shuai","shuan","shuang","shui","shun","shuo","si","song","sou","su","suan","sui","sun","suo","ta","tai","tan","tang","tao","te","teng","ti","tian","tiao","tie","ting","tong","tou","tu","tuan","tui","tun","tuo","wa","wai","wan","wang","wei","wen","weng","wo","wu","xi","xia","xian","xiang","xiao","xie","xin","xing","xiong","xiu","xu","xuan","xue","xun","ya","yan","yang","yao","ye","yi","yin","ying","yo","yong","you","yu","yuan","yue","yun","za","zai","zan","zang","zao","ze","zei","zen","zeng","zha","zhai","zhan","zhang","zhao","zhe","zhen","zheng","zhi","zhong","zhou","zhu","zhua","zhuai","zhuan","zhuang","zhui","zhun","zhuo","zi","zong","zou","zu","zuan","zui","zun","zuo"]
+          chars = [chr(c) for c in range(0x4E00, 0x4E00 + 3000)]
+          freq = 1000000
+          with open("/tmp/gen.yaml", "w") as f:
+              f.write("...\n")
+              n = 0
+              for s1, s2 in itertools.product(syls, syls):
+                  if n >= 100_000:
+                      break
+                  w = chars[n % 3000] + chars[(n * 7 + 3) % 3000]
+                  f.write(f"{w}\t{s1} {s2}\t{freq - n}\n")
+                  n += 1
+          print(f"generated {n} entries")
+          EOF
+      - name: Import + build FST
+        run: |
+          cargo run -q -p kime -- --dict /tmp/gen.sqlite --import /tmp/gen.yaml
+          cargo run -q -p kime -- build-dict --in /tmp/gen.sqlite --out /tmp/kime_dict.bin
+      - name: Run benchmark
+        run: |
+          KIME_BENCH_DB=/tmp/gen.sqlite KIME_BENCH_BIN=/tmp/kime_dict.bin \
+            cargo bench -q --bench kime_bench 2>&1 | tee /tmp/bench_out.txt
+      - name: Report
+        if: always()
+        run: |
+          echo '### Benchmark（合成 10 万词库；跨 runner 噪音大，同 job 前后对比才有效）' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench_out.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

@@ -2,9 +2,12 @@ use std::path::Path;
 use std::time::Instant;
 
 fn main() {
+    let db_path = std::env::var("KIME_BENCH_DB")
+        .unwrap_or_else(|_| "/home/hathaway/.local/share/kime/dict.sqlite3".to_string());
+    let bin_path =
+        std::env::var("KIME_BENCH_BIN").unwrap_or_else(|_| "/tmp/kime_dict.bin".to_string());
     println!("=== kime 性能基准测试 ===");
-    let db_path = "/home/hathaway/.local/share/kime/dict.sqlite3";
-    let bin_path = "/tmp/kime_dict.bin";
+    println!("词库: {db_path} / FST: {bin_path}");
 
     if !Path::new(db_path).exists() {
         eprintln!("词库文件未找到: {}，请先运行数据准备", db_path);
