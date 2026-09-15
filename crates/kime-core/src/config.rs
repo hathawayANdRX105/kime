@@ -21,6 +21,7 @@ pub struct Config {
     #[serde(default)]
     pub ai_realtime: bool,
     /// 模糊音替换对（"zh=z"、"n=l"、"an=ang"）；空 = 关闭
+    #[serde(default)]
     pub fuzzy: Vec<String>,
     /// Binary dict path (optional); loads ~/.local/share/kime/dict.bin if exists
     pub dict_bin_path: Option<String>,
