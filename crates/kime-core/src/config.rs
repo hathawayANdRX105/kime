@@ -17,6 +17,9 @@ pub struct Config {
     /// AI 模型名称（默认 gpt-oss-120b）
     #[serde(default = "default_ai_model")]
     pub ai_model: String,
+    /// 实时候补（merge_ai）开关，默认关闭；上下文分词质量优先
+    #[serde(default)]
+    pub ai_realtime: bool,
     /// 模糊音替换对（"zh=z"、"n=l"、"an=ang"）；空 = 关闭
     pub fuzzy: Vec<String>,
     /// Binary dict path (optional); loads ~/.local/share/kime/dict.bin if exists
@@ -66,6 +69,7 @@ impl Default for Config {
             shuangpin: Some(Scheme::Ziranma),
             ai_endpoint: None,
             ai_model: "gpt-oss-120b".to_string(),
+            ai_realtime: false,
             fuzzy: Vec::new(),
             dict_bin_path: None,
             page_size: 10,

@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 /// LLM 请求（debounce 合并）
 pub struct LlmRequest {
     pub syllables: Vec<String>,
+    /// 光标前的上下文尾巴（surrounding_text），无则 None
+    pub context: Option<String>,
     pub timestamp: std::time::Instant,
 }
 
@@ -40,11 +42,15 @@ impl LlmClient {
     }
 
     /// 发送 LLM 请求（同步版本，供测试用）
-    pub fn request_sync(&self, syllables: &[String]) -> Result<Vec<Candidate>, String> {
-        let prompt = format!(
-            "拼音: {}\n请给出可能的中文句子，每行一个，最多 3 个。只输出文本。",
-            syllables.join("'")
-        );
+    ///
+    /// `context` = 光标前的上下文尾巴（`surrounding_text`），有则拼进 prompt
+    /// 供分词消歧，无则保持纯拼音 prompt。
+    pub fn request_sync(
+        &self,
+        syllables: &[String],
+        context: Option<&str>,
+    ) -> Result<Vec<Candidate>, String> {
+        let prompt = build_prompt(syllables, context);
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -71,11 +77,15 @@ impl LlmClient {
     }
 
     /// 发送 LLM 请求（异步版本，供壳侧后台线程用）
-    pub async fn request_async(&self, syllables: Vec<String>) -> Result<Vec<Candidate>, String> {
-        let prompt = format!(
-            "拼音: {}\n请给出可能的中文句子，每行一个，最多 3 个。只输出文本。",
-            syllables.join("'")
-        );
+    ///
+    /// `context` = 光标前的上下文尾巴（`surrounding_text`），有则拼进 prompt
+    /// 供分词消歧，无则保持纯拼音 prompt。
+    pub async fn request_async(
+        &self,
+        syllables: Vec<String>,
+        context: Option<String>,
+    ) -> Result<Vec<Candidate>, String> {
+        let prompt = build_prompt(&syllables, context.as_deref());
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -106,6 +116,19 @@ impl LlmClient {
     }
 }
 
+/// 拼请求 prompt：有上下文时「上文 / 当前拼音」两段，消歧靠它；无上下文
+/// 时保持原样（拼音单段）。`parse_candidates` 不受影响。
+fn build_prompt(syllables: &[String], context: Option<&str>) -> String {
+    let joined = syllables.join("'");
+    match context.filter(|c| !c.is_empty()) {
+        Some(ctx) => format!(
+            "上文：{ctx}\n当前拼音：{joined}\n请给出可能的中文句子，每行一个，最多 3 个。只输出文本。"
+        ),
+        None => format!(
+            "拼音: {joined}\n请给出可能的中文句子，每行一个，最多 3 个。只输出文本。"
+        ),
+    }
+}
 /// 解析 LLM 返回的文本为候选列表
 fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
     text.lines()
