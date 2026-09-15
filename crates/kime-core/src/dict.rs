@@ -31,12 +31,12 @@ fn io_to_sqlite(e: std::io::Error) -> SqliteError {
 /// 用户词提频（第五轮调频方案 B：使用即提升 + 时间衰减，rime user_freq 同款语义）。
 ///
 /// 语料计数是 10⁵~10⁷ 量级（常见词「我们」freq=509,405），旧版 learn 一次 +1
-/// 对排序毫无作用。现在第 n 次使用（n≥2）给该词叠加 `(n-1) × USER_BOOST × 0.5^(age/半衰期)`
-/// 的**排序用**有效频率；n=1 不加成是刻意的：`user_overlay_test` 与
-/// `tests/dict.rs::他(6) > 它(1)` 钉死了「学一次不改变与高频语料词的相对位置」。
+/// 对排序毫无作用。第 n 次使用给该词叠加 `n × USER_BOOST × 0.5^(age/半衰期)`
+/// 的**排序用**有效频率。首用即满额是用户拍板（2026-09-15）：rime 手感——
+/// 选过的词立刻要有存在感；`tests/dict.rs` 钉「等量加成相抵、排序仍由裸频定」。
 ///
-/// 校准：BOOST=300_000 ⇒ 第 3 次使用（n=3，加成 2×300k=600k）压过 freq=500,000
-/// 的普通语料词；第 2 次（300k）已能压过 10⁵ 级词、进入长尾词之上。
+/// 校准：BOOST=300_000 ⇒ 第 1 次使用（300k）压过 10⁵ 级长尾词、压不过 50 万级
+/// 语料词；第 2 次（600k）压过 freq=500,000 的普通语料词。
 const USER_BOOST: u64 = 300_000;
 /// 提频半衰期（天）：连续 30 天不再使用，加成减半；60 天降到 1/4，回落语料位。
 const USER_BOOST_HALF_LIFE_DAYS: f64 = 30.0;
@@ -50,7 +50,8 @@ fn today_days() -> u64 {
 }
 
 /// 某词的提频加成。`stats[(pinyin, text)] = (使用次数 n, 最近使用日)`；
-/// n≤1 或无记录 → 0。纯函数（除查表），learn/开库共用同一条算式，无第二份语义。
+/// 无记录 → 0；n=1 即满额（首用即加成，用户拍板 2026-09-15）。纯函数（除查表），
+/// learn/开库共用同一条算式，无第二份语义。
 fn user_bonus_of(
     stats: &HashMap<(String, String), (u64, u64)>,
     today: u64,
@@ -60,12 +61,9 @@ fn user_bonus_of(
     let Some(&(n, last)) = stats.get(&(pinyin.to_string(), text.to_string())) else {
         return 0;
     };
-    if n <= 1 {
-        return 0;
-    }
     let age = today.saturating_sub(last) as f64;
     let factor = 0.5f64.powf(age / USER_BOOST_HALF_LIFE_DAYS);
-    ((n - 1) as f64 * USER_BOOST as f64 * factor) as u64
+    (n as f64 * USER_BOOST as f64 * factor) as u64
 }
 
 /// 排序用的有效频率 = 库频 + 提频加成。加成只存在于比较器里：
@@ -934,8 +932,9 @@ impl Dict {
 
         // 用户提频计数（方案 B：使用即提升 + 按天时间衰减，rime user_freq 语义）。
         // phrase.freq 保持旧语义（词库频率 + 累计 bump 次数），使用次数 n 与最近使用日
-        // 写旁表 kime_kv；加成只进比较器，不改任何导出频率。n=1 不加成——用户第一次
-        // 选词不得跳过语料词（tests/dict.rs 他>它 与 user_overlay_test 5001 钉着）。
+        // 写旁表 kime_kv；加成只进比较器，不改任何导出频率。首用即满额
+        // （n×300k，用户拍板 2026-09-15）——选过的词立刻要有存在感；
+        // `tests/dict.rs` 钉「等量加成相抵、排序仍由裸频定」。
         self.today = today_days();
         let stats_key = (joined.clone(), text.to_string());
         let n = self

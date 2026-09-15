@@ -188,9 +188,10 @@ fn dict_learn_bumps_existing_or_inserts_user_row_and_changes_order() {
     d.learn(&["ta".into()], "它").expect("learn new");
     let h2 = d.lookup(&["ta".into()], 10).unwrap();
     assert_eq!(h2.len(), 2);
-    // freq DESC tie-break by text ASC: "他"(6) < "它"(1).
+    // 首用即满额（n=1 → 各 +300k）：「他」「它」都学过一次，加成等量相抵，
+    // 排序仍由裸频决定（6 > 1）——首用加成只对「未学过的语料词」产生跳位。
     assert_eq!(h2[0].text, "他");
-    assert_eq!(h2[0].freq, 6);
+    assert_eq!(h2[0].freq, 6, "导出频率恒为库内原值");
     assert_eq!(h2[1].text, "它");
     assert_eq!(h2[1].freq, 1);
 

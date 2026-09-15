@@ -18,7 +18,7 @@
 
 | 内容 | 落点 | 证据 |
 |---|---|---|
-| 用户调频方案 B：`effective_freq = phrase.freq + (n−1)×300_000×0.5^(age_天/30)`，30 天半衰期，n=1 不加成 | `crates/kime-core/src/dict.rs`（`cand_cmp` / `merge_overlay` / learn upsert `kime_kv` 旁表） | commit `b8d06de`（PR #23） |
+| 用户调频方案 B：`effective_freq = phrase.freq + n×300_000×0.5^(age_天/30)`，30 天半衰期；~~n=1 不加成~~ → **首用即满额**（2026-09-15 用户拍板，M12 轮修改） | `crates/kime-core/src/dict.rs`（`cand_cmp` / `merge_overlay` / learn upsert `kime_kv` 旁表） | commit `b8d06de`（PR #23）+ M12 轮修改 |
 | 分词混排：`PATHS_PER_NODE 2→3`，viterbi 边权改用 effective_freq | `crates/kime-core/src/lattice.rs` | 同上 |
 | `lookup_abbrev` SQLite 分支修复（原不吃提频，与 FST 分支行为分裂） | `dict.rs:844-869` 一带，truncate 前按 `cand_cmp` 重排 | 同上 + 回归测试 `boost_applies_to_abbrev_lookup` |
 | 上下文感知候选：surrounding_text 四事件、种子先验、ai_realtime 默认关 | platform-wayland + `kime-core/src/engine.rs`/`config.rs` | commit `2a1bedf`（PR #24） |

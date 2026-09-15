@@ -80,7 +80,7 @@
 
 ## M10 — 候选词优化：用户调频 + 分词混排 ✅ 2026-09-14
 
-- [x] 用户调频（方案 B）：`effective_freq = phrase.freq + (n−1)×300_000×0.5^(age_天/30)`，30 天半衰期；计数存 `kime_kv` 旁表（独立空间，导出 freq 恒为库内原值），FST/SQLite/缩写三条查询路径统一比较器
+- [x] 用户调频（方案 B）：`effective_freq = phrase.freq + n×300_000×0.5^(age_天/30)`，30 天半衰期，首用即满额（2026-09-15 用户拍板，原 n=1 零加成契约废止）；计数存 `kime_kv` 旁表（独立空间，导出 freq 恒为库内原值），FST/SQLite/缩写三条查询路径统一比较器
 - [x] 分词混排：`PATHS_PER_NODE 2→3`（2+2 组合进候选），viterbi 边权改用 effective_freq；实测 `womenzai` 真词「我们再」从第 3 升至第 2，双拼碎切「我么内爱」沉到第 14
 - [x] 回归保护：`freq_boost_test`（BOOST 校准 / 90 天回落 / 前缀层一置顶 / 缩写查询提频）
 

@@ -1,13 +1,11 @@
 //! 高频词调频（方案 B：使用即提升 + 时间衰减）的验收测试。
 //!
-//! 钉住三件事：
-//! 1. BOOST 校准——第 3 次使用（n=3，加成 2×USER_BOOST=600k）压过 freq=500,000
-//!    的普通语料词；第 2 次（300k）压不过。
+//! 1. BOOST 校准——第 1 次使用（n=1，加成 300k）压不过 freq=500,000 的普通
+//!    语料词；第 2 次（600k）压过（首用即满额，用户拍板 2026-09-15）。
 //! 2. 导出频率不变——`Candidate.freq` 恒为库内原始值（phrase.freq 旧语义），
 //!    加成只进排序（`user_overlay_test` 的 5001 断言同此契约）。
-//! 3. 时间衰减——半衰期 30 天；拨旧 3 个半衰期后加成 600k→75k，排序回落。
+//! 3. 时间衰减——半衰期 30 天；拨旧 3 个半衰期后加成 900k→112.5k，排序回落。
 //!    计数持久化在 kime_kv 旁表：重开库不丢提升，也不丢衰减基准日。
-
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,24 +55,29 @@ fn boost_calibrates_and_decays_without_touching_exported_freq() {
     // 基线：我温(10) 在 我们(500000) 之后。
     assert_eq!(texts(&d.lookup(&reading, 10).unwrap()), ["我们", "我温"]);
 
-    // 第 1 次使用：n=1 不加成（首选用词不得跳过语料词——5001 契约的排序面）。
+    // 第 1 次使用：n=1 → +300k（首用即满额，用户拍板 2026-09-15），
+    // 压过 10⁵ 级长尾词、压不过 50 万级语料词。
     d.learn(&reading, "我温").unwrap();
     assert_eq!(
         texts(&d.lookup(&reading, 10).unwrap()),
         ["我们", "我温"],
-        "学一次不得改变与高频语料词的相对位置"
+        "300k 首用加成不得压过 freq=500,000 的语料词（BOOST 上界钉）"
     );
 
-    // 第 2 次：加成 300k，仍压不过 500k 级（钉住 BOOST 下界）。
-    d.learn(&reading, "我温").unwrap();
-    assert_eq!(texts(&d.lookup(&reading, 10).unwrap()), ["我们", "我温"]);
-
-    // 第 3 次：加成 2×300k=600k > 500k，立即置顶（同一会话，无需重开库）。
+    // 第 2 次：600k > 500k，立即置顶（同一会话，无需重开库）。
     d.learn(&reading, "我温").unwrap();
     assert_eq!(
         texts(&d.lookup(&reading, 10).unwrap()),
         ["我温", "我们"],
-        "n=3 必须压过 freq=500,000 的普通语料词（BOOST 校准钉）"
+        "n=2 必须压过 freq=500,000 的普通语料词（BOOST 校准钉）"
+    );
+
+    // 第 3 次：900k，置顶保持。
+    d.learn(&reading, "我温").unwrap();
+    assert_eq!(
+        texts(&d.lookup(&reading, 10).unwrap()),
+        ["我温", "我们"],
+        "n=3 置顶保持"
     );
 
     // 导出频率仍是原始库值：加成绝不写进 Candidate.freq。
@@ -91,7 +94,7 @@ fn boost_calibrates_and_decays_without_touching_exported_freq() {
         "使用计数在 kime_kv 里持久化，重开库不得丢"
     );
 
-    // 衰减：把最近使用日拨回 90 天（3 个半衰期），加成 600k→75k < 500k。
+    // 衰减：把最近使用日拨回 90 天（3 个半衰期），加成 900k→112.5k < 500k。
     let today = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
