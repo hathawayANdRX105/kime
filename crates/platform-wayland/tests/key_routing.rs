@@ -15,7 +15,9 @@ use kime_core::dict::Dict;
 use kime_core::{Engine, Outcome};
 use platform_wayland::keyboard::Keyboard;
 use platform_wayland::repeat::{KeyRepeat, REPEAT_DELAY_MS, REPEAT_INTERVAL_MS};
-use platform_wayland::route::{key_log_line, route_press, route_release, shell_key, PressAction};
+use platform_wayland::route::{
+    key_log_line, route_press, route_release, shell_key, shift_holds_passthrough, PressAction,
+};
 use platform_wayland::SwallowTracker;
 use xkbcommon::xkb;
 
@@ -454,4 +456,25 @@ fn key_log_line_contract_format() {
         ),
         "key code=35 ch=h mods=csa -> Commit(你好)\n"
     );
+}
+
+/// Shift-hold 透传裁决（第六轮）：手势窗口内只有字母透传，标点走引擎。
+/// 此前标点也在透传范围，快速打字时 Shift 按住窗口与标点键重叠 →
+/// 「中文括号逗号偶尔变英文」的头号根因。回退 shift_holds_passthrough 即红。
+#[test]
+fn shift_holds_passthrough_letters_only() {
+    // 窗口内 + 字母 → 透传（大写英文语义）
+    assert!(shift_holds_passthrough(true, Some('a'), false));
+    assert!(shift_holds_passthrough(true, Some('Z'), false));
+    // 窗口内 + 标点 → 走引擎（中文标点），不透传
+    assert!(!shift_holds_passthrough(true, Some(','), false));
+    assert!(!shift_holds_passthrough(true, Some('('), false));
+    assert!(!shift_holds_passthrough(true, Some('.'), false));
+    // Alt 组合永远直通（无论什么键）
+    assert!(shift_holds_passthrough(true, Some('a'), true));
+    assert!(shift_holds_passthrough(false, Some(','), true));
+    // 窗口外一律走引擎（shift 手势已裁决完毕）
+    assert!(!shift_holds_passthrough(false, Some('a'), false));
+    // 无字符（功能键，utf32 空）不透传
+    assert!(!shift_holds_passthrough(true, None, false));
 }

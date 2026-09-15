@@ -14,7 +14,9 @@ use kime_core::{Engine, Outcome};
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
-use platform_wayland::route::{key_log_line, route_press, route_release, shell_key, PressAction};
+use platform_wayland::route::{
+    key_log_line, route_press, route_release, shell_key, shift_holds_passthrough, PressAction,
+};
 use platform_wayland::tray::TrayIconManager;
 use platform_wayland::SwallowTracker;
 use platform_wayland::{Layout, Renderer};
@@ -1148,11 +1150,15 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     }
                     return;
                 }
-                // Shift 按住期间的任何其他键（含方向/Home/End、Ctrl/Alt 组合、字母）：
-                // 一律原样透传，不碰引擎 → 不进拼音、不改模式。字母呈大写形态，靠的
-                // 是 vk.modifiers 实时同步的合成器 shift 位，应用自己 xkb 解码。
-                // Alt 组合一律直通应用（不改）也走这同一条 forward。
-                if state.shift_gesture.on_key_press() || state.alt {
+                // Shift 按住期间：字母原样透传（大写英文形态，应用自己 xkb 解码）；
+                // 标点键走引擎——rime 的 ascii_composer 只影响字母，punctuator
+                // 不受 shift 位影响（Shift hold 打标点出中文标点）。裁决契约见
+                // route::shift_holds_passthrough；方向/Home/End 照旧透传。
+                if shift_holds_passthrough(
+                    state.shift_gesture.on_key_press(),
+                    state.keyboard.key_char(key),
+                    state.alt,
+                ) {
                     state.forward_key(time, key, true);
                     return;
                 }

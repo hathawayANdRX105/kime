@@ -23,6 +23,15 @@ pub fn shell_key(code: u32, ch: Option<char>, ctrl: bool, alt: bool) -> Key {
     }
 }
 
+/// Shift 按住期间（手势窗口内）一次 press 的透传裁决：
+/// 只有**字母**原样透传（大写英文形态）；标点走引擎（rime 的 ascii_composer
+/// 只影响字母，punctuator 不受 shift 位影响——Shift hold 打标点出中文标点）。
+/// `alt` 组合永远直通。此前标点也透传，是「中文括号逗号偶尔变英文」的头号根因。
+pub fn shift_holds_passthrough(in_gesture_window: bool, ch: Option<char>, alt: bool) -> bool {
+    let letter = ch.is_some_and(|c| c.is_ascii_alphabetic());
+    (in_gesture_window && letter) || alt
+}
+
 /// 一次真 press 的路由裁决要做的动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressAction {
