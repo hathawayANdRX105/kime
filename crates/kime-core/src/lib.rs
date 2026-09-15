@@ -29,6 +29,7 @@
 
 pub mod builder;
 pub mod config;
+pub mod context;
 pub mod dict;
 pub mod engine;
 pub mod lattice;
@@ -36,6 +37,7 @@ pub mod llm;
 pub mod predict;
 pub mod punct;
 pub mod store;
+pub use context::ContextTail;
 pub use dict::Candidate;
 pub use engine::{Engine, Key, Outcome};
 pub use kime_shuangpin::Scheme;

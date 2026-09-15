@@ -80,6 +80,10 @@ pub struct Engine {
     last_joined: String,
     /// 上一个键是否为数字（rime `digit_separators`：数字紧跟 ` , . : ` 时保持半角直通）。
     after_digit: bool,
+    /// 光标前的输入框上下文（surrounding_text 归一化结果）。
+    /// 上下文与组合生命周期无关：commit / Esc 清组合时**保留**它，
+    /// 只由平台壳在 surrounding_text 事件到来时整体替换。
+    context: Option<String>,
 }
 impl Engine {
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -119,6 +123,7 @@ impl Engine {
             quote_open: None,
             last_joined: String::new(),
             after_digit: false,
+            context: None,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -170,6 +175,17 @@ impl Engine {
             }
         }
         idx.min(pe_len)
+    }
+
+    /// 更新输入框上下文尾巴（平台壳在 `surrounding_text` 事件时调用）。
+    /// `None` = 光标前无可用上下文。与组合生命周期无关：清组合不清上下文。
+    pub fn set_context(&mut self, tail: Option<String>) {
+        self.context = tail;
+    }
+
+    /// 当前上下文尾巴（分词 / 排序的上下文输入），无上下文时 `None`。
+    pub fn context_tail(&self) -> Option<&str> {
+        self.context.as_deref()
     }
     /// 全量清空组合：候选/读音/preedit/页码/光标一并归位。所有上屏与 Esc 路径共用。
     fn clear_composition(&mut self) {
