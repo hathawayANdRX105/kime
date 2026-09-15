@@ -514,17 +514,25 @@ impl Engine {
             let len = self.letters.len();
             // 解码和半截键的拼音前缀都在块表达式里算完，`self.sp` 的借用随块结束：
             // 后面要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
-            let (decoded, pending) = {
+            let (decoded, pending, half_key_syls) = {
                 let table = self.sp.as_ref().unwrap();
                 if len % 2 == 0 {
-                    (table.to_syllables(&self.letters), String::new())
+                    (table.to_syllables(&self.letters), String::new(), Vec::new())
                 } else {
                     // 最后一个键还没凑成键对，它代表的是**声母**而不是拼音字母：
                     // 直接拿它当拼音前缀去查，等于查 "u" 开头的词，半截状态必出垃圾。
                     let last = self.letters[len - 1..].chars().next();
+                    let last = last.unwrap_or(' ');
                     (
                         table.to_syllables(&self.letters[..len - 1]),
-                        table.initial_of(last.unwrap_or(' ')),
+                        table.initial_of(last),
+                        // 公共前缀塌缩为空（y/w/元音零声母键）时，前缀收窄不了
+                        // 任何东西；留下完整音节集给补全路径（见下）。
+                        if table.initial_of(last).is_empty() {
+                            table.syllables_of_initial(last)
+                        } else {
+                            Vec::new()
+                        },
                     )
                 }
             };
@@ -535,10 +543,39 @@ impl Engine {
                     self.last_reading = syllables.clone();
                     self.preedit = format!("{}{}", syllables.join(""), pending);
                     self.last_joined = sp_joined.clone();
-                    self.candidates = self
+                    let mut cands = self
                         .dict
                         .lookup_prefix(&syllables, pending, self.config.candidate_limit)
                         .unwrap_or_default();
+                    // 半截键补全（零声母键 y/w/元音：公共前缀为空，前缀查询退化成
+                    // 「首音节全量」）：枚举半截键能拼出的完整音节，逐个作为已完成
+                    // 的末音节补查。用户敲半截键的意图是「末音节以这个字母开头」，
+                    // 末音节完整的词（ke+y → ke'yi「可以」）比任意 ke* 词更贴合意图
+                    // ——补全命中排在前，其余裸前缀结果去重后续后。
+                    if !half_key_syls.is_empty() {
+                        let mut seen: std::collections::HashSet<String> =
+                            cands.iter().map(|c| c.text.clone()).collect();
+                        let mut completions: Vec<Candidate> = Vec::new();
+                        for s in &half_key_syls {
+                            let mut r = syllables.clone();
+                            r.push((*s).to_string());
+                            if let Ok(mut vc) =
+                                self.dict.lookup_prefix(&r, "", self.config.candidate_limit)
+                            {
+                                vc.retain(|c| seen.insert(c.text.clone()));
+                                completions.extend(vc);
+                            }
+                            if completions.len() >= self.config.candidate_limit {
+                                break;
+                            }
+                        }
+                        // completions + 原前缀结果，总长截到 candidate_limit
+                        let mut merged = completions;
+                        let keep = self.config.candidate_limit.saturating_sub(merged.len());
+                        merged.extend(cands.into_iter().take(keep));
+                        cands = merged;
+                    }
+                    self.candidates = cands;
                     if self.candidates.is_empty() {
                         if let Ok(ab) = self
                             .dict

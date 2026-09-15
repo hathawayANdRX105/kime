@@ -78,6 +78,28 @@ impl Table {
         }
         common.unwrap_or("").to_string()
     }
+
+    /// 半截键能拼出的**全部完整音节**（按码表第二键序，确定性）。
+    ///
+    /// 与 [`Table::initial_of`] 互补：y/w/元音这类零声母键的公共前缀是空串
+    /// （initial_of 收缩不出任何东西），半截键的意图只能靠「枚举 + 补全」表达——
+    /// 敲 `ke`+`y` 的人想要的是 ke'yi/ke'ya/… 这类末音节完整的词，而不是任意 ke 词。
+    /// 空键/非法键返回空表。
+    pub fn syllables_of_initial(&self, key: char) -> Vec<&'static str> {
+        if !key.is_ascii_lowercase() {
+            return Vec::new();
+        }
+        let first = key as u8;
+        let mut out: Vec<&'static str> = Vec::new();
+        for second in b'a'..=b'z' {
+            if let Some(syl) = (self.decode)(first, second) {
+                if !out.contains(&syl) {
+                    out.push(syl);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// ASCII 公共前缀（拼音全 ASCII，按字节切安全）。
