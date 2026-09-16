@@ -88,9 +88,57 @@ pub fn route_release(code: u32, swallowed: &mut SwallowTracker, repeat: &mut Key
     !swallowed.release(code)
 }
 
-/// 逐键路由日志的行格式（真机定罪用的统一契约）：
-/// `key code=<u32> ch=<char|-> mods=<c?><s?><a?> -> <Outcome>`
-/// 纯格式化，落盘在 main.rs；钉在 tests/key_routing.rs 防格式漂移。
+/// 剪贴板模式一次 press 的裁决（M16）：纯函数，副作用（提交/重绘）归调用方。
+///
+/// - `C-;`（evdev 39）：切入（游标 0）/ 再按一次退出
+/// - j(36)/k(37)：移动游标（有候选时）
+/// - Enter(28)/空格(57)：提交当前游标候选
+/// - Esc(1)/Backspace(14)：退出
+/// - 其余键：退出模式并放行（`Forward`），调用方转交引擎
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipAction {
+    /// 进入剪贴板模式（游标 0）
+    Enter,
+    /// 退出剪贴板模式（重绘走 popup_show）
+    Exit,
+    /// 游标移动到 `usize`
+    Move(usize),
+    /// 提交候选列表下标 `usize` 的文本并退出
+    Commit(usize),
+    /// 剪贴板模式内吞掉但无动作（空列表时的功能键）
+    Swallow,
+    /// 不在模式 / 未知键：放行给引擎
+    Forward,
+}
+
+pub fn clip_route(
+    active: bool,
+    pick: Option<usize>,
+    ctrl: bool,
+    code: u32,
+    n_candidates: usize,
+) -> ClipAction {
+    if ctrl && code == 39 {
+        return if active {
+            ClipAction::Exit
+        } else {
+            ClipAction::Enter
+        };
+    }
+    let Some(pick) = pick else {
+        return ClipAction::Forward;
+    };
+    match code {
+        36 if n_candidates > 0 => ClipAction::Move((pick + 1).min(n_candidates - 1)), // j
+        37 if n_candidates > 0 => ClipAction::Move(pick.saturating_sub(1)),           // k
+        28 | 57 if n_candidates > 0 => {
+            ClipAction::Commit(pick.min(n_candidates - 1)) // Enter/空格
+        }
+        // Esc/退格退出；空列表时导航/提交无处可去，也只退出
+        1 | 14 | 36 | 37 | 28 | 57 => ClipAction::Exit,
+        _ => ClipAction::Forward, // 其余：退出+放行
+    }
+}
 pub fn key_log_line(
     code: u32,
     ch: Option<char>,

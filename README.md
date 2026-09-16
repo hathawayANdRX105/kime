@@ -37,6 +37,7 @@ platform-mac/         （规划中）macOS IMKit 壳
 - 组合内光标 C-f / C-b / C-h（keysym 兜底，xkb Ctrl 变换不吞键）
 - 壳内按键自动重复（Backspace / C-f / C-b / C-h 长按连续）
 - Shift 手势：点击切换中英，按住期间临时英文透传不改模式（rime ascii_composer 语义）
+- **剪贴板候选**（M16）：`C-;` 呼出复制历史（会话级 64 条去重）+ deskctl 预设（`~/.config/deskctl/snippets/` 只读同源），j/k 选、Enter 上屏；内容不落日志，单条 4k 字符封顶
 - **已知边界**（详见 `todo/HANDOFF.md`）：`place_sentences`/engine 去重合并与 top_user 列表仍按裸 freq 比较（boost 不跨列、不入个性化列表）；常驻进程跨天不刷新 `today` 缓存 → 当晚 boost 少衰减 ≤1 天；升级前老用户词无使用计数（n 从 1 重计）
 
 ## 性能指标（192 万词条实测）

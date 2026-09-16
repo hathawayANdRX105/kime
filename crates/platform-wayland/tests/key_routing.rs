@@ -16,7 +16,8 @@ use kime_core::{Engine, Outcome};
 use platform_wayland::keyboard::Keyboard;
 use platform_wayland::repeat::{KeyRepeat, REPEAT_DELAY_MS, REPEAT_INTERVAL_MS};
 use platform_wayland::route::{
-    key_log_line, route_press, route_release, shell_key, shift_holds_passthrough, PressAction,
+    clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
+    ClipAction, PressAction,
 };
 use platform_wayland::SwallowTracker;
 use xkbcommon::xkb;
@@ -477,4 +478,43 @@ fn shift_holds_passthrough_letters_only() {
     assert!(!shift_holds_passthrough(false, Some('a'), false));
     // 无字符（功能键，utf32 空）不透传
     assert!(!shift_holds_passthrough(true, None, false));
+}
+
+/// 剪贴板模式路由（M16）：C-; 进出、j/k 导航、Enter/空格提交、Esc/字母退出。
+/// 回退 clip_route 即红。
+#[test]
+fn clip_route_toggle_and_navigation() {
+    // C-; 切入（游标 0）
+    assert_eq!(clip_route(false, None, true, 39, 3), ClipAction::Enter);
+    // 再按 C-; 退出
+    assert_eq!(clip_route(true, Some(0), true, 39, 3), ClipAction::Exit);
+    // 模式内 j/k：j 下移钳到末尾，k 上移钳到 0
+    assert_eq!(clip_route(true, Some(0), false, 36, 3), ClipAction::Move(1));
+    assert_eq!(clip_route(true, Some(2), false, 36, 3), ClipAction::Move(2));
+    assert_eq!(clip_route(true, Some(0), false, 37, 3), ClipAction::Move(0));
+    assert_eq!(clip_route(true, Some(2), false, 37, 3), ClipAction::Move(1));
+}
+
+#[test]
+fn clip_route_commit_exit_and_pass_through() {
+    // Enter / 空格：提交当前游标
+    assert_eq!(
+        clip_route(true, Some(1), false, 28, 3),
+        ClipAction::Commit(1)
+    );
+    assert_eq!(
+        clip_route(true, Some(0), false, 57, 3),
+        ClipAction::Commit(0)
+    );
+    // Esc / Backspace：退出
+    assert_eq!(clip_route(true, Some(0), false, 1, 3), ClipAction::Exit);
+    assert_eq!(clip_route(true, Some(0), false, 14, 3), ClipAction::Exit);
+    // 字母等未知键：退出并放行（转交引擎）
+    assert_eq!(clip_route(true, Some(0), false, 30, 3), ClipAction::Forward);
+    // 不在模式：一律放行（C-; 之外）
+    assert_eq!(clip_route(false, None, false, 30, 3), ClipAction::Forward);
+    // 模式内但列表为空：功能键只退出
+    assert_eq!(clip_route(true, Some(0), false, 28, 0), ClipAction::Exit);
+    // 模式内空列表 + 未知键也是退出+放行
+    assert_eq!(clip_route(true, Some(0), false, 30, 0), ClipAction::Forward);
 }

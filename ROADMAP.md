@@ -112,7 +112,17 @@
 - [x] 审查：CRG 0 affected flows（risk 0.40）+ 结构化 8 项清单 PASS_WITH_NITS，记录在 PR #25 评论
 - [ ] 远期：双层词库（热层 FST 常驻堆 + 冷层 mmap 按需）——词库到千万级时的内存扩展性保险
 
-## M15 — 待规划
+## M16 — 剪贴板候选（第一阶段）✅ 2026-09-16
+
+- [x] 动态历史：`wl-paste --watch` 后台监听（wl-clipboard 已是机内依赖，无新 crate），`ClipStore` 有界 64 条、同文去重置顶、单条 4096 字符截断（防超大复制拖挂渲染）
+- [x] 用户预设：只读加载 deskctl snippets 目录（`~/.config/deskctl/snippets/<topic>/<template>`），与 deskctl 面板同源，一处维护两处可用
+- [x] 壳内交互：`C-;`（evdev 39）进/出剪贴板模式，j/k 导航、Enter/空格上屏、Esc/字母退出并转交引擎；路由决策抽纯函数 `clip_route`（route.rs，12 用例离线钉行为），副作用（重绘/提交/记账）归 main.rs 执行层
+- [x] 隐私与配对：剪贴板文本不落 `/tmp/kime-ime.log`（提交走无日志投递路径）；clip 模式吞键记入 SwallowTracker，release 配对不漏
+- [x] 验证：kime-core + platform-wayland 245 测试全绿（含 clip_route 12 用例 / ClipStore 公共 API 7 用例）；实机 smoke（mangowm）：`wl-copy` → data-control 事件 → 文本无损往返，不碰 IM seat 与运行中实例无竞争
+- [x] 修复 M14 遗留：`context_seed_test` 的 `viterbi_sentences_seeded` 调用补 SpanCache 参数（main 上已编译失败，前轮「33 套件全绿」漏数了此文件）
+- [ ] 二阶段：候选窗内搜索/删除单条历史、持久化开关（默认会话级）、primary selection 监听
+
+## M17 — 待规划
 
 - [ ] XIM 协议前端（解决 XWayland 光标对齐）
 - [ ] 多模式输入（中英混合 + 自定义快捷短语）
