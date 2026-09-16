@@ -10,12 +10,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::llm::{Debouncer, LlmClient};
+use kime_core::ClipStore;
 use kime_core::{Engine, Outcome};
+use platform_wayland::clipboard_watch::spawn as spawn_clipboard_watcher;
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
 use platform_wayland::route::{
-    key_log_line, route_press, route_release, shell_key, shift_holds_passthrough, PressAction,
+    clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
+    ClipAction, PressAction,
 };
 use platform_wayland::tray::TrayIconManager;
 use platform_wayland::SwallowTracker;
@@ -431,6 +434,12 @@ struct AppState {
     /// 合成器告知的文本输入区（surface-local）。摆位归 zwp_input_popup_surface_v2
     /// 的 role 与合成器，本字段是「真的被摆位了」的诊断证据，不参与布局。
     cursor_rect: Option<(i32, i32, i32, i32)>,
+    /// 剪贴板候选（M16）：动态历史 + deskctl 预设
+    clip: ClipStore,
+    /// 剪贴板模式的候选游标；None = 不在剪贴板模式
+    clip_pick: Option<usize>,
+    /// 剪贴板监视线程 → 主循环的新文本
+    clip_rx: Option<Receiver<String>>,
 }
 
 impl AppState {
@@ -464,6 +473,21 @@ impl AppState {
             pending_content_type: None,
             cursor_rect: None,
             shift_gesture: ShiftComposer::default(),
+            clip: {
+                let mut store = ClipStore::new();
+                // deskctl 预设（只读）：目录不存在 → 空集，未装 deskctl 是常态
+                let dir = std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".config/deskctl/snippets"))
+                    .unwrap_or_default();
+                store.load_presets(&dir);
+                store
+            },
+            clip_pick: None,
+            clip_rx: {
+                let (tx, rx) = channel();
+                spawn_clipboard_watcher(tx);
+                Some(rx)
+            },
         }
     }
 
@@ -576,22 +600,33 @@ impl AppState {
         log("input popup 候选窗已建（已提交 1×1 透明首帧）");
     }
 
-    /// 引擎当前页候选 + 页内高亮 → 进程内渲染层。
-    /// 只画当前页：highlight() 是页首全局下标，页内 = highlight()-start；
-    /// 数字键 1..=9/0 与标号天然对齐。不画 preedit（应用自己内联显示）。
-    /// 中英模式不进候选条（工单第 1 条）；切换闪现由 Key 处理里的 flash_chip 管。
+    /// 候选条渲染的单一入口：剪贴板模式画剪贴板候选（历史+预设），否则画引擎页。
     fn popup_show(&mut self, qh: &QueueHandle<AppState>) {
-        let (page, hl) = match &self.engine {
-            Some(engine) => {
-                let (start, ps) = (engine.highlight(), engine.page().1);
-                let all = engine.candidates();
-                let page = all[start.min(all.len())..(start + ps).min(all.len())]
-                    .iter()
-                    .map(|c| c.text.clone())
-                    .collect();
-                (page, engine.highlight().saturating_sub(start))
+        let (page, hl) = if let Some(pick) = self.clip_pick {
+            let cands: Vec<String> = self
+                .clip
+                .candidates()
+                .into_iter()
+                .map(|e| {
+                    // 多行候选压成一行显示（渲染层是单行条）
+                    e.text.replace('\n', "␤")
+                })
+                .collect();
+            let n = cands.len();
+            (cands, if n > 0 { pick.min(n - 1) } else { 0 })
+        } else {
+            match &self.engine {
+                Some(engine) => {
+                    let (start, ps) = (engine.highlight(), engine.page().1);
+                    let all = engine.candidates();
+                    let page = all[start.min(all.len())..(start + ps).min(all.len())]
+                        .iter()
+                        .map(|c| c.text.clone())
+                        .collect();
+                    (page, engine.highlight().saturating_sub(start))
+                }
+                None => (Vec::new(), 0),
             }
-            None => (Vec::new(), 0),
         };
         if let Some(canvas) = self.popup.as_mut() {
             canvas.set_content(page, hl, qh);
@@ -633,6 +668,12 @@ impl AppState {
 
     fn apply_commit(&mut self, text: String, qh: &QueueHandle<Self>) {
         log(&format!("commit {text}"));
+        self.deliver_commit(text, qh);
+    }
+
+    /// 投递上屏（无日志）：剪贴板候选文本不落 /tmp/kime-ime.log（隐私——
+    /// 日志可含任意复制内容）。
+    fn deliver_commit(&mut self, text: String, qh: &QueueHandle<Self>) {
         if let Some(im) = &self.input_method {
             im.commit_string(text);
             im.set_preedit_string(String::new(), 0, 0);
@@ -643,9 +684,72 @@ impl AppState {
         self.popup_show(qh);
     }
 
+    /// 剪贴板模式按键执行层：决策全部在纯函数 [`clip_route`]（可离线单测），
+    /// 这里只做副作用（重绘/提交/模式翻转）。
+    ///
+    fn clip_mode_key(&mut self, code: u32, qh: &QueueHandle<Self>) -> bool {
+        let n = self.clip.candidates().len();
+        let action = clip_route(self.clip_pick.is_some(), self.clip_pick, self.ctrl, code, n);
+        let consumed = !matches!(action, ClipAction::Forward);
+        if consumed {
+            // release 配对记账：clip 模式吞掉的 press，其 release 也吞，
+            // 否则应用收到无 press 的裸 release（947a3a3 同族幽灵事件）。
+            self.swallowed.consume(code);
+        }
+        match action {
+            ClipAction::Enter => {
+                self.clip_pick = Some(0);
+                self.popup_show(qh);
+            }
+            ClipAction::Exit => {
+                self.clip_pick = None;
+                self.popup_show(qh);
+            }
+            ClipAction::Move(next) => {
+                self.clip_pick = Some(next);
+                self.popup_show(qh);
+            }
+            ClipAction::Commit(idx) => {
+                let text = self.clip.candidates().get(idx).map(|e| e.text.clone());
+                self.clip_pick = None;
+                match text {
+                    // 剪贴板文本不进日志：走无日志投递路径
+                    Some(text) => self.deliver_commit(text, qh),
+                    None => self.popup_show(qh),
+                }
+            }
+            ClipAction::Swallow => {}
+            ClipAction::Forward => {
+                // 不在模式或未知键：退出模式（若在）并转交引擎
+                if self.clip_pick.take().is_some() {
+                    self.popup_show(qh);
+                }
+            }
+        }
+        consumed
+    }
+
     /// 引擎按键的唯一路径：真 press、Shift 手势裁决补交的 toggle、长按合成的
     /// tick（synthetic=true）都从这里进，消费/放行的记账只有一份。
     fn engine_press(&mut self, code: u32, time: u32, synthetic: bool, qh: &QueueHandle<Self>) {
+        // 收剪贴板监视线程的新文本（不阻塞：线程异步推送）
+        while let Ok(text) = self
+            .clip_rx
+            .as_ref()
+            .map(|rx| rx.try_recv())
+            .unwrap_or(Err(std::sync::mpsc::TryRecvError::Disconnected))
+        {
+            self.clip.push(&text, kime_core::clipboard::now_ms());
+            // 剪贴板模式开着 → 候选列表实时刷新
+            if self.clip_pick.is_some() {
+                self.popup_show(qh);
+            }
+        }
+        // 剪贴板模式优先：C-; 触发 / 导航 / 提交都在这里闭环，不进引擎。
+        if self.clip_mode_key(code, qh) {
+            key_log(code, None, self.ctrl, self.alt, false, &Outcome::Consumed);
+            return;
+        }
         let ch = self.keyboard.key_char(code);
         let (ctrl, alt) = (self.ctrl, self.alt);
         let mode_before = self.engine.as_ref().map_or(true, |e| e.chinese());

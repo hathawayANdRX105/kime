@@ -1,5 +1,6 @@
 //! platform-wayland: input-method-v2 壳，候选词直接画进 zwp_input_popup_surface_v2。
 
+pub mod clipboard_watch;
 pub mod context_batch;
 pub mod keyboard;
 pub mod render;

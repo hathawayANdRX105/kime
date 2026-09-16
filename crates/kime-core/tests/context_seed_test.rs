@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
-use kime_core::lattice::{viterbi_sentences, viterbi_sentences_seeded, Seed};
+use kime_core::lattice::{viterbi_sentences, viterbi_sentences_seeded, Seed, SpanCache};
 use kime_core::{Engine, Key, Outcome};
 
 /// 种子样本（对齐工单数据）：「我们」wo'men，库频 509405。
@@ -144,7 +144,7 @@ fn invariant_a_seed_text_never_leaks_into_output() {
     let dict = dict_at(&dir);
     // 输入读音与种子读音不相交：候选若混入种子文本/拼音，在这里立刻显形。
     let reading = vec!["zai".to_string(), "shuo".to_string()];
-    let seeded = viterbi_sentences_seeded(&dict, &reading, Some(seed()));
+    let seeded = viterbi_sentences_seeded(&dict, &reading, Some(seed()), &mut SpanCache::default());
     assert!(!seeded.is_empty(), "fixture 必须给出整句候选");
     for c in &seeded {
         assert!(
@@ -176,7 +176,7 @@ fn invariant_b_none_is_identical_to_legacy() {
         vec!["zai".to_string()], // 退化：长度 1，两边都空
     ] {
         assert_eq!(
-            viterbi_sentences_seeded(&dict, &reading, None),
+            viterbi_sentences_seeded(&dict, &reading, None, &mut SpanCache::default()),
             viterbi_sentences(&dict, &reading),
             "None 必须与旧函数逐字段相等：reading = {reading:?}"
         );
@@ -198,7 +198,7 @@ fn invariant_c_score_dimension_unchanged() {
     //   seeded = exp(0.5·ln(509405·200000) − 0.25·ln T) ≈ 2700
     let reading = vec!["zai".to_string(), "shuo".to_string()];
     let plain = viterbi_sentences(&dict, &reading);
-    let seeded = viterbi_sentences_seeded(&dict, &reading, Some(seed()));
+    let seeded = viterbi_sentences_seeded(&dict, &reading, Some(seed()), &mut SpanCache::default());
     assert!(!plain.is_empty() && !seeded.is_empty());
 
     // 1) 先验不重排句子：代价序不变 ⇒ 文本顺序不变。
