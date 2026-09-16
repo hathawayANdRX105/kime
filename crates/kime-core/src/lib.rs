@@ -28,6 +28,7 @@
 #![allow(dead_code)] // ponytail: 契约骨架期 todo!() 占位，实现时逐个移除
 
 pub mod builder;
+pub mod clipboard;
 pub mod config;
 pub mod context;
 pub mod correction;
@@ -38,6 +39,7 @@ pub mod llm;
 pub mod predict;
 pub mod punct;
 pub mod store;
+pub use clipboard::ClipStore;
 pub use context::ContextTail;
 pub use dict::Candidate;
 pub use engine::{Engine, Key, Outcome};
