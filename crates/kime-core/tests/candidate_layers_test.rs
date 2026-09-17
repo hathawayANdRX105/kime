@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use kime_core::builder::build;
 use kime_core::dict::{Candidate, Dict};
@@ -23,18 +22,6 @@ const SEED: &str = "...\n\
 名\tming\t1804559\n\
 命\tming\t1368062\n\
 迷你\tmin ni\t133000\n";
-
-fn tmp_path(prefix: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "kime_layers_{}_{}_{}.sqlite",
-        prefix,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
-}
 
 fn texts(hits: &[Candidate]) -> Vec<&str> {
     hits.iter().map(|c| c.text.as_str()).collect()

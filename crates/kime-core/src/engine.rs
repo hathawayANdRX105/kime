@@ -532,7 +532,7 @@ impl Engine {
             // 后面要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
             let (decoded, pending, half_key_syls) = {
                 let table = self.sp.as_ref().unwrap();
-                if len % 2 == 0 {
+                if len.is_multiple_of(2) {
                     (table.to_syllables(&self.letters), String::new(), Vec::new())
                 } else {
                     // 最后一个键还没凑成键对，它代表的是**声母**而不是拼音字母：
@@ -1000,7 +1000,7 @@ mod tests {
         let db = tmp_db("shuangpin");
         let yaml = fixture_yaml_path();
         let _dict = Dict::open(&db).expect("open dict");
-        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES
                ('ni''hao','你好',5000,'nh',0),
@@ -1395,7 +1395,6 @@ mod tests {
         let db = tmp_db("page");
         let yaml = std::env::temp_dir().join(format!("kime_page_{}.yaml", std::process::id()));
         std::fs::write(&yaml, "").unwrap();
-        let dict = Dict::open(&db).unwrap();
         let conn = rusqlite::Connection::open(&db).unwrap();
         for i in 0..25 {
             conn.execute(

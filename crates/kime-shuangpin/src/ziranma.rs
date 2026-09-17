@@ -21,7 +21,7 @@
 //!   - `d` 在 j/q/x/l 之后              → `iang`；否则 `uang`
 //!   - `s` 在 j/q/x 之后                → `iong`；否则 `ong`
 //!   - `v` 在 dt…cs 之后                → `ui`； 在 j/q/x/y 之后 → `u`（ju/qu/xu/yu）
-//!                                         在 n/l 之后 → `ü`（nv/lv）
+//!     在 n/l 之后 → `ü`（nv/lv）
 //!   - `o` 在 dt…cs 之后                → `uo`；否则保持 `o`
 //!
 //! 零声母 `y` 一律**当声母**，韵母取本表键位：`you`=yb(ou→B)、`yan`=yj(an→J)、

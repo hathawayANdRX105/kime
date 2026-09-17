@@ -1,7 +1,7 @@
 //! 剪贴板候选的公共 API 测试：只走消费者视角（candidates/presets），
 //! 不碰私有字段（本仓规范：测试放同层 tests/ 目录）。
 
-use kime_core::clipboard::{ClipEntry, ClipStore, HISTORY_CAP, PRESET_MAX_CHARS};
+use kime_core::clipboard::{ClipStore, HISTORY_CAP, PRESET_MAX_CHARS};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
