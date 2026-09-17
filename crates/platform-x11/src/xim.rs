@@ -258,12 +258,21 @@ where
         event: &S::XEvent,
     ) -> Result<bool, ServerError> {
         let key = self.key_from_event(event);
-        let outcome = self.engine.lock().key(key);
+        let (outcome, preedit) = {
+            let mut engine = self.engine.lock();
+            let outcome = engine.key(key);
+            let preedit = match outcome {
+                Outcome::Consumed => Some(engine.preedit().to_owned()),
+                _ => None,
+            };
+            (outcome, preedit)
+        };
 
         match outcome {
             Outcome::Consumed => {
-                let preedit = self.engine.lock().preedit().to_owned();
-                server.preedit_draw(&mut user_ic.ic, &preedit)?;
+                if let Some(preedit) = preedit {
+                    server.preedit_draw(&mut user_ic.ic, &preedit)?;
+                }
                 self.update_window();
                 Ok(true)
             }
