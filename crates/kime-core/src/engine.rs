@@ -532,7 +532,7 @@ impl Engine {
             // 后面要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
             let (decoded, pending, half_key_syls) = {
                 let table = self.sp.as_ref().unwrap();
-                if len % 2 == 0 {
+                if len.is_multiple_of(2) {
                     (table.to_syllables(&self.letters), String::new(), Vec::new())
                 } else {
                     // 最后一个键还没凑成键对，它代表的是**声母**而不是拼音字母：

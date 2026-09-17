@@ -1,38 +1,97 @@
-//! X11 候选窗渲染模块
+//! X11 候选窗纯像素渲染：cosmic-text 横排候选 → ARGB8888 字节缓冲。
 //!
-//! 实现基于 X11 的候选词窗口绘制
+//! 内存序：ARGB8888 小端 = B,G,R,A，可直接喂 XPutImage。
+//! 本模块不碰 X11：无连接、无窗口、无绘图调用（那是 window.rs/T3 的事），
+//! 布局与光栅都是纯计算，tests/candidate_render.rs 直接对返回值断言。
+//!
+//! 排版参数与配色跟 platform-wayland 候选条同款（同字号、同留白、同颜色）。
 
+use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache};
 use kime_core::Candidate;
 
-pub struct Renderer {
-    candidates: Vec<Candidate>,
-    current_page: usize,
-    page_size: usize,
-    x: i32,
-    y: i32,
-    visible: bool,
-    width: u16,
-    height: u16,
+pub const FONT_SIZE: f32 = 16.0;
+pub const LINE_HEIGHT: f32 = 22.0;
+/// 面板左右留白
+pub const MARGIN_X: u32 = 10;
+/// 上下留白
+pub const MARGIN_Y: u32 = 6;
+/// 候选项之间的定宽分隔（px）
+pub const SEP: u32 = 10;
+
+/// 背景 rgb(30,30,38)，不透明。B,G,R,A 序。
+const BG: [u8; 4] = [38, 30, 30, 255];
+const FG: Color = Color::rgba(220, 220, 230, 255);
+/// 高亮项：琥珀色，深底对比足够
+const HL: Color = Color::rgba(255, 220, 120, 255);
+
+/// 一帧渲染结果：`pixels` 长度恒为 `width * height * 4`（ARGB8888 小端）。
+/// 空候选/隐藏 → 1×1 全透明帧（真实候选条最小也有 2*边距+行高，绝不可能是 1×1）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
-impl Renderer {
-    pub fn new() -> Self {
+impl RenderedFrame {
+    fn hidden() -> Self {
         Self {
-            candidates: Vec::new(),
-            current_page: 0,
-            page_size: 10,
-            x: 0,
-            y: 0,
-            visible: false,
-            width: 400,
-            height: 300,
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 0],
         }
     }
 
+    /// 隐藏帧（空候选或不可见）：窗口不该被 PutImage 出去。
+    pub fn is_hidden(&self) -> bool {
+        self.width == 1 && self.height == 1
+    }
+
+    pub fn pixel_len(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+}
+
+/// 纯像素 renderer：持有候选状态与字体系统，输出帧缓冲，不创建任何 X11 资源。
+pub struct Renderer {
+    candidates: Vec<Candidate>,
+    highlight: usize,
+    visible: bool,
+    x: i32,
+    y: i32,
+    font_system: FontSystem,
+    cache: SwashCache,
+}
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Renderer {
+    /// FontSystem::new() 扫系统字体（fontconfig 路径），一次性、偏慢，只建一个。
+    pub fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+            highlight: 0,
+            visible: false,
+            x: 0,
+            y: 0,
+            font_system: FontSystem::new(),
+            cache: SwashCache::new(),
+        }
+    }
+
+    /// 候选列表更新（engine 新一轮查询结果）；高亮重置，非空即显示。
     pub fn set_candidates(&mut self, candidates: &[Candidate]) {
         self.candidates = candidates.to_vec();
-        self.current_page = 0;
+        self.highlight = 0;
         self.visible = !self.candidates.is_empty();
+    }
+
+    /// 设置当前高亮项下标；越界只是不着色，render 不 panic。
+    pub fn set_highlight(&mut self, highlight: usize) {
+        self.highlight = highlight;
     }
 
     pub fn set_position(&mut self, x: i32, y: i32) {
@@ -40,41 +99,127 @@ impl Renderer {
         self.y = y;
     }
 
+    /// 窗口应放置的屏幕坐标（T3 用来移动候选窗）。
+    pub fn position(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
 
-    pub fn render(&self) {
+    pub fn update_from_glyph_position(&mut self, x: i32, y: i32) {
+        self.set_position(x + 5, y + 25);
+    }
+
+    /// 主入口：当前候选 + 高亮 → ARGB8888 帧。空候选/隐藏 → 1×1 透明帧。
+    pub fn render(&mut self) -> RenderedFrame {
         if !self.visible || self.candidates.is_empty() {
-            return;
+            return RenderedFrame::hidden();
         }
 
-        let start = self.current_page * self.page_size;
-        let end = (start + self.page_size).min(self.candidates.len());
-        let page = &self.candidates[start..end];
+        // 横排单行摆放：每项 "N. 候选"，定宽分隔，总宽随内容自适应。
+        // 先把标签全部生成出来（measure 要 &mut self，与遍历借用冲突）
+        let labels: Vec<String> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c.text))
+            .collect();
+        let mut items = Vec::with_capacity(labels.len());
+        let mut x = MARGIN_X;
+        for label in &labels {
+            let w = self.measure(label);
+            items.push((x, label.clone()));
+            x += w + SEP;
+        }
+        let width = (x - SEP + MARGIN_X).max(1);
+        let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        for px in pixels.chunks_mut(4) {
+            px.copy_from_slice(&BG);
+        }
+        let band_top = MARGIN_Y as i32;
+        let band_h = LINE_HEIGHT.ceil() as i32;
+        for (i, (ox, label)) in items.iter().enumerate() {
+            let color = if i == self.highlight { HL } else { FG };
+            let mut buffer =
+                Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            buffer.set_size(None, None);
+            buffer.set_text(label, &Attrs::new(), Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            // 单行：把 run 的行盒垂直居中到文本带
+            let dy = match buffer.layout_runs().next() {
+                Some(run) => band_top + (band_h - run.line_height as i32) / 2 - run.line_top as i32,
+                None => band_top,
+            };
+            let ox = *ox as i32;
+            buffer.draw(
+                &mut self.font_system,
+                &mut self.cache,
+                color,
+                |gx, gy, w, h, c| {
+                    composite_rect(&mut pixels, width as usize, (gx + ox, gy + dy), (w, h), c);
+                },
+            );
+        }
 
-        println!(
-            "[X11 Render] Candidate window at ({}, {}), {} candidates:",
-            self.x,
-            self.y,
-            page.len()
-        );
-        for (i, candidate) in page.iter().enumerate() {
-            if i == 0 {
-                println!(
-                    "[X11 Render] * Highlighted: {}. {}",
-                    start + i + 1,
-                    candidate.text
-                );
-            } else {
-                println!("[X11 Render]   {}. {}", start + i + 1, candidate.text);
-            }
+        RenderedFrame {
+            width,
+            height,
+            pixels,
         }
     }
 
-    pub fn update_from_glyph_position(&mut self, x: i32, y: i32) {
-        let candidate_x = x + 5;
-        let candidate_y = y + 25;
-        self.set_position(candidate_x, candidate_y);
+    /// 测量一段文本的像素宽（横排、不换行）。
+    /// 宽度取所有 run 的 `line_w` 最大值：script/BiDi 分段后各段不重叠，
+    /// 单段宽度不是整行总宽。
+    fn measure(&mut self, text: &str) -> u32 {
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        buffer.set_size(None, None);
+        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0f32, f32::max)
+            .ceil()
+            .max(0.0) as u32
+    }
+}
+
+/// 直行 alpha 合成到不透明底上（cosmic 回调色：rgb=字色，a=覆盖率）。
+fn composite_rect(
+    buf: &mut [u8],
+    stride_px: usize,
+    pos: (i32, i32),
+    size: (u32, u32),
+    color: Color,
+) {
+    let a = color.a() as u32;
+    if a == 0 {
+        return;
+    }
+    let (r, g, b) = (color.r() as u32, color.g() as u32, color.b() as u32);
+    for yy in 0..size.1 as i32 {
+        let py = pos.1 + yy;
+        if py < 0 {
+            continue;
+        }
+        for xx in 0..size.0 as i32 {
+            let px = pos.0 + xx;
+            if px < 0 {
+                continue;
+            }
+            let off = (py as usize * stride_px + px as usize) * 4;
+            let Some(p) = buf.get_mut(off..off + 4) else {
+                continue;
+            };
+            // B,G,R 通道：out = bg*(1-α) + fg*α；A 恒 255（实底面板）
+            p[0] = ((p[0] as u32 * (255 - a) + b * a) / 255) as u8;
+            p[1] = ((p[1] as u32 * (255 - a) + g * a) / 255) as u8;
+            p[2] = ((p[2] as u32 * (255 - a) + r * a) / 255) as u8;
+            p[3] = 255;
+        }
     }
 }

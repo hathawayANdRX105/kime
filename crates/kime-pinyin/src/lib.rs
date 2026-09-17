@@ -258,5 +258,5 @@ pub fn is_fully_segmentable(letters: &str) -> bool {
 }
 
 fn is_syllable_bytes(b: &[u8]) -> bool {
-    std::str::from_utf8(b).ok().is_some_and(|s| is_syllable(s))
+    std::str::from_utf8(b).ok().is_some_and(is_syllable)
 }

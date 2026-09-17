@@ -76,6 +76,7 @@ pub fn viterbi_sentences(dict: &Dict, reading: &[String]) -> Vec<Candidate> {
 /// 都查过——而格子查词是整句转换最贵的一步（qingjian 同款结论，他们借此
 /// 12ms→1ms）。缓存失效由持有方负责：凡词库内容或条目 eff 可能变（learn /
 /// import），整个 clear。超 [`MAX_SPAN_CACHE_ENTRIES`] 上限整体丢弃重建。
+#[derive(Default)]
 pub struct SpanCache {
     entries: std::collections::HashMap<String, std::sync::Arc<[Candidate]>>,
 }
@@ -83,14 +84,6 @@ pub struct SpanCache {
 /// 缓存容量上限：一次整句的跨度数 = n(n+1)/2，几十音节的句子几百个，8192 足够；
 /// 超过说明失效逻辑漏了，宁可整清不可无限增长。
 pub const MAX_SPAN_CACHE_ENTRIES: usize = 8192;
-
-impl Default for SpanCache {
-    fn default() -> Self {
-        Self {
-            entries: std::collections::HashMap::new(),
-        }
-    }
-}
 
 impl SpanCache {
     /// 取缓存跨度候选；没有就 `compute` 一次并存入。

@@ -45,7 +45,7 @@ fn neighbor_chars(b: u8) -> impl Iterator<Item = u8> {
     let key = b as char;
     let value: &'static str = NEIGHBORS
         .iter()
-        .find(|(k, _)| k.chars().next() == Some(key))
+        .find(|(k, _)| k.starts_with(key))
         .map(|(_, v)| *v)
         .unwrap_or("");
     value.bytes().filter(|c| c.is_ascii_lowercase())

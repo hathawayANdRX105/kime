@@ -327,7 +327,7 @@ impl Dict {
                 freq: row.get(2)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect()
     }
 
     /// 英文词查询：拿**原始按键串**匹配，不做拼音解码（对齐 rime 的 english translator）。
@@ -392,7 +392,7 @@ impl Dict {
                 user: row.get(4)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect()
     }
 
     /// 读出用户提频计数（`kime_kv` 全表，几十行）。value 格式 n,day；

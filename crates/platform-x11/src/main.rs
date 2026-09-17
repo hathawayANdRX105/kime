@@ -20,7 +20,7 @@ use platform_x11::xim::X11IM;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[platform-x11] Starting X11 frontend...");
 
-    let (conn, _screen_num) = x11rb::connect(None)?;
+    let (conn, screen_num) = x11rb::connect(None)?;
     let conn = Arc::new(conn);
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -29,30 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();
     let engine = Engine::new(dict, config);
 
-    let mut im = X11IM::new(conn.clone(), engine);
+    let mut im = X11IM::new(conn, screen_num, engine)?;
 
     println!("[platform-x11] X11 frontend initialized successfully");
     println!("[platform-x11] XIM event loop starting...");
 
-    im.run();
+    im.run()?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_platform_x11_basic() {
-        assert!(true);
-    }
-
-    #[test]
-    fn test_xim_event_handling() {
-        assert!(true);
-    }
-
-    #[test]
-    fn test_cursor_following() {
-        assert!(true);
-    }
 }

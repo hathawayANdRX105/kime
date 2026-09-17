@@ -31,7 +31,7 @@ impl Table {
     /// 双拼按键串 → 音节序列（小鹤 `"nihc"` → ["ni","hao"]；自然码 `"nihk"` → ["ni","hao"]）。
     /// 长度非偶数 / 组合非法 → Err，engine 据此拦截该键。
     pub fn to_syllables(&self, keys: &str) -> Result<Reading, String> {
-        if keys.len() % 2 != 0 {
+        if !keys.len().is_multiple_of(2) {
             return Err(format!("odd key length: {}", keys.len()));
         }
         let bytes = keys.as_bytes();
@@ -39,7 +39,7 @@ impl Table {
             return Err("non a-z key".into());
         }
         let mut out = Reading::with_capacity(keys.len() / 2);
-        for pair in bytes.chunks_exact(2) {
+        for pair in bytes.as_chunks::<2>().0 {
             match (self.decode)(pair[0], pair[1]) {
                 Some(s) => out.push(s.to_string()),
                 None => {
