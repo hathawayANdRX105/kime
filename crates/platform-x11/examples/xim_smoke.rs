@@ -60,7 +60,7 @@ impl<C: xim::Client<XEvent = KeyPressEvent>> ClientHandler<C> for SmokeHandler {
         println!("[smoke] XIM open ok, im_id={input_method_id}");
         client.get_im_values(
             input_method_id,
-            &vec![xim_parser::AttributeName::QueryInputStyle],
+            &[xim_parser::AttributeName::QueryInputStyle],
         )
     }
 

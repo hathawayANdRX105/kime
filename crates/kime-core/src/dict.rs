@@ -1054,7 +1054,6 @@ impl Dict {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_db(suffix: &str) -> std::path::PathBuf {
