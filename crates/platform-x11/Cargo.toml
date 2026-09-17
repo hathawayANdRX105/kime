@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 kime-core = { path = "../kime-core" }
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
-xim = { version = "0.5", features = ["x11rb-server"] }
+xim = { version = "0.5", features = ["x11rb-server", "x11rb-client"] }
 xim-parser = "0.2"
 xkbcommon = "0.9"
 parking_lot = "0.12"
@@ -21,3 +21,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "platform-x11"
 path = "src/main.rs"
+
+[[example]]
+name = "xim_smoke"
+path = "examples/xim_smoke.rs"
