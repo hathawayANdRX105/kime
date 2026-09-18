@@ -624,6 +624,14 @@ impl Engine {
                         // pending（半截键对）非空时句子没有消耗全部输入 → 不抢层一名次。
                         Self::place_sentences(&mut self.candidates, sentences, &sp_joined);
                     }
+                    // 缺陷 A 回退：以上全部落空（整串无词条、Viterbi 拼不出全覆盖句）
+                    // 时，砍末音节逐档重查，让候选列表非空——用户至少能选到首音节的字。
+                    // preedit / last_reading / last_joined 仍是整串，回退只补候选。
+                    if self.candidates.is_empty() {
+                        if let Some(fb) = self.longest_prefix_candidates(&syllables) {
+                            self.candidates = fb;
+                        }
+                    }
                 }
                 Err(_) => {
                     // 非法键对：按全拼重新切分（preedit 保持原字母串）
@@ -639,10 +647,12 @@ impl Engine {
     }
 
     /// 英文词候选：rime 的英文走独立 translator，匹配**原始按键串**、不做拼音解码，
-    /// 所以双拼/全拼下行为一致。落位按层一契约（与 `place_sentences` 同源）：
-    /// **精确消耗输入的英文词属层一**——插到中文层一块之后（中文层一空时即打头），
-    /// 不许被「哦可哦可」这类层二补全压住；前缀补全英文仍挂全部中文之后（打 `day`
-    /// 先看到中文）。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声灌进每一次按键。
+    /// 所以双拼/全拼下行为一致。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声
+    /// 灌进每一次按键。
+    ///
+    /// 落位（用户裁定）：**中文候选全部在前**——英文块（精确词 + 补全词）整体追加到
+    /// 列表末尾，不再按层一 splice。`lookup_english` 内部恒「精确在前、补全在后」，
+    /// 英文块内顺序不变；层一「精确命中优先于补全」的中文内部规则完全不受影响。
     fn merge_english(&mut self) {
         if self.letters.len() < 2 {
             return;
@@ -653,20 +663,7 @@ impl Engine {
         if en.is_empty() {
             return;
         }
-        // lookup_english 恒「精确词在前、补全在后」（见其层内排序契约）；英文条目的
-        // pinyin 就是词本身 → 大小写不敏感相等即精确消耗输入。
-        let exact_end = en
-            .iter()
-            .take_while(|c| c.pinyin.eq_ignore_ascii_case(&self.letters))
-            .count();
-        let l1_end = self
-            .candidates
-            .iter()
-            .take_while(|c| c.pinyin == self.last_joined)
-            .count();
-        self.candidates
-            .splice(l1_end..l1_end, en[..exact_end].iter().cloned());
-        self.candidates.extend_from_slice(&en[exact_end..]);
+        self.candidates.extend(en);
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
@@ -831,9 +828,39 @@ impl Engine {
                 Self::place_sentences(&mut cands, sentences, &self.last_joined);
             }
         }
+        // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
+        // 用**整串的首切分**音节序列（= 用户敲出的完整读音），无完整切分则无回退空间。
+        if cands.is_empty() {
+            if let Some(fb) = segs.first().and_then(|f| self.longest_prefix_candidates(f)) {
+                cands = fb;
+            }
+        }
         self.candidates = cands;
     }
 
+    /// 缺陷 A：整串无词条、补全/缩写/Viterbi 全都拼不出候选时的最后一道回退——
+    /// 砍掉末音节逐档重查（`[..n-1]` → `[..1]`），取第一个非空结果返回。
+    /// 用户至少能看到首音节的字/词可选；`preedit` / `last_reading` / `last_joined`
+    /// 全部保持整串原样（回退只补候选列表，不改显示与读音语义）。
+    /// 不足一个音节或逐档全空 → `None`。纯查询，不改引擎状态。
+    /// k 从完整长度起：双拼半截键场景下 syllables 是**已凑齐的音节**，末键在
+    /// pending 里——第一档就等于「丢掉 pending 重查」，单音节也能回退（`ni`+pending
+    /// `q` → 回退查 `ni` 本身）。全拼无 pending 时第一档与主查询重复，必空，直接进下一档。
+    fn longest_prefix_candidates(&self, syllables: &[String]) -> Option<Vec<Candidate>> {
+        if syllables.is_empty() {
+            return None;
+        }
+        for k in (1..=syllables.len()).rev() {
+            let cands = self
+                .dict
+                .lookup_prefix(&syllables[..k], "", self.config.candidate_limit)
+                .unwrap_or_default();
+            if !cands.is_empty() {
+                return Some(cands);
+            }
+        }
+        None
+    }
     /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
     ///
     /// 窗口 = 光标前末 1..=4 字：先试 4 字词、再 3、2、1，取频率最高的命中作种子
@@ -1395,6 +1422,8 @@ mod tests {
         let db = tmp_db("page");
         let yaml = std::env::temp_dir().join(format!("kime_page_{}.yaml", std::process::id()));
         std::fs::write(&yaml, "").unwrap();
+        // raw INSERT 前必须建表：Dict::open 负责 schema，缺了 5 个 page_* 测试在 base 上即崩。
+        let _dict = Dict::open(&db).unwrap();
         let conn = rusqlite::Connection::open(&db).unwrap();
         for i in 0..25 {
             conn.execute(
@@ -1562,7 +1591,7 @@ mod tests {
         for c in "ni".chars() {
             e.key(k(c));
         }
-        assert!(e.candidates().len() > 0, "非法配置不影响正常查询");
+        assert!(!e.candidates().is_empty(), "非法配置不影响正常查询");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

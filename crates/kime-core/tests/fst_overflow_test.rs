@@ -107,7 +107,7 @@ fn open_rejects_truncated_and_legacy_dict_bin() {
     }
 
     // 回退路径真的可用：坏 dict.bin 摆在 db 旁边，Dict 仍从 SQLite 查出候选
-    fs::copy(&dir.path().join("legacy2.bin"), &bin).unwrap();
+    fs::copy(dir.path().join("legacy2.bin"), &bin).unwrap();
     let dict = Dict::open(&db).unwrap();
     let hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
     assert_eq!(
