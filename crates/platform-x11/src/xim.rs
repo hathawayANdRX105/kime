@@ -139,7 +139,12 @@ impl Handler {
         };
         let (candidates, highlight) = {
             let engine = self.engine.lock();
-            (engine.candidates().to_vec(), engine.highlight())
+            // 按页切片（与 wayland 前端同律）：candidate_limit 默认 50，
+            // 不切片会把整列候选塞进一行，面板超长占满桌面。
+            let (start, page_size) = engine.page();
+            let all = engine.candidates();
+            let page = all[start.min(all.len())..(start + page_size).min(all.len())].to_vec();
+            (page, engine.highlight().saturating_sub(start))
         };
         if candidates.is_empty() {
             window.hide();
