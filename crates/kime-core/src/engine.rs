@@ -87,6 +87,9 @@ pub struct Engine {
     context: Option<String>,
     /// 词图格子候选缓存（M14）：learn/import 失效，见 lattice::SpanCache。
     span_cache: crate::lattice::SpanCache,
+    /// 上一次 kime 上屏的 (text, reading)，bigram 挖掘的「上文」。
+    /// 比 surrounding_text 可靠：恒为 kime 自己的提交，不含粘贴/启动前的文本。
+    last_commit: Option<(String, String)>,
 }
 
 impl Engine {
@@ -139,6 +142,7 @@ impl Engine {
             last_joined: String::new(),
             after_digit: false,
             context: None,
+            last_commit: None,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -500,6 +504,22 @@ impl Engine {
         } else {
             cand.pinyin.split('\'').map(str::to_string).collect()
         };
+        // 离线 LM 原材料：记录 (上次提交词, 本词) 供挖掘 bigram。
+        // 失败不阻塞上屏（log_commit 内部已吞错）。
+        let prev = self.last_commit.take();
+        self.dict.log_commit(
+            prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
+            &reading,
+            &cand.text,
+        );
+        self.last_commit = Some((cand.text.clone(), reading.join("'")));
+        // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
+        // 顺手检查世代号（离线挖掘跑过则重载缓存）。
+        self.dict.set_lm_context(
+            self.last_commit
+                .as_ref()
+                .map(|(t, r)| (t.as_str(), r.as_str())),
+        );
         if let Err(e) = self.dict.learn(&reading, &cand.text) {
             eprintln!(
                 "[kime] 用户词学习失败 ({} → {}): {}",

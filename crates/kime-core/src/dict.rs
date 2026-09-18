@@ -155,6 +155,18 @@ pub struct Dict {
     user_pinyins: std::collections::HashSet<String>,
     /// `today_days()` 在开库/learn 时刷新的缓存值（比较器热路径不碰系统时钟）。
     today: u64,
+    /// 词表由本进程自己写入，进程内无外部并发写入者，缓存不会脏。
+    vocab_ids: HashMap<(String, String), i64>,
+    /// LM 上下文：上次提交词的 vocab id（None = 无上下文，不加成）。
+    lm_ctx: Option<i64>,
+    /// lm_ctx 的后继 bigram 计数，两级键 text → pinyin → count：
+    /// cand_cmp 每次比较都要查（O(n log n) 次），嵌套结构用 &str 两跳
+    /// 查找，避免扁平 (String,String) 键的每比较两次 String 分配。
+    lm_counts: HashMap<String, HashMap<String, i64>>,
+    /// 已消费的挖掘世代号（kime_kv 'lm_generation'）：变化即重载 lm_counts。
+    lm_generation: i64,
+    /// commit_log 写失败已告警哨兵（一次性 eprintln，防每键刷屏）。
+    lm_warned: bool,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -186,7 +198,11 @@ fn dict_body_lines(path: &Path) -> Result<impl Iterator<Item = String>> {
 }
 
 impl Dict {
-    /// Helper to compute binary dict path alongside DB path
+    /// 只读连接引用：离线挖掘工具与集成测试查 commit_log/bigram 用。
+    /// 不暴露 &mut：写路径必须走 Dict 的方法，保证内存索引与库一致。
+    pub fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
     fn dict_bin_path(db_path: &Path) -> PathBuf {
         db_path
             .parent()
@@ -200,7 +216,12 @@ impl Dict {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
         conn.execute_batch(
-            "PRAGMA synchronous = NORMAL;
+            "PRAGMA journal_mode = WAL;
+             -- WAL：离线挖掘工具批量写时 IME 并发读，零锁冲突。
+             -- journal_mode 持久存于 DB header，已为 WAL 则本行 no-op；
+             -- busy_timeout 不持久，必须每次连接设置（ms）。
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS phrase (
                pinyin  TEXT    NOT NULL,
                text    TEXT    NOT NULL,
@@ -224,7 +245,35 @@ impl Dict {
              CREATE TABLE IF NOT EXISTS kime_kv (
                key   TEXT    NOT NULL PRIMARY KEY,
                value TEXT    NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS commit_log (
+               ts      INTEGER NOT NULL,
+               ctx_id  INTEGER,
+               text_id INTEGER NOT NULL,
+               reading TEXT    NOT NULL
+             );
+             -- vocab = 词表：text/reading 只存一次，bigram 用整数 ID 引用
+             -- （压缩 + 整数比较比文本排序快，见设计文档第四节）。
+             CREATE TABLE IF NOT EXISTS vocab (
+               id      INTEGER PRIMARY KEY,
+               text    TEXT    NOT NULL,
+               reading TEXT    NOT NULL,
+               last_seen INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(text, reading)
+             );
+             -- bigram = 「主表」：仅收录在 commit_log 里重复 >= 2 次的对
+             -- （W-TinyLFU 准入门槛，一次性打错的词进不来）。
+             -- count 周期性全体减半实现老化；超预算按 count ASC, last_seen ASC 淘汰。
+             CREATE TABLE IF NOT EXISTS bigram (
+               prev_id   INTEGER NOT NULL,
+               next_id   INTEGER NOT NULL,
+               count     INTEGER NOT NULL DEFAULT 1,
+               last_seen INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(prev_id, next_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_bigram_prev ON bigram(prev_id);
+             CREATE INDEX IF NOT EXISTS idx_bigram_last ON bigram(count, last_seen);
+             ",
         )?;
         // 用户提频计数先加载：下面内存索引的排序按「有效频率」（裸 freq + 加成）走。
         let user_stats = Self::load_user_stats(&conn)?;
@@ -311,6 +360,11 @@ impl Dict {
             english,
             user_stats,
             today,
+            vocab_ids: HashMap::new(),
+            lm_ctx: None,
+            lm_counts: HashMap::new(),
+            lm_generation: 0,
+            lm_warned: false,
         })
     }
 
@@ -425,9 +479,13 @@ impl Dict {
         c.eff
     }
 
-    /// (有效频率 DESC, text ASC)——候选层的统一排序键，纯字段比较（零哈希零 powf）。
+    /// (有效频率 + LM 上下文加成 DESC, text ASC)——候选层的统一排序键。
+    /// eff 是烘焙好的字段（零哈希零 powf）；lm_boost 是两次内存 HashMap 查找，
+    /// 无上下文/空计数时 O(1) 短路为 0，排序退化为纯 eff。
     fn cand_cmp(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-        b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text))
+        let ka = a.eff as i64 + self.lm_boost(a);
+        let kb = b.eff as i64 + self.lm_boost(b);
+        kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
     }
 
     /// 语料总词频。见字段注释：为什么在开库时算。
@@ -1047,6 +1105,145 @@ impl Dict {
             .partition_point(|e| e.pinyin.as_str() <= stats_key.0.as_str());
         self.index[lo..hi].sort_by(entry_cmp);
         Ok(())
+    }
+
+    /// todo/2026-09-18-offline-lm-design.md 第 0 层）。
+    ///
+    /// `ctx` = 上一次 kime 上屏的词 `(text, reading)`，用来挖掘 bigram。
+    /// 用引擎自记的上次提交而非解析 surrounding_text：后者混着非 kime 输入的文本
+    /// （粘贴、kime 启动前打的字），bigram 会被污染；前者恒为 kime 自己的提交。
+    ///
+    /// 失败**不阻塞上屏**：commit_log 缺失只影响离线排序质量，本次输入照常完成。
+    pub fn log_commit(&mut self, ctx: Option<(&str, &str)>, reading: &[String], text: &str) {
+        if reading.is_empty() || text.is_empty() {
+            return;
+        }
+        let joined = reading.join("'");
+        let today = today_days();
+        let text_id = match self.vocab_id(text, &joined, today) {
+            Some(id) => id,
+            None => return,
+        };
+        let ctx_id = ctx.and_then(|(t, r)| self.vocab_id(t, r, today));
+        // 失败不阻塞上屏（输入法优先级），但不能静默：日志是离线挖掘唯一
+        // 原材料，连失败会掏空排序质量。一次性告警（ lm_warned 哨兵防刷屏
+        // ——每键都打印会淹掉终端）。
+        if let Err(e) = self.conn.execute(
+            "INSERT INTO commit_log(ts, ctx_id, text_id, reading) VALUES (?1, ?2, ?3, ?4)",
+            params![today as i64, ctx_id, text_id, joined],
+        ) {
+            if !self.lm_warned {
+                self.lm_warned = true;
+                eprintln!("[kime] commit_log 写入失败（后续不再重复提示）: {e}");
+            }
+        }
+    }
+
+    /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
+    ///
+    /// 每次 learn 后由引擎调用。挖掘完成使世代号变化时自动重载缓存。
+    /// 查询是一条走主键前缀（bigram 主键 prev_id 打头）的范围扫描，
+    /// 个位数行，微秒级；按键热路径只查内存 HashMap。
+    pub fn set_lm_context(&mut self, prev: Option<(&str, &str)>) {
+        // 世代号变了（离线挖掘跑过）→ vocab id 缓存全部作废重查
+        let gen: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM kime_kv
+                 WHERE key = 'lm_generation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if gen != self.lm_generation {
+            self.lm_generation = gen;
+            self.vocab_ids.clear();
+        }
+        let Some((text, reading)) = prev else {
+            self.lm_ctx = None;
+            self.lm_counts.clear();
+            return;
+        };
+        let Some(ctx) = self.vocab_id(text, reading, today_days()) else {
+            self.lm_ctx = None;
+            self.lm_counts.clear();
+            return;
+        };
+        self.lm_ctx = Some(ctx);
+        self.lm_counts.clear();
+        // JOIN vocab 把 next_id 翻译回 (text, pinyin)：候选排序按 Candidate
+        // 字段直查，不要求每个候选先进过 vocab 缓存。
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT v.text, v.reading, b.count
+             FROM bigram b JOIN vocab v ON v.id = b.next_id
+             WHERE b.prev_id = ?1",
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([ctx], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        for row in rows.flatten() {
+            self.lm_counts
+                .entry(row.0)
+                .or_default()
+                .insert(row.1, row.2);
+        }
+    }
+
+    /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
+    /// 加成直接落排序比较，不碰 eff/导出频率。
+    /// 热路径：两次 &str HashMap 查找，零分配。
+    pub fn lm_boost(&self, c: &Candidate) -> i64 {
+        if self.lm_counts.is_empty() || c.pinyin.is_empty() {
+            return 0;
+        }
+        self.lm_counts
+            .get(c.text.as_str())
+            .and_then(|m| m.get(c.pinyin.as_str()))
+            .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
+            .unwrap_or(0)
+    }
+
+    /// 取（必要时建）vocab 行的 id。`log_commit` 每次提交都调，命中缓存时零 SQL。
+    fn vocab_id(&mut self, text: &str, reading: &str, today: u64) -> Option<i64> {
+        let key = (text.to_string(), reading.to_string());
+        if let Some(&id) = self.vocab_ids.get(&key) {
+            return Some(id);
+        }
+        // SELECT 命中 → 缓存；未命中 → 插入（UNIQUE 冲突说明并发已建，忽略）
+        // 再回查拿 id。不使用 RETURNING：旧 SQLite 不支持，且 execute 不返回行。
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+                params![text, reading],
+                |row| row.get(0),
+            )
+            .ok()
+            .or_else(|| {
+                let _ = self.conn.execute(
+                    "INSERT OR IGNORE INTO vocab(text, reading, last_seen) VALUES (?1, ?2, ?3)",
+                    params![text, reading, today as i64],
+                );
+                self.conn
+                    .query_row(
+                        "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+                        params![text, reading],
+                        |row| row.get(0),
+                    )
+                    .ok()
+            });
+        if let Some(id) = id {
+            self.vocab_ids.insert(key, id);
+        }
+        id
     }
 }
 
