@@ -157,6 +157,12 @@ pub struct Dict {
     today: u64,
     /// 词表由本进程自己写入，进程内无外部并发写入者，缓存不会脏。
     vocab_ids: HashMap<(String, String), i64>,
+    /// LM 上下文：上次提交词的 vocab id（None = 无上下文，不加成）。
+    lm_ctx: Option<i64>,
+    /// lm_ctx 的后继 bigram 计数（next_id → count），set_lm_context 时一次装载。
+    lm_counts: HashMap<i64, i64>,
+    /// 已消费的挖掘世代号（kime_kv 'lm_generation'）：变化即重载 lm_counts。
+    lm_generation: i64,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -351,6 +357,9 @@ impl Dict {
             user_stats,
             today,
             vocab_ids: HashMap::new(),
+            lm_ctx: None,
+            lm_counts: HashMap::new(),
+            lm_generation: 0,
         })
     }
 
@@ -465,9 +474,13 @@ impl Dict {
         c.eff
     }
 
-    /// (有效频率 DESC, text ASC)——候选层的统一排序键，纯字段比较（零哈希零 powf）。
+    /// (有效频率 + LM 上下文加成 DESC, text ASC)——候选层的统一排序键。
+    /// eff 是烘焙好的字段（零哈希零 powf）；lm_boost 是两次内存 HashMap 查找，
+    /// 无上下文/空计数时 O(1) 短路为 0，排序退化为纯 eff。
     fn cand_cmp(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-        b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text))
+        let ka = a.eff as i64 + self.lm_boost(a);
+        let kb = b.eff as i64 + self.lm_boost(b);
+        kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
     }
 
     /// 语料总词频。见字段注释：为什么在开库时算。
@@ -1111,6 +1124,67 @@ impl Dict {
             "INSERT INTO commit_log(ts, ctx_id, text_id, reading) VALUES (?1, ?2, ?3, ?4)",
             params![today as i64, ctx_id, text_id, joined],
         );
+    }
+
+    /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
+    ///
+    /// 每次 learn 后由引擎调用。挖掘完成使世代号变化时自动重载缓存。
+    /// 查询是一条走主键前缀（bigram 主键 prev_id 打头）的范围扫描，
+    /// 个位数行，微秒级；按键热路径只查内存 HashMap。
+    pub fn set_lm_context(&mut self, prev: Option<(&str, &str)>) {
+        // 世代号变了（离线挖掘跑过）→ vocab id 缓存全部作废重查
+        let gen: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM kime_kv
+                 WHERE key = 'lm_generation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if gen != self.lm_generation {
+            self.lm_generation = gen;
+            self.vocab_ids.clear();
+        }
+        let Some((text, reading)) = prev else {
+            self.lm_ctx = None;
+            self.lm_counts.clear();
+            return;
+        };
+        let Some(ctx) = self.vocab_id(text, reading, today_days()) else {
+            self.lm_ctx = None;
+            self.lm_counts.clear();
+            return;
+        };
+        self.lm_ctx = Some(ctx);
+        self.lm_counts.clear();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT next_id, count FROM bigram WHERE prev_id = ?1")
+        else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([ctx], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        else {
+            return;
+        };
+        for row in rows.flatten() {
+            self.lm_counts.insert(row.0, row.1);
+        }
+    }
+
+    /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
+    /// 加成直接落排序比较，不碰 eff/导出频率。
+    /// 热路径：两次内存 HashMap 查找（vocab id 缓存 + counts）。
+    pub fn lm_boost(&self, c: &Candidate) -> i64 {
+        if self.lm_counts.is_empty() || c.pinyin.is_empty() {
+            return 0;
+        }
+        self.vocab_ids
+            .get(&(c.text.clone(), c.pinyin.clone()))
+            .and_then(|id| self.lm_counts.get(id))
+            .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
+            .unwrap_or(0)
     }
 
     /// 取（必要时建）vocab 行的 id。`log_commit` 每次提交都调，命中缓存时零 SQL。

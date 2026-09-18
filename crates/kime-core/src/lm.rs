@@ -19,6 +19,10 @@ pub const MIN_ADMISSION: i64 = 2;
 pub const BIGRAM_BUDGET: i64 = 500_000;
 /// 日志保留窗口（天）：更老的行挖掘后直接删。
 pub const LOG_WINDOW_DAYS: i64 = 30;
+/// LM bigram 加成单位。语料计数 10⁵~10⁷ 量级（同 user_bonus_of 的校准逻辑）：
+/// count=1 的 bigram 给 30 万，足以把低频后继顶到高频词前面；
+/// count=2 → 60 万。与 USER_BOOST 同源，但独立累积互不干扰。
+pub const LM_BOOST_UNIT: i64 = 300_000;
 
 /// 挖掘结果统计。
 #[derive(Debug, Default, PartialEq)]

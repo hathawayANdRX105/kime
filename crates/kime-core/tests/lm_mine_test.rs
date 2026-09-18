@@ -146,3 +146,39 @@ fn mine_evicts_over_budget_lfu_first() {
     assert_eq!(bigram_count(&d, "冷", "门"), 2);
     let _ = fs::remove_file(&db);
 }
+
+/// 端到端验收：同样的拼音「pin」，上文「高」时「频」排第一，
+/// 无上文时按裸频排——上下文真正改变候选顺序（整个机制的核心收益）。
+#[test]
+fn lm_context_reorders_candidates() {
+    let db = tmp_db("reorder");
+    let mut d = Dict::open(&db).unwrap();
+    // 语料：同样读 pin 的两个词，果 100 > 频 10（裸频果在前）
+    let yaml = std::env::temp_dir().join("kime_lm_reorder.yaml");
+    fs::write(&yaml, "...\n果\tpin\t100\n频\tpin\t10\n").unwrap();
+    d.import(&yaml).unwrap();
+
+    // 无上下文：裸频序（果在前）
+    let plain = d.lookup(&["pin".into()], 10).unwrap();
+    assert_eq!(plain[0].text, "果", "无上下文按裸频");
+
+    // 用户习惯：打完「高」总接「频」（5 次），「果」从没接过
+    for _ in 0..5 {
+        d.log_commit(None, &["gao".into()], "高");
+        d.log_commit(Some(("高", "gao")), &["pin".into()], "频");
+    }
+    lm::mine(d.conn()).unwrap();
+
+    // 设置上下文「高」→ 候选序翻转（boost 压过裸频差 10 倍）
+    d.set_lm_context(Some(("高", "gao")));
+    let with_ctx = d.lookup(&["pin".into()], 10).unwrap();
+    assert_eq!(with_ctx[0].text, "频", "上下文「高」后「频」应顶到第一");
+    assert_eq!(with_ctx[1].text, "果");
+
+    // 无上下文恢复裸频序
+    d.set_lm_context(None);
+    let plain2 = d.lookup(&["pin".into()], 10).unwrap();
+    assert_eq!(plain2[0].text, "果", "清上下文后恢复裸频序");
+    let _ = fs::remove_file(&db);
+    let _ = fs::remove_file(&yaml);
+}

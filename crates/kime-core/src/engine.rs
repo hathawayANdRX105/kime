@@ -513,6 +513,13 @@ impl Engine {
             &cand.text,
         );
         self.last_commit = Some((cand.text.clone(), reading.join("'")));
+        // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
+        // 顺手检查世代号（离线挖掘跑过则重载缓存）。
+        self.dict.set_lm_context(
+            self.last_commit
+                .as_ref()
+                .map(|(t, r)| (t.as_str(), r.as_str())),
+        );
         if let Err(e) = self.dict.learn(&reading, &cand.text) {
             eprintln!(
                 "[kime] 用户词学习失败 ({} → {}): {}",
