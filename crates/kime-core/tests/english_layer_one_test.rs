@@ -85,51 +85,43 @@ fn texts(cands: &[Candidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
 
-/// 中文层一空（`ok` 没有任何词读音恰为 o'k）：英文精确词 OK 打头，
-/// 补全词 okay 仍排在所有中文之后（层二末尾）。
+/// 中文层一空（`ok` 没有任何词读音恰为 o'k）：**中文候选（含补全块）全部在前**，
+/// 英文块整体垫底，块内精确 OK 仍先于补全 okay（用户裁定：中文优先）。
 #[test]
-fn english_exact_leads_when_chinese_layer_one_is_empty() {
+fn chinese_completions_precede_all_english() {
     let (mut e, dir) = engine("ok");
     type_letters(&mut e, "ok");
     let got = texts(e.candidates());
-    assert_eq!(
-        got.first().copied(),
-        Some("OK"),
-        "英文精确词必须打头，实际列表 {got:?}"
-    );
-    let ok_pos = got.iter().position(|t| *t == "OK").unwrap();
     let oke_pos = got
         .iter()
         .position(|t| *t == "哦可")
         .expect("哦可 补全在场");
+    let ok_pos = got.iter().position(|t| *t == "OK").unwrap();
     let okay_pos = got.iter().position(|t| *t == "okay").unwrap();
-    assert!(
-        ok_pos < oke_pos,
-        "精确 OK 不许被层二补全 哦可 压住：{got:?}"
+    assert_eq!(
+        got.first().copied(),
+        Some("哦可"),
+        "中文补全块必须打头，实际列表 {got:?}"
     );
     assert!(
-        okay_pos > oke_pos,
-        "英文补全 okay 必须仍挂在中文之后：{got:?}"
+        ok_pos > oke_pos,
+        "中文全部在前，英文精确 OK 不得插到 哦可 之前：{got:?}"
     );
+    assert!(okay_pos > ok_pos, "英文块内精确仍先于补全：{got:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 中文层一非空（`an`：安/按 精确命中）：顺序 = 中文层一块 → 英文精确词 an → 层二补全。
-/// 插入点用 engine 记住的 joined key，与 place_sentences 的层一边界同一约定。
+/// 中文层一非空（`an`：安/按 精确命中）：顺序 = 中文全部（含补全 安排）→ 英文块。
 #[test]
-fn english_exact_sits_after_chinese_layer_one_block() {
+fn english_sits_after_all_chinese_when_layer_one_is_nonempty() {
     let (mut e, dir) = engine("an");
     type_letters(&mut e, "an");
     let got = texts(e.candidates());
-    let pai_pos = got.iter().position(|t| *t == "安排").unwrap();
-    let en_pos = got
-        .iter()
-        .position(|t| *t == "an")
-        .expect("英文精确词 an 在场");
     assert_eq!(&got[..2], ["安", "按"], "中文层一块必须原样打头：{got:?}");
-    assert!(
-        en_pos > 1 && en_pos < pai_pos,
-        "英文精确词必须在中文层一之后、层二补全 安排 之前：{got:?}"
+    assert_eq!(
+        got,
+        ["安", "按", "安排", "an"],
+        "英文整体垫底，中文（含补全）全部在前：{got:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }

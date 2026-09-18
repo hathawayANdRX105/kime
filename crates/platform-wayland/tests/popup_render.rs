@@ -126,3 +126,32 @@ fn chip_is_inked_and_never_highlighted() {
     assert!(chip_pixels(&buf) > 0, "模式字必须用 CHIP 色画上");
     assert_eq!(buf, paint(&mut r, &l, 5), "闪现窗没有候选，高亮无意义");
 }
+
+/// 崩溃复现路径回归：候选窗宽度是 u32 累加，极长候选/字形异常时可能回绕，
+/// 一旦回绕成 0 或与实际 shm 长度不符，合成器就报 wl_shm.create_pool
+/// invalid arguments 并杀掉整条连接（kime-ime 进程死亡，表现为"打着打着突然没输入法"）。
+/// layout 出口必须钳到 create_buffer 的同款上限内，两处上限必须一致。
+#[test]
+fn layout_width_never_exceeds_pool_guard() {
+    let mut r = Renderer::new();
+    // 超长候选：单条 5000 字，强制 x 累加远超 8192
+    let huge = vec!["啊".repeat(5000)];
+    let l = r.layout(&huge);
+    assert!(
+        l.width <= 8192,
+        "layout 宽度 {} 超过 create_buffer 守卫上限，pool size 会与 shm 长度不符",
+        l.width
+    );
+    assert!(l.width >= 1, "宽度回绕成 0 会直接触发尺寸非法");
+    // pixel_len 必须与 create_buffer 的 len = w*h*4 同构，不得溢出
+    assert_eq!(l.pixel_len(), (l.width as usize) * (l.height as usize) * 4);
+
+    // 多条超长候选同样受钳
+    let many = (0..8).map(|_| "啊".repeat(2000)).collect::<Vec<_>>();
+    let l = r.layout(&many);
+    assert!(l.width <= 8192, "多候选累加后宽度 {} 仍然越界", l.width);
+
+    // chip 小窗同律
+    let c = r.chip_layout(true);
+    assert!(c.width <= 8192, "chip 宽度 {} 越界", c.width);
+}

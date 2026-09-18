@@ -130,7 +130,9 @@ impl Renderer {
             });
             x += w + SEP;
         }
-        let width = (x - SEP + MARGIN_X).max(1);
+        // u32 累加无上限：候选极长/字形异常时 x 可能回绕成 0 或极小值，
+        // create_pool 的 size 就与实际 shm 长度不符 → 合成器判 invalid arguments
+        let width = (x - SEP + MARGIN_X).max(1).min(8192);
         let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
         Layout {
             width,
@@ -143,8 +145,8 @@ impl Renderer {
     /// 高度与候选条同律（MARGIN_Y*2 + 行高），宽度 = 单字实测宽 + 左右留白。
     pub fn chip_layout(&mut self, chinese: bool) -> Layout {
         let text = mode_chip(chinese).to_string();
-        let w = self.measure(&text);
         let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
+        let w = self.measure(&text).min(8192);
         Layout {
             width: MARGIN_X * 2 + w,
             height,

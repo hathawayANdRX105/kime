@@ -219,7 +219,7 @@ fn pinyin_concat_segments_to_expected_syllables() {
         let joined = syls.concat();
         let readings = segment(&joined);
         assert!(
-            readings.iter().any(|r| *r == syls),
+            readings.contains(&syls),
             "{w}: segment({joined:?}) 的 {} 种切分里没有 {syls:?}",
             readings.len()
         );
