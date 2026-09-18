@@ -122,6 +122,40 @@
 - [x] 修复 M14 遗留：`context_seed_test` 的 `viterbi_sentences_seeded` 调用补 SpanCache 参数（main 上已编译失败，前轮「33 套件全绿」漏数了此文件）
 - [ ] 二阶段：候选窗内搜索/删除单条历史、持久化开关（默认会话级）、primary selection 监听
 
+## 版本口径（v0.49.33，2026-09-19）
+
+**minor = 功能实数，patch = fix 提交累计**；major 恒 0（无 breaking）。
+复刻剧本：`.agent/tasks/version-bump-v0.49.33.md`（计数规则 / 剔除特征词 / 争议裁定先例 / 步骤）。
+
+当前快照：**49 功能 / 33 fix**（98 提交闭环：38 feat 提交、33 fix、27 其他）。
+为什么不是 silverq 的双 commit 计数（v0.18.16）：feat 提交粒度不稳定，
+功能实数才是产品本体——minor 人审（发版数清单），patch 机数（git grep）。
+
+功能清单（52 项，计数规则见剧本；新增追加、废弃移除）：
+
+- [x] M1（4）：音节切分 404；词库 loader；精确+前缀查询；缩写兜底
+- [x] M2（3）：双拼码表小鹤自然码；用户词自学习；自定义缩写映射
+- [x] M3（1）：Wayland grab→preedit→commit 真上屏
+- [x] M4（2）：wl_shm 渲染管线；cosmic-text CJK
+- [x] M4.5（2）：input-popup 候选摆位；横排自适应宽度
+- [x] M5（4）：翻页+数字选词；模糊音；音节补全；翻页键增强/Enter 原样/数字 0
+- [x] M6（2）：192 万词条词库；范围查询 231x（跨过可用性边界）
+- [x] M6.5（2）：内存双排序索引；二分查找热路径
+- [x] M7（3）：FST build-dict；mmap -81% 内存；用户词 overlay
+- [x] M8（4）：中文标点+顶字；TOML 配置；候选窗主题；Viterbi 句级联想
+- [x] M9（4）：中英切换；托盘；LLM 联想；config 热更新
+- [x] M10（2）：用户调频方案 B；分词混排
+- [x] M11（1）：surrounding_text 上下文+末词种子
+- [x] M12（2）：邻键纠错；半截键补全
+- [x] M13（2）：eff 烘焙 7.5x；typing_probe 探针
+- [x] M14（1）：SpanCache
+- [x] M16（4）：剪贴板 ClipStore；deskctl snippets；`C-;` 交互路由；隐私投递路径
+- [x] PR#27（1）：XIM server
+- [x] PR#28（1）：中文优先排序（fix 提交，功能/fix 双计）
+- [x] PR#32（4）：commit_log 采集；mine-lm 挖掘；bigram 上下文加成；自动组词
+
+合计：4+3+1+2+2+4+2+2+3+4+4+2+1+2+2+1+4+1+1+4 = 49 ✓
+
 ## M17 — 待规划
 
 - [ ] XIM 协议前端（解决 XWayland 光标对齐）
