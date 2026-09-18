@@ -125,7 +125,7 @@
 ## 版本口径（v0.49.33，2026-09-19）
 
 **minor = 功能实数，patch = fix 提交累计**；major 恒 0（无 breaking）。
-复刻剧本：`.agent/tasks/version-bump-v0.49.33.md`（计数规则 / 剔除特征词 / 争议裁定先例 / 步骤）。
+复刻剧本：`.agent/tasks/versioning.md`（计数规则 / 剔除特征词 / 争议裁定先例 / 步骤）。
 
 当前快照：**49 功能 / 33 fix**（98 提交闭环：38 feat 提交、33 fix、27 其他）。
 为什么不是 silverq 的双 commit 计数（v0.18.16）：feat 提交粒度不稳定，
