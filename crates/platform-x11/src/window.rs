@@ -29,7 +29,7 @@ use crate::render::{RenderedFrame, Renderer};
 /// 候选窗左缘相对光标点的水平偏移（不要贴着光标）
 pub const SPOT_DX: i32 = 5;
 /// 候选窗顶边相对光标点的垂直偏移（约一行高度，把候选条放在光标所在行下方）
-pub const SPOT_DY: i32 = 25;
+pub const SPOT_DY: i32 = 18;
 /// 下溢翻到光标上方时，候选窗底边与光标点的净空（一行高度，避免压住光标行）
 pub const SPOT_UP_CLEARANCE: i32 = 22;
 
