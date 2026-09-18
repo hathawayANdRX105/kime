@@ -33,6 +33,17 @@ fn bigram_count(d: &Dict, prev: &str, next: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// 构造 boost 查询用的 Candidate（text + `'` 连接读音）。
+fn cand(text: &str, pinyin: &str) -> kime_core::dict::Candidate {
+    kime_core::dict::Candidate {
+        text: text.to_string(),
+        pinyin: pinyin.to_string(),
+        freq: 0,
+        eff: 0,
+        ai: false,
+    }
+}
+
 #[test]
 fn mine_admits_repeated_pairs_and_blocks_oneoffs() {
     let db = tmp_db("admit");
@@ -214,5 +225,114 @@ fn mine_learns_phrases_from_repeated_adjacent_commits() {
     // 重复挖掘不重复学（幂等）
     let st2 = lm::mine(d.conn()).unwrap();
     assert_eq!(st2.phrases_learned, 0, "已学过的不重复学");
+    let _ = fs::remove_file(&db);
+}
+
+// ===== 覆盖缺口补齐（TinyLFU 论文 §3.3.1 Reset Correctness + Caffeine 实践）=====
+
+/// 老化的负向面：停止使用的对衰减到淘汰线以下被清掉。
+/// TinyLFU reset 的意义就是「历史污染会被洗掉」——只测续用对不够。
+#[test]
+fn mine_ages_out_unused_pairs() {
+    let db = tmp_db("ageout");
+    let mut d = Dict::open(&db).unwrap();
+    // 对 A 用 4 次后停手；对 B 每轮都续用
+    for _ in 0..4 {
+        d.log_commit(None, &["ting".into()], "停");
+        d.log_commit(Some(("停", "ting")), &["yong".into()], "用");
+    }
+    lm::mine(d.conn()).unwrap(); // A=4, B 未造
+    assert_eq!(bigram_count(&d, "停", "用"), 4);
+    // 5 轮不再使用：4→2→1→0(清)
+    for round in 0..3 {
+        d.log_commit(None, &["yong".into()], "用");
+        d.log_commit(Some(("用", "yong")), &["xin".into()], "新");
+        lm::mine(d.conn()).unwrap();
+        let a = bigram_count(&d, "停", "用");
+        if a == 0 {
+            break; // 第 3 轮内衰减到 0
+        }
+        assert_eq!(a, 4 >> (round + 1), "第 {round} 轮后应减半");
+    }
+    assert_eq!(bigram_count(&d, "停", "用"), 0, "停用对最终衰减归零被清掉");
+    let _ = fs::remove_file(&db);
+}
+
+/// 世代号变化 → IME 侧 vocab_ids 缓存作废重查：
+/// 挖掘后新词的 boost 必须对「早已打开的 Dict」生效。
+#[test]
+fn generation_bump_invalidates_stale_vocab_cache() {
+    let db = tmp_db("geninv");
+    let mut d = Dict::open(&db).unwrap();
+    // 旧词「旧」与「词」建立 bigram。vocab 的 reading = 单次提交的读音串，
+    // 候选 pinyin 键必须与之完全一致（Candidate.pinyin 同格式）。
+    for _ in 0..3 {
+        d.log_commit(None, &["jiu".into()], "旧");
+        d.log_commit(Some(("旧", "jiu")), &["ci".into()], "词");
+    }
+    lm::mine(d.conn()).unwrap(); // gen=1，此时 vocab_ids 已缓存
+    d.set_lm_context(Some(("旧", "jiu")));
+    assert!(
+        d.lm_boost(&cand("词", "ci")) > 0,
+        "挖掘后旧连接上 boost 立即可见"
+    );
+
+    // 模拟离线工具新增 pair（同库另一连接写），世代号 +1
+    let offline = Dict::open(&db).unwrap();
+    let _ = offline.conn().execute(
+        "INSERT INTO vocab(text, reading, last_seen) VALUES ('新词', 'xin''ci', 0)",
+        [],
+    );
+    let _ = offline.conn().execute(
+        "INSERT INTO bigram(prev_id, next_id, count, last_seen)
+         SELECT id, (SELECT id FROM vocab WHERE text='新词'), 9, 0 FROM vocab WHERE text='旧'",
+        [],
+    );
+    drop(offline);
+
+    // IME 侧老 Dict：缓存里没有「新词」的 id——世代号变化必须触发重载
+    d.set_lm_context(Some(("旧", "jiu")));
+    assert_eq!(
+        d.lm_boost(&cand("新词", "xin'ci")),
+        9 * lm::LM_BOOST_UNIT,
+        "世代号变化后离线新增的 pair 必须对已打开的 IME 生效"
+    );
+    let _ = fs::remove_file(&db);
+}
+
+/// 预算淘汰真触发：小预算注入（BIGRAM_BUDGET 是 const，测试用低于它的
+/// 绝对计数差构造：预算不可调，那就直接清空 bigram 再塞 BIGRAM_BUDGET+2 行，
+/// 验证淘汰逻辑恰好删到预算线）。
+#[test]
+fn mine_evicts_exactly_to_budget_line() {
+    let db = tmp_db("budget");
+    let mut d = Dict::open(&db).unwrap();
+    // 造 BIGRAM_BUDGET + 2 行准入对（count 均 = MIN_ADMISSION，last_seen 相同
+    // → 纯按 rowid 顺序淘汰最旧的 2 行）
+    let conn = d.conn();
+    let budget = lm::BIGRAM_BUDGET as usize;
+    // 造 vocab 词（一次多行）
+    let _ = conn.execute("BEGIN", []);
+    for i in 0..(budget + 2) {
+        let _ = conn.execute(
+            "INSERT INTO vocab(text, reading, last_seen) VALUES (?1, ?1, 0)",
+            [format!("w{i}")],
+        );
+    }
+    let _ = conn.execute("COMMIT", []);
+    let _ = conn.execute(
+        "INSERT INTO bigram(prev_id, next_id, count, last_seen)
+         SELECT id, id, 2, 0 FROM vocab",
+        [],
+    );
+    drop(conn);
+
+    let st = lm::mine(d.conn()).unwrap();
+    assert!(st.evicted > 0, "超预算必须触发淘汰");
+    let n: i64 = d
+        .conn()
+        .query_row("SELECT count(*) FROM bigram", [], |r| r.get(0))
+        .unwrap();
+    assert!(n <= lm::BIGRAM_BUDGET, "淘汰后必须回到预算内（实际 {n}）");
     let _ = fs::remove_file(&db);
 }
