@@ -1160,9 +1160,12 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 // 自解码：grab 建立时合成器就发一次 keymap，之后变化时再发；
                 // 这里把它编译成 xkb Keymap，失败/格式不支持则沿用上一份（比没有强，也比错表强）。
                 if fmt == KEYMAP_FORMAT_XKB_V1 {
+                    // fd 偏移可能不在 0（dup 共享偏移，合成器/wayland 库可能已读过），
+                    // 读前必须复位，否则 read_to_string 读到空 → XKB-822 解析失败。
                     let loaded = dup_fd(&fd)
                         .map(File::from)
                         .and_then(|mut f| {
+                            let _ = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_SET) };
                             let mut text = String::new();
                             f.read_to_string(&mut text).ok().map(|_| text)
                         })
