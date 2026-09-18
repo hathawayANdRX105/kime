@@ -159,8 +159,10 @@ pub struct Dict {
     vocab_ids: HashMap<(String, String), i64>,
     /// LM 上下文：上次提交词的 vocab id（None = 无上下文，不加成）。
     lm_ctx: Option<i64>,
-    /// lm_ctx 的后继 bigram 计数（next_id → count），set_lm_context 时一次装载。
-    lm_counts: HashMap<i64, i64>,
+    /// lm_ctx 的后继 bigram 计数，键 = (text, pinyin)——候选排序按
+    /// Candidate 的字段直接查，不需要每个候选都有 vocab id。
+    /// 装载时 JOIN vocab 一次拿全文本键，热路径零回查。
+    lm_counts: HashMap<(String, String), i64>,
     /// 已消费的挖掘世代号（kime_kv 'lm_generation'）：变化即重载 lm_counts。
     lm_generation: i64,
 }
@@ -1158,31 +1160,38 @@ impl Dict {
         };
         self.lm_ctx = Some(ctx);
         self.lm_counts.clear();
-        let Ok(mut stmt) = self
-            .conn
-            .prepare("SELECT next_id, count FROM bigram WHERE prev_id = ?1")
-        else {
+        // JOIN vocab 把 next_id 翻译回 (text, pinyin)：候选排序按 Candidate
+        // 字段直查，不要求每个候选先进过 vocab 缓存。
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT v.text, v.reading, b.count
+             FROM bigram b JOIN vocab v ON v.id = b.next_id
+             WHERE b.prev_id = ?1",
+        ) else {
             return;
         };
-        let Ok(rows) = stmt.query_map([ctx], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
-        else {
+        let Ok(rows) = stmt.query_map([ctx], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }) else {
             return;
         };
         for row in rows.flatten() {
-            self.lm_counts.insert(row.0, row.1);
+            self.lm_counts.insert((row.0, row.1), row.2);
         }
     }
 
     /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
     /// 加成直接落排序比较，不碰 eff/导出频率。
-    /// 热路径：两次内存 HashMap 查找（vocab id 缓存 + counts）。
+    /// 热路径：一次内存 HashMap 查找。
     pub fn lm_boost(&self, c: &Candidate) -> i64 {
         if self.lm_counts.is_empty() || c.pinyin.is_empty() {
             return 0;
         }
-        self.vocab_ids
+        self.lm_counts
             .get(&(c.text.clone(), c.pinyin.clone()))
-            .and_then(|id| self.lm_counts.get(id))
             .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
             .unwrap_or(0)
     }

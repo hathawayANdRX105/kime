@@ -182,3 +182,37 @@ fn lm_context_reorders_candidates() {
     let _ = fs::remove_file(&db);
     let _ = fs::remove_file(&yaml);
 }
+
+/// 自动组词：「项目」+「进度」反复相邻提交（≥ PHRASE_ADMISSION 次）后，
+/// 挖掘应学出「项目进度」这个词——下次打 xiang'mu'jin'du 整串直接出。
+#[test]
+fn mine_learns_phrases_from_repeated_adjacent_commits() {
+    let db = tmp_db("phrase");
+    let mut d = Dict::open(&db).unwrap();
+    for _ in 0..lm::PHRASE_ADMISSION {
+        d.log_commit(None, &["xiang".into(), "mu".into()], "项目");
+        d.log_commit(
+            Some(("项目", "xiang'mu")),
+            &["jin".into(), "du".into()],
+            "进度",
+        );
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(st.phrases_learned, 1, "应学出 1 个新词");
+
+    // 词库里有「项目进度」，读音 xiang'mu'jin'du
+    let hit: i64 = d
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM phrase WHERE pinyin = 'xiang''mu''jin''du' AND text = '项目进度'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hit, 1);
+
+    // 重复挖掘不重复学（幂等）
+    let st2 = lm::mine(d.conn()).unwrap();
+    assert_eq!(st2.phrases_learned, 0, "已学过的不重复学");
+    let _ = fs::remove_file(&db);
+}

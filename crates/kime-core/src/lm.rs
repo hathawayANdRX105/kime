@@ -37,6 +37,8 @@ pub struct MineStats {
     pub evicted: i64,
     /// 清掉的日志行数
     pub purged_rows: i64,
+    /// 自动组词新学的用户词数
+    pub phrases_learned: i64,
     /// 写入的新世代号
     pub generation: i64,
 }
@@ -93,6 +95,14 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
 
     // 清日志（环形）：全量已合并进主表
     st.purged_rows = conn.execute("DELETE FROM commit_log", [])? as i64;
+    // 主事务提交：bigram 计数/淘汰/清日志原子生效
+    conn.execute_batch("COMMIT")?;
+
+    // 自动组词：反复相邻提交的对（≥ PHRASE_ADMISSION 次）learn 成用户词。
+    // 用户打「项目」+「进度」若干次后，下次打 xiang'mu'jin'du 整串直接出
+    // 「项目进度」——替用户完成组词（设计文档第 5 步）。
+    // 独立执行：组词失败不影响已提交的 bigram 主数据。
+    st.phrases_learned = mine_phrases(conn).unwrap_or(0);
 
     // 世代号 +1：IME 读到变化即重载 boost 表
     conn.execute(
@@ -109,7 +119,6 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
         .parse()
         .unwrap_or(0);
 
-    conn.execute_batch("COMMIT")?;
     let _ = today;
     Ok(st)
 }
@@ -122,4 +131,77 @@ fn today_days() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64 / 86_400)
         .unwrap_or(0)
+}
+
+/// 自动组词准入线：相邻对出现 ≥ 此次数才值得学成词。
+/// 必须明显高于 bigram 的 MIN_ADMISSION(2)：学错词的代价（词库污染）
+/// 远高于漏学，宁缺勿滥。
+pub const PHRASE_ADMISSION: i64 = 5;
+
+/// 把反复相邻的对 learn 成用户词。
+///
+/// 数据源：本轮日志清空前的对计数已在 bigram 主表里——直接读 bigram
+/// （含历史累积），对 count ≥ PHRASE_ADMISSION 且还没学过的执行 learn。
+/// 拼接读音：prev.reading + "'" + next.reading（vocab 里存着）。
+/// 已是词库精确行的跳过（learn 幂等，但省一次写）。
+fn mine_phrases(conn: &Connection) -> rusqlite::Result<i64> {
+    let pairs: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT pv.text || ' ' || nx.text,
+                    pv.reading || ' ' || nx.reading,
+                    b.count
+             FROM bigram b
+             JOIN vocab pv ON pv.id = b.prev_id
+             JOIN vocab nx ON nx.id = b.next_id
+             WHERE b.count >= ?
+               AND pv.reading != '' AND nx.reading != ''
+               AND pv.reading NOT LIKE '% %' AND nx.reading NOT LIKE '% %'
+             ORDER BY b.count DESC
+             LIMIT 50",
+        )?;
+        let rows = stmt.query_map([PHRASE_ADMISSION], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.flatten().collect()
+    };
+    let mut learned = 0i64;
+    for (text_pair, reading_pair, _) in pairs {
+        // text_pair = "项目 进度"，reading_pair = "xiang'mu jin'du"
+        let (Some(pt), Some(nt)) = (text_pair.split_once(' '), reading_pair.split_once(' ')) else {
+            continue;
+        };
+        let (p_text, n_text) = pt;
+        let (p_read, n_read) = nt;
+        let joined_text = format!("{p_text}{n_text}");
+        let joined_reading = format!("{p_read}'{n_read}");
+        // 已在词库（同读音同文本）→ 跳过
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM phrase WHERE pinyin = ?1 AND text = ?2)",
+                [&joined_reading, &joined_text],
+                |r| r.get(0),
+            )
+            .unwrap_or(true);
+        if exists {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO phrase(pinyin, text, freq, abbrev, user)
+             VALUES (?1, ?2, 1, ?3, 1)",
+            rusqlite::params![
+                joined_reading,
+                joined_text,
+                joined_reading
+                    .chars()
+                    .filter(|c| *c != '\'')
+                    .collect::<String>()
+            ],
+        )?;
+        learned += 1;
+    }
+    Ok(learned)
 }
