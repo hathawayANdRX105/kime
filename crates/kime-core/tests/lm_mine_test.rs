@@ -108,12 +108,13 @@ fn mine_ages_counts_and_purges_log() {
         "老化减半(4→2) + 本轮4 = 6"
     );
 
-    // 日志清空（环形不累积）
+    // 日志：已合并的对被删（防双重计数），未合并的保留到下轮
+    // （本测试两轮都是同一对，两轮都已合并 → 应全部清掉）
     let log_n: i64 = d
         .conn()
         .query_row("SELECT count(*) FROM commit_log", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(log_n, 0, "挖掘后日志清空");
+    assert_eq!(log_n, 0, "已合并对不残留（防下轮双重计数）");
     let _ = fs::remove_file(&db);
 }
 

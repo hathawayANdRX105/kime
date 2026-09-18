@@ -159,12 +159,14 @@ pub struct Dict {
     vocab_ids: HashMap<(String, String), i64>,
     /// LM 上下文：上次提交词的 vocab id（None = 无上下文，不加成）。
     lm_ctx: Option<i64>,
-    /// lm_ctx 的后继 bigram 计数，键 = (text, pinyin)——候选排序按
-    /// Candidate 的字段直接查，不需要每个候选都有 vocab id。
-    /// 装载时 JOIN vocab 一次拿全文本键，热路径零回查。
-    lm_counts: HashMap<(String, String), i64>,
+    /// lm_ctx 的后继 bigram 计数，两级键 text → pinyin → count：
+    /// cand_cmp 每次比较都要查（O(n log n) 次），嵌套结构用 &str 两跳
+    /// 查找，避免扁平 (String,String) 键的每比较两次 String 分配。
+    lm_counts: HashMap<String, HashMap<String, i64>>,
     /// 已消费的挖掘世代号（kime_kv 'lm_generation'）：变化即重载 lm_counts。
     lm_generation: i64,
+    /// commit_log 写失败已告警哨兵（一次性 eprintln，防每键刷屏）。
+    lm_warned: bool,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -362,6 +364,7 @@ impl Dict {
             lm_ctx: None,
             lm_counts: HashMap::new(),
             lm_generation: 0,
+            lm_warned: false,
         })
     }
 
@@ -1122,10 +1125,18 @@ impl Dict {
             None => return,
         };
         let ctx_id = ctx.and_then(|(t, r)| self.vocab_id(t, r, today));
-        let _ = self.conn.execute(
+        // 失败不阻塞上屏（输入法优先级），但不能静默：日志是离线挖掘唯一
+        // 原材料，连失败会掏空排序质量。一次性告警（ lm_warned 哨兵防刷屏
+        // ——每键都打印会淹掉终端）。
+        if let Err(e) = self.conn.execute(
             "INSERT INTO commit_log(ts, ctx_id, text_id, reading) VALUES (?1, ?2, ?3, ?4)",
             params![today as i64, ctx_id, text_id, joined],
-        );
+        ) {
+            if !self.lm_warned {
+                self.lm_warned = true;
+                eprintln!("[kime] commit_log 写入失败（后续不再重复提示）: {e}");
+            }
+        }
     }
 
     /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
@@ -1179,19 +1190,23 @@ impl Dict {
             return;
         };
         for row in rows.flatten() {
-            self.lm_counts.insert((row.0, row.1), row.2);
+            self.lm_counts
+                .entry(row.0)
+                .or_default()
+                .insert(row.1, row.2);
         }
     }
 
     /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
     /// 加成直接落排序比较，不碰 eff/导出频率。
-    /// 热路径：一次内存 HashMap 查找。
+    /// 热路径：两次 &str HashMap 查找，零分配。
     pub fn lm_boost(&self, c: &Candidate) -> i64 {
         if self.lm_counts.is_empty() || c.pinyin.is_empty() {
             return 0;
         }
         self.lm_counts
-            .get(&(c.text.clone(), c.pinyin.clone()))
+            .get(c.text.as_str())
+            .and_then(|m| m.get(c.pinyin.as_str()))
             .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
             .unwrap_or(0)
     }

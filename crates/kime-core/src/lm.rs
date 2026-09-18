@@ -17,8 +17,6 @@ use rusqlite::Connection;
 pub const MIN_ADMISSION: i64 = 2;
 /// bigram 主表软预算（行数）。超出按 count ASC, last_seen ASC 淘汰。
 pub const BIGRAM_BUDGET: i64 = 500_000;
-/// 日志保留窗口（天）：更老的行挖掘后直接删。
-pub const LOG_WINDOW_DAYS: i64 = 30;
 /// LM bigram 加成单位。语料计数 10⁵~10⁷ 量级（同 user_bonus_of 的校准逻辑）：
 /// count=1 的 bigram 给 30 万，足以把低频后继顶到高频词前面；
 /// count=2 → 60 万。与 USER_BOOST 同源，但独立累积互不干扰。
@@ -93,8 +91,21 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
     )?;
     st.evicted = conn.query_row("SELECT changes()", [], |r| r.get(0))?;
 
-    // 清日志（环形）：全量已合并进主表
-    st.purged_rows = conn.execute("DELETE FROM commit_log", [])? as i64;
+    // 清日志：**只删已合并进主表的行**（对计数 ≥ MIN_ADMISSION）。
+    // 未达门槛的行保留——它们下轮可能凑够准入线；已合并的必须删，
+    // 否则下轮 UPSERT 累加会双重计数。
+    // ctx_id IS NULL 的行（每次提交序列的首词）永远进不了 bigram，
+    // 留着纯属无界累积（审查发现 C2 的真实形态）——一并删掉。
+    st.purged_rows = conn.execute(
+        "DELETE FROM commit_log WHERE ctx_id IS NULL
+             OR (ctx_id, text_id) IN (
+               SELECT ctx_id, text_id FROM commit_log
+               WHERE ctx_id IS NOT NULL
+               GROUP BY ctx_id, text_id
+               HAVING count(*) >= 2
+             )",
+        [],
+    )? as i64;
     // 主事务提交：bigram 计数/淘汰/清日志原子生效
     conn.execute_batch("COMMIT")?;
 
@@ -178,6 +189,11 @@ fn mine_phrases(conn: &Connection) -> rusqlite::Result<i64> {
         let (p_read, n_read) = nt;
         let joined_text = format!("{p_text}{n_text}");
         let joined_reading = format!("{p_read}'{n_read}");
+        // 长度防线：>8 字的「词」几乎必是切分歪了（如「项目进」+「度进度」
+        // 类长链），学进词库是污染。词库常规词 2-4 字。
+        if joined_text.chars().count() > 8 {
+            continue;
+        }
         // 已在词库（同读音同文本）→ 跳过
         let exists: bool = conn
             .query_row(
