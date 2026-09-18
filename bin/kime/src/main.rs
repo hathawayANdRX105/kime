@@ -177,6 +177,37 @@ fn main() -> ExitCode {
             let sub_args: Vec<String> = args_iter.collect();
             return handle_english_cmd(&sub_args);
         }
+        Some("mine-lm") => {
+            let mut dict_path: Option<PathBuf> = None;
+            let mut sub_args = args_iter.peekable();
+            while let Some(arg) = sub_args.next() {
+                if arg == "--dict" {
+                    dict_path = sub_args.next().map(PathBuf::from);
+                }
+            }
+            let path = dict_path.unwrap_or_else(default_dict_path);
+            let start = std::time::Instant::now();
+            return match Dict::open(&path) {
+                Ok(d) => match kime_core::lm::mine(d.conn()) {
+                    Ok(st) => {
+                        eprintln!(
+                            "mined: log {} rows, admitted {} pairs, evicted {}, purged {}, gen {} in {:?}",
+                            st.log_rows, st.admitted, st.evicted, st.purged_rows, st.generation,
+                            start.elapsed()
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("mine-lm error: {e}");
+                        ExitCode::from(2)
+                    }
+                },
+                Err(e) => {
+                    eprintln!("mine-lm: 无法打开词库 {}: {e}", path.display());
+                    ExitCode::from(2)
+                }
+            };
+        }
         _ => {}
     }
 
