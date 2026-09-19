@@ -61,5 +61,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .body > body.md
-          sed -E 's/ by @[-A-Za-z0-9_]+ in #[0-9]+//' body.md > body_clean.md
+          sed -E 's/ by @[-A-Za-z0-9_]+ in (#[0-9]+|https://[^ )]+)//g' body.md > body_clean.md
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -F body=@body_clean.md --jq .name
