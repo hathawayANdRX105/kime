@@ -442,6 +442,9 @@ impl Engine {
                         let text = cand.text.clone();
                         self.learn_or_warn(&cand);
                         self.clear_composition();
+                        // 数字在此被消费成中文候选上屏，不是输出字面数字；
+                        // after_digit 必须清零，否则下一个 ,.: 会被误当数字分隔符放行半角。
+                        self.after_digit = false;
                         return Outcome::Commit(text);
                     }
                     return Outcome::Ignored;
@@ -553,7 +556,25 @@ impl Engine {
             let (decoded, pending, half_key_syls) = {
                 let table = self.sp.as_ref().unwrap();
                 if len.is_multiple_of(2) {
-                    (table.to_syllables(&self.letters), String::new(), Vec::new())
+                    match table.to_syllables(&self.letters) {
+                        ok @ Ok(_) => (ok, String::new(), Vec::new()),
+                        Err(_) => {
+                            // 非法键对（如自然码 xk=x+ao「xao」不存在的音节）：
+                            // 双拼键序回退全拼几乎必然无解——键序含 v 等全拼
+                            // 不存在的字母，segment 必空 → 0 候选 → 候选窗
+                            // 消失、翻页失效。改为解码最长合法偶数前缀（剩余
+                            // 键不参与查询），保住已敲部分的候选；连首键对都
+                            // 解不出时保持 Err，由下游 match 退全拼混输兜底。
+                            let mut fb: Result<Vec<String>, String> = Err(String::new());
+                            for cut in (2..len).step_by(2).rev() {
+                                if let ok @ Ok(_) = table.to_syllables(&self.letters[..cut]) {
+                                    fb = ok;
+                                    break;
+                                }
+                            }
+                            (fb, String::new(), Vec::new())
+                        }
+                    }
                 } else {
                     // 最后一个键还没凑成键对，它代表的是**声母**而不是拼音字母：
                     // 直接拿它当拼音前缀去查，等于查 "u" 开头的词，半截状态必出垃圾。

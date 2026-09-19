@@ -162,17 +162,19 @@ fn punct_mapping_outside_digit_context_unchanged() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 「数字键无论 outcome 置位」：`1` 选词上屏（Commit 而非 Ignored）之后，
-/// 紧跟的 `.` 仍必须直通半角 —— 打「你好。1.5」这类混排不乱吃全角。
+/// 数字键被「消费」成选词（Commit 中文而非上屏字面数字）时，after_digit
+/// 必须清零：此时用户在打中文，紧随的 . 应走全角标点，而不是被
+/// digit_sep 分支放行半角（「中文打字偶尔出现英文逗号」的根因）。
+/// 「1.5」这类真数字走的是 Ignored 直通路径，不经过选词，不受影响。
 #[test]
-fn digit_separator_after_selection_commit() {
+fn digit_separator_cleared_after_selection_commit() {
     let (mut e, dir) = engine();
     type_letters(&mut e, "ni");
     assert_eq!(press(&mut e, '1'), Outcome::Commit("你".into()));
     assert_eq!(
         press(&mut e, '.'),
-        Outcome::Ignored,
-        "选词提交后仍是「数字之后」，. 直通"
+        Outcome::Commit("。".into()),
+        "选词提交后已不是「数字之后」，. 应为全角句号"
     );
     fs::remove_dir_all(dir).unwrap();
 }

@@ -66,6 +66,10 @@ jobs:
             libfontconfig1-dev \
             libxcb1-dev \
             pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests
+        # 全部测试均为离线（xkb 文本直喂、内存字典），无需 Wayland/X 显示。
+        run: cargo test --workspace --all-targets
 
   perf:
     name: Benchmark (synthetic dict)
