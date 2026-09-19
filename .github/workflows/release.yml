@@ -46,7 +46,7 @@ jobs:
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "kime ${GITHUB_REF_NAME}"
+          name: "kime ${{ github.ref_name }}"
           generate_release_notes: true
           files: |
             dist/kime
