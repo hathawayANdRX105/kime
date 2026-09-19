@@ -128,7 +128,7 @@
 
 - **major = 用户确认**（breaking change 由用户拍板，当前 0）
 - **minor = 用户可感知功能域数**（逐 crate 代码清点，codegraph 辅助，排除管道模块，可复现）
-- **patch = fix commit 累计**（`git log --no-merges --oneline | grep -cE '^ fix'`，机数）
+- **patch = fix commit 累计**（`git log --no-merges --format="%s" | grep -cE "^fix"`，机数）
 
 操作手册（怎么数 / 排除哪些管道 / 更新步骤 / 校验）：`.agent/tasks/versioning.md`。
 之前误用「ROADMAP 子功能勾选数（49）」当 minor 来源——那是手维护清单会漂移；真源是代码。

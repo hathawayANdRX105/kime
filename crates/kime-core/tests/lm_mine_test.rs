@@ -307,7 +307,7 @@ fn generation_bump_invalidates_stale_vocab_cache() {
 #[test]
 fn mine_evicts_exactly_to_budget_line() {
     let db = tmp_db("budget");
-    let mut d = Dict::open(&db).unwrap();
+    let d = Dict::open(&db).unwrap();
     // 造 BIGRAM_BUDGET + 2 行准入对（count 均 = MIN_ADMISSION，last_seen 相同
     // → 纯按 rowid 顺序淘汰最旧的 2 行）
     let conn = d.conn();
@@ -326,7 +326,6 @@ fn mine_evicts_exactly_to_budget_line() {
          SELECT id, id, 2, 0 FROM vocab",
         [],
     );
-    drop(conn);
 
     let st = lm::mine(d.conn()).unwrap();
     assert!(st.evicted > 0, "超预算必须触发淘汰");
