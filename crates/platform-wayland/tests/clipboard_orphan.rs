@@ -66,10 +66,7 @@ fn parent() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // 留证据不如清干净
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
+    // 不做清理 kill：失败现场保留给排查，sleep 30s 后自然退出
     panic!("armed 子进程 pid={pid} 在父进程退出后仍存活 = 孤儿回归（PDEATHSIG 失效）");
 }
 
