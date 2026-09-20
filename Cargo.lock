@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "kime"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "kime-core",
  "kime-shuangpin",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "kime-core"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "anyhow",
  "fst",
@@ -885,18 +885,18 @@ dependencies = [
 
 [[package]]
 name = "kime-pinyin"
-version = "0.19.37"
+version = "0.19.38"
 
 [[package]]
 name = "kime-root"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "kime-core",
 ]
 
 [[package]]
 name = "kime-shuangpin"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "kime-pinyin",
  "serde",
@@ -1121,7 +1121,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform-wayland"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "cosmic-text",
  "fontdb 0.24.0",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "platform-x11"
-version = "0.19.37"
+version = "0.19.38"
 dependencies = [
  "cosmic-text",
  "kime-core",
