@@ -37,6 +37,7 @@ jobs:
 
       - name: Package
         run: |
+          mkdir -p dist
           cp target/release/kime target/release/platform-wayland target/release/platform-x11 dist/
           tar -C dist -czf "kime-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" kime platform-wayland platform-x11
           cd dist && sha256sum kime platform-wayland platform-x11 > SHA256SUMS.txt
