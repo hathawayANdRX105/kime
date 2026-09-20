@@ -31,6 +31,7 @@ const KEY_H: u32 = 35;
 const KEY_N: u32 = 49;
 const KEY_PERIOD: u32 = 52;
 const KEY_2: u32 = 3;
+const KEY_ENTER: u32 = 28;
 
 /// 壳层假表原点（main.rs 用 CLOCK_MONOTONIC now_ms；harness 把时间捏在手里）。
 const T0: u64 = 1_000_000_000;
@@ -176,6 +177,13 @@ impl Shell {
                 self.forwarded.push((code, true));
                 self.forwarded.push((code, false));
                 self.swallowed.consume(code);
+            }
+            PressAction::CommitThenForward => {
+                if let Outcome::CommitAndForward(text) = outcome.clone() {
+                    self.commits.push(text);
+                }
+                self.swallowed.forward(code);
+                self.forwarded.push((code, true));
             }
         }
         outcome
@@ -432,6 +440,26 @@ fn ctrl_digit_forwarded_ctrl_dot_consumed() {
         "C-. 被消费不许转发: {:?}",
         sh.forwarded
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Enter 上屏字母后必须把原始回车键放行给应用：只 commit 不转发时
+/// 终端收到命令名却收不到执行符（yazi 打了没反应）；在文本里塞 \n
+/// 则污染所有非终端应用。CommitAndForward 两件事都做。
+fn enter_commits_letters_and_forwards_the_key() {
+    let (mut sh, dir) = Shell::new("enterfwd");
+    sh.type_str("yazi");
+    assert_eq!(sh.engine.preedit(), "yazi");
+    let out = sh.press(KEY_ENTER);
+    assert_eq!(out, Outcome::CommitAndForward("yazi".into()));
+    sh.release(KEY_ENTER);
+    assert_eq!(sh.commits, vec!["yazi"], "字母串已上屏");
+    assert!(
+        sh.forwarded.contains(&(KEY_ENTER, true)) && sh.forwarded.contains(&(KEY_ENTER, false)),
+        "回车 press+release 必须完整放行: {:?}",
+        sh.forwarded
+    );
+    assert!(sh.engine.preedit().is_empty(), "组合清空");
     fs::remove_dir_all(dir).unwrap();
 }
 
