@@ -458,7 +458,12 @@ impl Engine {
         // 无组合 → Ignored，回车正常放行给应用。
         if k.ch.is_none() && k.code == 28 {
             if !self.letters.is_empty() {
-                let text = self.letters.clone();
+                // 回车键本身要随字母串一起送达：只上屏字母而不带 \n 时，
+                // 终端收到命令名却收不到执行符（shell 永不执行），聊天框里
+                // 回车键也被吞掉（消息发不出去）。fcitx5 会把回车一并转发，
+                // 行为对齐它。
+                let mut text = self.letters.clone();
+                text.push('\n');
                 self.clear_composition();
                 return Outcome::Commit(text);
             }
@@ -1824,7 +1829,7 @@ mod tests {
             ctrl: false,
             alt: false,
         });
-        assert_eq!(outcome, Outcome::Commit("nihao".to_string()));
+        assert_eq!(outcome, Outcome::Commit("nihao\n".to_string()));
         assert!(e.chinese(), "Enter 之后必须仍是中文模式");
         assert!(e.preedit().is_empty());
         assert!(e.candidates().is_empty());

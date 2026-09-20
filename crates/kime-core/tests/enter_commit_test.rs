@@ -111,8 +111,8 @@ fn enter_without_candidates_commits_raw_letters_and_keeps_chinese() {
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::Commit("zzz".into()),
-        "无候选时 Enter 原样上屏字母（英文/网址）"
+        Outcome::Commit("zzz\n".into()),
+        "无候选时 Enter 原样上屏字母并附换行（否则终端收到命令名却不执行）"
     );
     assert!(e.chinese(), "Enter 上屏字母同样不得切换模式");
     assert!(e.preedit().is_empty());
