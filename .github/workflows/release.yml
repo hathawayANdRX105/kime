@@ -60,6 +60,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .body > body.md
+          # action-gh-release 刚建完 release，releases/tags 端点传播有数百 ms 延迟，重试到读得到为止
+          for i in $(seq 1 10); do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .body > body.md 2>/dev/null; then break; fi
+            echo "release 还没传播，重试 $i/10"; sleep 2
+          done
+          test -s body.md || { echo "读不到 release body"; exit 1; }
           sed -E 's; by @[-A-Za-z0-9_]+ in (#[0-9]+|https://[^ )]+);;g' body.md > body_clean.md
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -F body=@body_clean.md --jq .name
