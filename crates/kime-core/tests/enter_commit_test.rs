@@ -82,7 +82,7 @@ fn enter_with_candidates_commits_raw_letters_not_the_word() {
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::Commit("nihao".into()),
+        Outcome::Commit("nihao\n".into()),
         "Enter 上屏的是原始字母串，不是高亮候选（选词归空格/数字）"
     );
     assert!(e.chinese(), "Enter 绝不切换中英文模式");
