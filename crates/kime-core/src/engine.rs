@@ -463,16 +463,22 @@ impl Engine {
                 }
             }
         }
-
-        // Enter（code 28）— 工单第 3 条契约：中文模式下打英文/网址的习惯。
-        // 有组合（letters 非空）→ 原样上屏字母串，清空组合，**不改中英模式**、
-        // 不 learn（选词是空格/数字的事，Enter 是「这不是拼音」的声明）。
-        // 无组合 → Ignored，回车正常放行给应用。
+        // Enter（code 28）— 对齐 fcitx5 的按键设计：
+        //   有候选 → 确认首选上屏（与空格同语义，面板消失），不 learn、
+        //            不切换中英模式——用户看到候选才按 Enter，意图就是选词。
+        //   无候选但有组合 → 原样上屏字母串（打英文/网址/终端命令），并把
+        //            回车键本身放行给应用：shell 收到命令名后由真实回车执行，
+        //            聊天框按应用语义发送/换行。
+        //   无组合 → Ignored，回车原样放行。
         if k.ch.is_none() && k.code == 28 {
+            if let Some(cand) = self.candidates.first().cloned() {
+                let text = cand.text.clone();
+                self.learn_or_warn(&cand);
+                self.clear_composition();
+                self.after_digit = false;
+                return Outcome::Commit(text);
+            }
             if !self.letters.is_empty() {
-                // 有组合时 Enter 原样上屏字母（打英文/网址），并把回车键本身
-                // 放行给应用：shell 收到命令名后由真实回车键执行；聊天框里
-                // 回车按应用语义发送/换行。之前在文本里附 \n 会污染非终端应用。
                 let text = self.letters.clone();
                 self.clear_composition();
                 return Outcome::CommitAndForward(text);
@@ -1811,31 +1817,22 @@ mod tests {
     }
 
     #[test]
-    fn enter_commits_raw_letters_without_learning_or_toggling() {
-        // 工单第 3 条（用户定稿契约）：有组合时 Enter 原样上屏字母（打英文/网址），
-        // 中文模式不变、不 learn（选词归空格/数字）。完整断言集见 tests/enter_commit_test.rs。
+    fn enter_confirms_first_candidate_when_candidates_exist() {
+        // 对齐 fcitx5：有候选时 Enter = 确认首选（与空格同语义），不是上屏原串。
+        // 无候选时才退回原串上屏——那条契约见 tests/enter_commit_test.rs。
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
         }
-        assert_eq!(e.preedit(), "nihao");
-        let outcome = e.key(Key {
-            ch: None,
-            code: 28,
-            shift: false,
-            ctrl: false,
-            alt: false,
-        });
-        assert_eq!(outcome, Outcome::CommitAndForward("nihao".to_string()));
+        assert!(!e.candidates().is_empty(), "nihao 应有候选");
+        let outcome = e.key(code_k(28));
+        match outcome {
+            Outcome::Commit(text) => assert_eq!(text, "你好", "Enter 确认首选"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
         assert!(e.chinese(), "Enter 之后必须仍是中文模式");
         assert!(e.preedit().is_empty());
         assert!(e.candidates().is_empty());
-        drop(e);
-        let d2 = Dict::open(&db).unwrap();
-        assert!(
-            d2.top_user(10).unwrap().is_empty(),
-            "Enter 不是选词，不许产生用户词"
-        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

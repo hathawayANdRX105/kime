@@ -448,12 +448,15 @@ fn ctrl_digit_forwarded_ctrl_dot_consumed() {
 /// 则污染所有非终端应用。CommitAndForward 两件事都做。
 fn enter_commits_letters_and_forwards_the_key() {
     let (mut sh, dir) = Shell::new("enterfwd");
-    sh.type_str("yazi");
-    assert_eq!(sh.engine.preedit(), "yazi");
+    // 无候选输入（zzz 不在种子词库）→ 走原串上屏 + 放行原始回车。
+    // 有候选时 Enter 改为确认首选，那条契约由 kime-core 的 enter_commit_test 钉。
+    sh.type_str("zzz");
+    assert_eq!(sh.engine.preedit(), "zzz");
+    assert!(sh.engine.candidates().is_empty(), "zzz 无候选");
     let out = sh.press(KEY_ENTER);
-    assert_eq!(out, Outcome::CommitAndForward("yazi".into()));
+    assert_eq!(out, Outcome::CommitAndForward("zzz".into()));
     sh.release(KEY_ENTER);
-    assert_eq!(sh.commits, vec!["yazi"], "字母串已上屏");
+    assert_eq!(sh.commits, vec!["zzz"], "字母串已上屏");
     assert!(
         sh.forwarded.contains(&(KEY_ENTER, true)) && sh.forwarded.contains(&(KEY_ENTER, false)),
         "回车 press+release 必须完整放行: {:?}",

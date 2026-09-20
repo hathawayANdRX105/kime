@@ -67,7 +67,9 @@ fn type_str(e: &mut Engine, s: &str) {
 }
 
 #[test]
-fn enter_with_candidates_commits_raw_letters_not_the_word() {
+fn enter_with_candidates_confirms_first_candidate() {
+    // 对齐 fcitx5：有候选时 Enter = 确认首选（与空格同语义），面板消失。
+    // 之前 Enter 上屏原始字母串，面板不消失、换行被吞，用户觉得「直接发送了」。
     let db = tmp_db("raw");
     let mut e = engine(
         &db,
@@ -80,21 +82,13 @@ fn enter_with_candidates_commits_raw_letters_not_the_word() {
         "种子词库下 nihao 应有候选"
     );
     let out = e.key(code(KEY_ENTER));
-    assert_eq!(
-        out,
-        Outcome::CommitAndForward("nihao".into()),
-        "Enter 上屏的是原始字母串，不是高亮候选（选词归空格/数字）"
-    );
+    match out {
+        Outcome::Commit(text) => assert_eq!(text, "你好", "Enter 确认首选候选"),
+        other => panic!("expected Commit(你好), got {:?}", other),
+    }
     assert!(e.chinese(), "Enter 绝不切换中英文模式");
     assert!(e.preedit().is_empty(), "组合必须清空");
     assert!(e.candidates().is_empty(), "候选必须清空");
-    // 不 learn：Enter 是「这不是拼音」的声明，不该污染用户词。
-    drop(e);
-    let d2 = Dict::open(&db).unwrap();
-    assert!(
-        d2.top_user(10).unwrap().is_empty(),
-        "Enter 提交字母后不应产生用户词"
-    );
     let _ = fs::remove_file(&db);
 }
 
