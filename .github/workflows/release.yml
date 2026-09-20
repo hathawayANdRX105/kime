@@ -61,10 +61,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # action-gh-release 刚建完 release，releases/tags 端点传播有数百 ms 延迟，重试到读得到为止
+          REL_ID=""
           for i in $(seq 1 10); do
-            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .body > body.md 2>/dev/null; then break; fi
+            if REL_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id 2>/dev/null) && [ -n "$REL_ID" ]; then break; fi
             echo "release 还没传播，重试 $i/10"; sleep 2
           done
-          test -s body.md || { echo "读不到 release body"; exit 1; }
+          test -n "$REL_ID" || { echo "读不到 release id"; exit 1; }
+          # PATCH /releases/{release_id} 只吃数字 id，tag name 会 404
+          gh api "repos/$GITHUB_REPOSITORY/releases/$REL_ID" --jq .body > body.md
           sed -E 's; by @[-A-Za-z0-9_]+ in (#[0-9]+|https://[^ )]+);;g' body.md > body_clean.md
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -F body=@body_clean.md --jq .name
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$REL_ID" -F body=@body_clean.md --jq .name
