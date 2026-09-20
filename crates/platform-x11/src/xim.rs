@@ -296,6 +296,7 @@ where
                 self.hide_window();
                 Ok(true)
             }
+            Outcome::Ignored => Ok(false),
         }
     }
 }
