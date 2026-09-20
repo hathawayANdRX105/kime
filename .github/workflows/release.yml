@@ -33,15 +33,13 @@ jobs:
 
       # UPX 进一步压缩体积（lzma 算法压得更狠但加载略慢，这里取默认）
       - run: |
-          sudo apt-get update -qq && sudo apt-get install -y upx-ucl
-          upx --best --lzma target/release/kime target/release/platform-wayland
+          upx --best --lzma target/release/kime target/release/platform-wayland target/release/platform-x11
 
       - name: Package
         run: |
-          mkdir -p dist
-          cp target/release/kime target/release/platform-wayland dist/
-          tar -C dist -czf "kime-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" kime platform-wayland
-          cd dist && sha256sum kime platform-wayland > SHA256SUMS.txt
+          cp target/release/kime target/release/platform-wayland target/release/platform-x11 dist/
+          tar -C dist -czf "kime-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" kime platform-wayland platform-x11
+          cd dist && sha256sum kime platform-wayland platform-x11 > SHA256SUMS.txt
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
@@ -51,6 +49,7 @@ jobs:
           files: |
             dist/kime
             dist/platform-wayland
+            dist/platform-x11
             dist/SHA256SUMS.txt
             kime-*-linux-x86_64.tar.gz
 
