@@ -71,6 +71,37 @@ jobs:
         # 全部测试均为离线（xkb 文本直喂、内存字典），无需 Wayland/X 显示。
         run: cargo test --workspace --all-targets
 
+  # 本地更新通道：编译 release 二进制并作为 artifact 下载（不发布 release，
+  # 不打 tag）。验证未稳定的改动时，本地二进制走这里更新。
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps (wayland / xkbcommon / fontconfig / xcb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libfontconfig1-dev \
+            libxcb1-dev \
+            pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release -p kime -p platform-wayland -p platform-x11
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: kime-binaries
+          path: |
+            target/release/kime
+            target/release/platform-wayland
+            target/release/platform-x11
+          if-no-files-found: error
+          retention-days: 14
+
   perf:
     name: Benchmark (synthetic dict)
     runs-on: ubuntu-latest
