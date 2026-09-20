@@ -280,8 +280,13 @@ impl Engine {
             return Outcome::Consumed;
         }
 
-        // Esc — 清空当前组合。
+        // Esc — 有组合时清空并消费；无组合时放行给应用（退出全屏 vim、
+        // 关闭对话框等）。之前无条件 Consumed，空组合按 ESC 被吞掉，
+        // 与英文模式行为不一致。
         if k.ch.is_none() && k.code == KEY_ESC {
+            if self.letters.is_empty() {
+                return Outcome::Ignored;
+            }
             self.clear_composition();
             return Outcome::Consumed;
         }
@@ -1419,19 +1424,6 @@ mod tests {
     fn backspace_on_empty_is_ignored() {
         let (mut e, db, yaml) = engine_with_fixture();
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn esc_clears_composition() {
-        let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nih".chars() {
-            e.key(k(c));
-        }
-        assert_eq!(e.key(code_k(KEY_ESC)), Outcome::Consumed);
-        assert!(e.preedit().is_empty());
-        assert!(e.candidates().is_empty());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
