@@ -224,6 +224,43 @@ impl Engine {
         self.last_joined.clear();
     }
 
+    /// 选词上屏：learn + 清空候选/页码，但**只消耗被选候选覆盖的音节**，
+    /// 剩余字母重组回 letters 继续组词。
+    ///
+    /// 用户诉求：打长串 `womendoubuzhidao` 翻页选了首音节单字「我」后，
+    /// 之前的实现把整串字母全清掉，没法接着选「们」「都」……。候选自带
+    /// 读音（pinyin 按 `'` 切分），能算出消耗了几个音节；剩余音节拼回
+    /// 字母串，refresh_candidates 重新出候选。
+    ///
+    /// 剩余音节不足一个完整音节（半截尾）时也保留——用户继续打字补全。
+    /// 候选无自带读音（AI 注入）时回退整串消耗（last_reading 是首切分，
+    /// 无法可靠对齐字母边界，保持旧行为）。
+    fn commit_candidate(&mut self, cand: &Candidate) -> Outcome {
+        let text = cand.text.clone();
+        self.learn_or_warn(cand);
+
+        let consumed: Vec<String> = if cand.pinyin.is_empty() {
+            self.last_reading.clone()
+        } else {
+            cand.pinyin.split('\'').map(str::to_string).collect()
+        };
+        // 剩余字母 = 原串去掉已消耗音节的字母（按音节长度从头消费）。
+        let remaining = consume_prefix_letters(&self.letters, &consumed);
+
+        self.candidates.clear();
+        self.page_index = 0;
+        self.cursor = 0;
+        self.last_joined.clear();
+        self.preedit.clear();
+        self.last_reading.clear();
+        self.letters = remaining;
+
+        if !self.letters.is_empty() {
+            self.refresh_candidates();
+        }
+        Outcome::Commit(text)
+    }
+
     /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
     /// / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
@@ -377,10 +414,7 @@ impl Engine {
         // Space — 无候选时放行；有候选时上屏首选并清空。
         if k.ch.is_none() && k.code == KEY_SPACE {
             if let Some(top) = self.candidates.first().cloned() {
-                let text = top.text.clone();
-                self.learn_or_warn(&top);
-                self.clear_composition();
-                return Outcome::Commit(text);
+                return self.commit_candidate(&top);
             }
             return Outcome::Ignored;
         }
@@ -418,17 +452,17 @@ impl Engine {
                 } else {
                     // 有预编辑串，检查是否存在候选词
                     if let Some(top) = self.candidates.first().cloned() {
-                        // 情况 B：顶字上屏，拼接标点
-                        let text = top.text.clone();
-                        let commit_text = format!("{}{}", text, mapped);
-                        self.learn_or_warn(&top);
-                        self.clear_composition();
-                        return Outcome::Commit(commit_text);
+                        // 情况 B：顶字上屏，拼接标点。剩余音节保留由
+                        // commit_candidate 处理；标点拼到本次提交文本尾。
+                        match self.commit_candidate(&top) {
+                            Outcome::Commit(t) => {
+                                return Outcome::Commit(format!("{}{}", t, mapped))
+                            }
+                            other => return other,
+                        }
                     } else {
-                        // 情况 C：无候选词，直接上屏并清空
-                        let commit_text = format!("{}{}", self.letters, mapped);
-                        self.clear_composition();
-                        return Outcome::Commit(commit_text);
+                        // 情况 C：无候选词，字母串+标点上屏
+                        return Outcome::Commit(format!("{}{}", self.letters, mapped));
                     }
                 }
             }
@@ -451,15 +485,12 @@ impl Engine {
                     let offset = if digit == 0 { 9 } else { digit - 1 };
                     let idx = self.page_index * self.page_size() + offset;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
-                        let text = cand.text.clone();
-                        self.learn_or_warn(&cand);
-                        self.clear_composition();
+                        let r = self.commit_candidate(&cand);
                         // 数字在此被消费成中文候选上屏，不是输出字面数字；
                         // after_digit 必须清零，否则下一个 ,.: 会被误当数字分隔符放行半角。
                         self.after_digit = false;
-                        return Outcome::Commit(text);
+                        return r;
                     }
-                    return Outcome::Ignored;
                 }
             }
         }
@@ -472,11 +503,9 @@ impl Engine {
         //   无组合 → Ignored，回车原样放行。
         if k.ch.is_none() && k.code == 28 {
             if let Some(cand) = self.candidates.first().cloned() {
-                let text = cand.text.clone();
-                self.learn_or_warn(&cand);
-                self.clear_composition();
+                let r = self.commit_candidate(&cand);
                 self.after_digit = false;
-                return Outcome::Commit(text);
+                return r;
             }
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
@@ -489,6 +518,38 @@ impl Engine {
         // 其它（标点、功能键等）→ 放行给宿主。
         Outcome::Ignored
     }
+}
+
+/// 从字母串头部消费掉给定音节，返回剩余字母。
+///
+/// 音节按全拼规则连续占据字母串头部（`wo` + `men` + ...）。逐音节匹配：
+/// 大小写不敏感，匹配上就推进；首个音节匹配失败（候选读音与当前组合
+/// 不同源，如多切分/模糊音变体）时回退——按音节总长度截断，对齐不上
+/// 就整串消费（返回空，保持旧行为）。
+fn consume_prefix_letters(letters: &str, syllables: &[String]) -> String {
+    if syllables.is_empty() {
+        return letters.to_string();
+    }
+    let mut consumed_len = 0usize;
+    let mut rest = letters;
+    for syl in syllables {
+        let syl_lower = syl.to_ascii_lowercase();
+        if let Some(stripped) = rest.strip_prefix(&syl_lower) {
+            consumed_len += syl.len();
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix(&syl.to_ascii_uppercase()) {
+            consumed_len += syl.len();
+            rest = stripped;
+        } else {
+            // ponytail: 对齐失败时按音节总长度截断；长度越界则整串消费。
+            let total: usize = syllables.iter().map(|s| s.len()).sum();
+            if total >= letters.len() {
+                return String::new();
+            }
+            return letters[total..].to_string();
+        }
+    }
+    letters[consumed_len..].to_string()
 }
 
 /// 对一个音节/尾部串应用模糊替换表：前缀匹配（声母）与后缀匹配（韵母）各生成一路变体。

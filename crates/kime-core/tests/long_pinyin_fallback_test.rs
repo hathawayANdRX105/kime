@@ -100,14 +100,11 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
         other => panic!("expected Commit(握), got {:?}", other),
     }
 
-    // 选了单字后继续组词：组合已清空，接着打能出候选
-    assert!(e.preedit().is_empty());
-    for c in "men".chars() {
-        e.key(k(c));
-    }
+    // 选了单字后剩余音节保留在组合里，继续出候选（用户诉求：接着选下一个）
+    assert_eq!(e.preedit(), "mendoubuzhidao", "剩余音节必须保留");
     assert!(
         e.candidates().iter().any(|c| c.text == "们"),
-        "选单字后应能继续组词，实际 {:?}",
+        "剩余音节应继续出候选，实际 {:?}",
         e.candidates()
             .iter()
             .map(|c| c.text.clone())
