@@ -41,6 +41,9 @@ pub enum PressAction {
     Consume,
     /// 合成 tick 撞上组合已空：给应用补一次完整的 press+release 点击。
     Tap,
+    /// 先上屏文本，再把按键本身转发给应用（Enter 上屏字母 + 真实回车）。
+    /// 转发前同样销掉同键旧记账，release 配对按 Forward 规则走。
+    CommitThenForward,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +67,11 @@ pub fn route_press(code: u32, synthetic: bool, composing: bool, outcome: &Outcom
         },
         Outcome::Commit(_) => PressRoute {
             action: PressAction::Consume,
+            arm: false,
+            disarm: true,
+        },
+        Outcome::CommitAndForward(_) => PressRoute {
+            action: PressAction::CommitThenForward,
             arm: false,
             disarm: true,
         },
@@ -151,6 +159,7 @@ pub fn key_log_line(
         Outcome::Consumed => "Consumed".to_string(),
         Outcome::Ignored => "Ignored".to_string(),
         Outcome::Commit(text) => format!("Commit({text})"),
+        Outcome::CommitAndForward(text) => format!("CommitAndForward({text})"),
     };
     format!(
         "key code={code} ch={} mods={}{}{} -> {outcome_str}\n",

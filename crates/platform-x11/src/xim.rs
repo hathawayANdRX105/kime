@@ -287,7 +287,15 @@ where
                 self.hide_window();
                 Ok(true)
             }
-            Outcome::Ignored => Ok(false),
+            Outcome::CommitAndForward(text) => {
+                // XIM 只拿到 KeyPress、无 KeyRelease，客户端也不回放裸修饰键
+                // 事件，无法把「原始按键本身」再转发一次（见早期会话的实测）。
+                // 退化为普通上屏；换行语义留给应用自己的后续按键。
+                server.preedit_draw(&mut user_ic.ic, "")?;
+                server.commit(&user_ic.ic, &text)?;
+                self.hide_window();
+                Ok(true)
+            }
         }
     }
 }

@@ -82,7 +82,7 @@ fn enter_with_candidates_commits_raw_letters_not_the_word() {
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::Commit("nihao\n".into()),
+        Outcome::CommitAndForward("nihao".into()),
         "Enter 上屏的是原始字母串，不是高亮候选（选词归空格/数字）"
     );
     assert!(e.chinese(), "Enter 绝不切换中英文模式");
@@ -111,7 +111,7 @@ fn enter_without_candidates_commits_raw_letters_and_keeps_chinese() {
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::Commit("zzz\n".into()),
+        Outcome::CommitAndForward("zzz".into()),
         "无候选时 Enter 原样上屏字母并附换行（否则终端收到命令名却不执行）"
     );
     assert!(e.chinese(), "Enter 上屏字母同样不得切换模式");

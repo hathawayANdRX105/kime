@@ -48,6 +48,13 @@ pub enum Outcome {
     Ignored,
     /// 上屏该文本
     Commit(String),
+    /// 上屏该文本，并把原始按键本身放行给应用
+    ///
+    /// 用于「上屏字母 + 回车」这类组合：kime 先 commit 文本，应用随后收到
+    /// 真实按键。终端里 commit 的字母是命令名、随后到达的回车键负责执行；
+    /// 聊天框里回车键按应用自身语义处理（发送/换行）。顺序由壳保证：
+    /// 先投递文本，再转发按键。
+    CommitAndForward(String),
 }
 
 pub struct Engine {
@@ -458,14 +465,12 @@ impl Engine {
         // 无组合 → Ignored，回车正常放行给应用。
         if k.ch.is_none() && k.code == 28 {
             if !self.letters.is_empty() {
-                // 回车键本身要随字母串一起送达：只上屏字母而不带 \n 时，
-                // 终端收到命令名却收不到执行符（shell 永不执行），聊天框里
-                // 回车键也被吞掉（消息发不出去）。fcitx5 会把回车一并转发，
-                // 行为对齐它。
-                let mut text = self.letters.clone();
-                text.push('\n');
+                // 有组合时 Enter 原样上屏字母（打英文/网址），并把回车键本身
+                // 放行给应用：shell 收到命令名后由真实回车键执行；聊天框里
+                // 回车按应用语义发送/换行。之前在文本里附 \n 会污染非终端应用。
+                let text = self.letters.clone();
                 self.clear_composition();
-                return Outcome::Commit(text);
+                return Outcome::CommitAndForward(text);
             }
             return Outcome::Ignored;
         }
@@ -1829,7 +1834,7 @@ mod tests {
             ctrl: false,
             alt: false,
         });
-        assert_eq!(outcome, Outcome::Commit("nihao\n".to_string()));
+        assert_eq!(outcome, Outcome::CommitAndForward("nihao".to_string()));
         assert!(e.chinese(), "Enter 之后必须仍是中文模式");
         assert!(e.preedit().is_empty());
         assert!(e.candidates().is_empty());
