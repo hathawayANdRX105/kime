@@ -673,6 +673,20 @@ impl Engine {
                             self.candidates = fb;
                         }
                     }
+                    // 长串降级（与全拼路径同约）：整句/长组合词占满但不足一页时，
+                    // 首音节单字候选追加到末尾，翻页翻得到「我」。全拼重试已经跑过
+                    // 这条路径时结果已在列表里，按文本去重后是空操作。
+                    if !self.candidates.is_empty() {
+                        let limit = self.config.candidate_limit;
+                        let page = self.page_size();
+                        Self::append_first_syllable_candidates(
+                            &mut self.candidates,
+                            &self.dict,
+                            &syllables,
+                            limit,
+                            page,
+                        );
+                    }
                 }
                 Err(_) => {
                     // 非法键对：按全拼重新切分（preedit 保持原字母串）
@@ -876,6 +890,21 @@ impl Engine {
                 cands = fb;
             }
         }
+        // 长串降级：候选被整句/长组合词占满但不足一页时，把首音节的单字候选**追加到
+        // 末尾**——整句在前、单字在后，用户翻页翻得到「我」这类首音节的字，选它继续
+        // 组词。只追加、按文本去重、总量截到 candidate_limit：层一精确命中块与
+        // place_sentences 落好的整句名次零影响，空格首选永远是层一最优候选。
+        if !cands.is_empty() {
+            if let Some(full) = segs.first() {
+                Self::append_first_syllable_candidates(
+                    &mut cands,
+                    &self.dict,
+                    full,
+                    self.config.candidate_limit,
+                    self.page_size(),
+                );
+            }
+        }
         self.candidates = cands;
     }
 
@@ -901,6 +930,37 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// 长串降级（用户诉求）：**长串**（≥3 音节）拼音的候选被整句/长组合词占满但
+    /// 不足一页时，把首音节的单字候选追加到列表末尾（整句在前、单字在后，与
+    /// 「中文在前英文在后」的落位约定一致——英文块由 `merge_english` 之后统一
+    /// 追加，仍垫底）。用户翻页翻得到「我」这类首音节的字，选它继续组词。
+    ///
+    /// 长度门控是硬契约：1–2 音节输入（`wo` / `zaishuo` 这类「一个词」）的候选
+    /// 列表逐字不变——精确命中 + 补全本就够用，单字塞进来只会污染短串行为
+    /// （`tests/context_seed_test.rs` 钉死了两音节输入的完整候选列表）。
+    ///
+    /// 只做追加：按文本去重、总量截到 limit，层一精确命中块与 `place_sentences`
+    /// 落好的整句名次零变化，空格首选永远是层一最优候选。
+    /// `syllables` = 整串首切分读音（与 `longest_prefix_candidates` 同源）；
+    /// 音节不足 3 个、候选已满一页（>= page_size）或无完整切分 → 不动作。
+    fn append_first_syllable_candidates(
+        cands: &mut Vec<Candidate>,
+        dict: &Dict,
+        syllables: &[String],
+        limit: usize,
+        page_size: usize,
+    ) {
+        if syllables.len() < 3 || cands.len() >= page_size || limit == 0 {
+            return;
+        }
+        let Ok(mut extra) = dict.lookup_prefix(&syllables[..1], "", limit) else {
+            return;
+        };
+        extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
+        extra.truncate(limit.saturating_sub(cands.len()));
+        cands.extend(extra);
     }
     /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
     ///
@@ -1458,6 +1518,7 @@ mod tests {
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
+
     // --- M5: 翻页 + 页内选词 ---
     fn fixture_many_ni() -> (std::path::PathBuf, std::path::PathBuf) {
         let db = tmp_db("page");

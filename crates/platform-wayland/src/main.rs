@@ -55,6 +55,9 @@ fn log(msg: &str) {
     eprintln!("[kime-ime] {msg}");
 }
 
+/// evdev keycodes — wayland 原生即此值，平台壳无需翻译（route.rs 同源约定）。
+const KEY_ESC: u32 = 1;
+
 /// 协议枚举值回退到裸 u32：合成器可能发协议未定义的值（WEnum::Unknown），
 /// 一律当原始数字看，不因枚举缺失丢事件。
 fn wenum_to_u32<T>(e: WEnum<T>) -> u32
@@ -650,6 +653,19 @@ impl AppState {
             canvas.hide(qh);
         }
     }
+    /// 切走应用时作废在途组合：引擎组合 + 发往旧应用的 preedit 一起清。
+    /// 引擎无公开清组合入口（`Engine::clear_composition` 私有），与 XIM 前端
+    /// 同一手法：喂一个裸 Esc（引擎 Esc 路径 = 全量清组合，不动中英模式）。
+    /// preedit 不同步拉平的话，旧应用输入框里留半截拼音，新应用一按键就接着打。
+    fn clear_composition(&mut self) {
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.key(shell_key(KEY_ESC, None, false, false));
+        }
+        if let Some(im) = &self.input_method {
+            im.set_preedit_string(String::new(), 0, 0);
+            im.commit(self.im_serial);
+        }
+    }
     fn apply_consumed(&mut self, qh: &QueueHandle<Self>) {
         let (syllables, context) = {
             let Some(engine) = self.engine.as_ref() else {
@@ -982,6 +998,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 state.grab = None;
                 state.repeat.clear();
                 state.shift_gesture.reset();
+                // 组合/preedit 一并作废：否则旧应用的拼音和候选带到下一个应用。
+                state.clear_composition();
                 state.popup_hide(qh);
             }
             // 协议的双缓冲：这三个事件只改 pending，真正的生效在 done。
