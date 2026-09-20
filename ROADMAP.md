@@ -122,7 +122,7 @@
 - [x] 修复 M14 遗留：`context_seed_test` 的 `viterbi_sentences_seeded` 调用补 SpanCache 参数（main 上已编译失败，前轮「33 套件全绿」漏数了此文件）
 - [ ] 二阶段：候选窗内搜索/删除单条历史、持久化开关（默认会话级）、primary selection 监听
 
-## 版本口径（v0.19.44）
+## 版本口径（v0.19.45）
 
 三段各来源不同，别混：
 
