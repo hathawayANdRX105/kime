@@ -253,6 +253,11 @@ impl PopupCanvas {
     }
 
     /// 强制隐藏（deactivate 用）：候选与未清的闪现窗一并抹掉。
+    ///
+    /// 焦点抖动（ACTIVATE/DEACTIVATE 高频切换）时合成器挂起的 buffer release
+    /// 不再到达，free[] 卡在 false 且与实际所有权脱节，下一次 present 复用旧
+    /// pool → wl_shm.create_pool invalid arguments 致协议错误崩溃。deactivate
+    /// 是唯一能确定「合成器不再持有我的 buffer」的时刻，重置槽位记账。
     fn hide(&mut self, qh: &QueueHandle<AppState>) {
         let visible = self.chip.is_some() || !self.content.is_empty() || self.highlight != 0;
         self.chip = None;
@@ -261,6 +266,11 @@ impl PopupCanvas {
         if visible {
             self.present(qh);
         }
+        // 重置在 present 之后：隐藏帧要先画完，再让槽位回到「全部可用」。
+        // buffer 对象保留（尺寸命中时复用），只重置归属记账。
+        self.free = [true, true];
+        self.frame = None;
+        self.dirty = false;
     }
 
     fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
