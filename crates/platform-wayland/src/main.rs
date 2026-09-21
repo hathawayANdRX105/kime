@@ -277,6 +277,7 @@ impl PopupCanvas {
     }
 
     fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
+        log(&format!("popup: buffer release slot={slot}"));
         if slot < 2 {
             self.free[slot] = true;
         }
@@ -286,6 +287,7 @@ impl PopupCanvas {
     }
 
     fn on_frame(&mut self, qh: &QueueHandle<AppState>) {
+        log("popup: frame 回调到达");
         self.frame = None;
         if self.dirty {
             self.present(qh);
@@ -300,6 +302,7 @@ impl PopupCanvas {
             None => self.renderer.layout(&self.content),
         };
         let Some(slot) = self.pick_slot(&layout) else {
+            log("popup: 两槽位都被合成器占用，present 挂起（等 release/frame）");
             self.dirty = true;
             return;
         };
@@ -644,6 +647,7 @@ impl AppState {
                 None => (Vec::new(), 0),
             }
         };
+        log(&format!("popup_show 候选={page:?} hl={hl}"));
         if let Some(canvas) = self.popup.as_mut() {
             canvas.set_content(page, hl, qh);
         }

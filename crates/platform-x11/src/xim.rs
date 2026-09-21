@@ -220,9 +220,16 @@ where
 
     fn handle_set_focus(
         &mut self,
-        _server: &mut S,
-        _user_ic: &mut UserInputContext<Self::InputContextData>,
+        server: &mut S,
+        user_ic: &mut UserInputContext<Self::InputContextData>,
     ) -> Result<(), ServerError> {
+        // XIM 客户端共享同一个全局 Engine：应用 A 打到一半切到应用 B，
+        // set_focus 到来时若不清组合，A 的拼音和候选会带到 B 的输入框。
+        // 对齐 wayland 前端 Deactivate 的做法（main.rs:999-1007）：
+        // 清 preedit + 隐藏候选窗 + 清引擎组合。
+        server.preedit_draw(&mut user_ic.ic, "")?;
+        self.hide_window();
+        self.clear_composition();
         Ok(())
     }
 
