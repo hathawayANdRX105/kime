@@ -48,13 +48,6 @@ pub enum Outcome {
     Ignored,
     /// 上屏该文本
     Commit(String),
-    /// 上屏该文本，并把原始按键本身放行给应用
-    ///
-    /// 用于「上屏字母 + 回车」这类组合：kime 先 commit 文本，应用随后收到
-    /// 真实按键。终端里 commit 的字母是命令名、随后到达的回车键负责执行；
-    /// 聊天框里回车键按应用自身语义处理（发送/换行）。顺序由壳保证：
-    /// 先投递文本，再转发按键。
-    CommitAndForward(String),
 }
 
 pub struct Engine {
@@ -494,23 +487,16 @@ impl Engine {
                 }
             }
         }
-        // Enter（code 28）— 对齐 fcitx5 的按键设计：
-        //   有候选 → 确认首选上屏（与空格同语义，面板消失），不 learn、
-        //            不切换中英模式——用户看到候选才按 Enter，意图就是选词。
-        //   无候选但有组合 → 原样上屏字母串（打英文/网址/终端命令），并把
-        //            回车键本身放行给应用：shell 收到命令名后由真实回车执行，
-        //            聊天框按应用语义发送/换行。
-        //   无组合 → Ignored，回车原样放行。
+        // Enter（code 28）— 上屏原始字母串、面板退出，不提交候选词：
+        //   有字母 → 原样上屏（声明「我打的是字母不是拼音」），组合清空、
+        //            面板消失。不转发回车键本身——QQ/微信收到回车会把消息
+        //            直接发出去；要换行由应用自己的后续按键决定。
+        //   无字母 → Ignored，回车原样放行。
         if k.ch.is_none() && k.code == 28 {
-            if let Some(cand) = self.candidates.first().cloned() {
-                let r = self.commit_candidate(&cand);
-                self.after_digit = false;
-                return r;
-            }
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
                 self.clear_composition();
-                return Outcome::CommitAndForward(text);
+                return Outcome::Commit(text);
             }
             return Outcome::Ignored;
         }
@@ -1885,27 +1871,6 @@ mod tests {
             Outcome::Commit(text) => assert_eq!(text, "你好世界"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn enter_confirms_first_candidate_when_candidates_exist() {
-        // 对齐 fcitx5：有候选时 Enter = 确认首选（与空格同语义），不是上屏原串。
-        // 无候选时才退回原串上屏——那条契约见 tests/enter_commit_test.rs。
-        let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihao".chars() {
-            e.key(k(c));
-        }
-        assert!(!e.candidates().is_empty(), "nihao 应有候选");
-        let outcome = e.key(code_k(28));
-        match outcome {
-            Outcome::Commit(text) => assert_eq!(text, "你好", "Enter 确认首选"),
-            other => panic!("expected Commit, got {:?}", other),
-        }
-        assert!(e.chinese(), "Enter 之后必须仍是中文模式");
-        assert!(e.preedit().is_empty());
-        assert!(e.candidates().is_empty());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

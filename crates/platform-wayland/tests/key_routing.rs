@@ -178,13 +178,6 @@ impl Shell {
                 self.forwarded.push((code, false));
                 self.swallowed.consume(code);
             }
-            PressAction::CommitThenForward => {
-                if let Outcome::CommitAndForward(text) = outcome.clone() {
-                    self.commits.push(text);
-                }
-                self.swallowed.forward(code);
-                self.forwarded.push((code, true));
-            }
         }
         outcome
     }
@@ -444,22 +437,21 @@ fn ctrl_digit_forwarded_ctrl_dot_consumed() {
 }
 
 /// Enter 上屏字母后必须把原始回车键放行给应用：只 commit 不转发时
-/// 终端收到命令名却收不到执行符（yazi 打了没反应）；在文本里塞 \n
-/// 则污染所有非终端应用。CommitAndForward 两件事都做。
-fn enter_commits_letters_and_forwards_the_key() {
-    let (mut sh, dir) = Shell::new("enterfwd");
-    // 无候选输入（zzz 不在种子词库）→ 走原串上屏 + 放行原始回车。
-    // 有候选时 Enter 改为确认首选，那条契约由 kime-core 的 enter_commit_test 钉。
+/// Enter 契约：上屏原始字母串、面板退出，回车键本身**不再转发**——
+/// QQ/微信收到回车会把消息直接发出去；换行交给应用自己的后续按键。
+fn enter_commits_letters_and_swallows_the_key() {
+    let (mut sh, dir) = Shell::new("enternofwd");
+    // 无候选输入（zzz 不在种子词库）→ 原串上屏，按键被吞。
     sh.type_str("zzz");
     assert_eq!(sh.engine.preedit(), "zzz");
     assert!(sh.engine.candidates().is_empty(), "zzz 无候选");
     let out = sh.press(KEY_ENTER);
-    assert_eq!(out, Outcome::CommitAndForward("zzz".into()));
+    assert_eq!(out, Outcome::Commit("zzz".into()));
     sh.release(KEY_ENTER);
     assert_eq!(sh.commits, vec!["zzz"], "字母串已上屏");
     assert!(
-        sh.forwarded.contains(&(KEY_ENTER, true)) && sh.forwarded.contains(&(KEY_ENTER, false)),
-        "回车 press+release 必须完整放行: {:?}",
+        !sh.forwarded.contains(&(KEY_ENTER, true)),
+        "回车 press 不得转发: {:?}",
         sh.forwarded
     );
     assert!(sh.engine.preedit().is_empty(), "组合清空");

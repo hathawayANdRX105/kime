@@ -67,9 +67,9 @@ fn type_str(e: &mut Engine, s: &str) {
 }
 
 #[test]
-fn enter_with_candidates_confirms_first_candidate() {
-    // 对齐 fcitx5：有候选时 Enter = 确认首选（与空格同语义），面板消失。
-    // 之前 Enter 上屏原始字母串，面板不消失、换行被吞，用户觉得「直接发送了」。
+fn enter_commits_raw_letters_even_with_candidates() {
+    // 用户诉求：Enter 永远上屏原始字母串、面板退出，不提交候选词——
+    // 声明「我打的是字母不是拼音」。选词用空格/数字。
     let db = tmp_db("raw");
     let mut e = engine(
         &db,
@@ -83,12 +83,12 @@ fn enter_with_candidates_confirms_first_candidate() {
     );
     let out = e.key(code(KEY_ENTER));
     match out {
-        Outcome::Commit(text) => assert_eq!(text, "你好", "Enter 确认首选候选"),
-        other => panic!("expected Commit(你好), got {:?}", other),
+        Outcome::Commit(text) => assert_eq!(text, "nihao", "Enter 上屏原串，不提交候选"),
+        other => panic!("expected Commit(nihao), got {:?}", other),
     }
     assert!(e.chinese(), "Enter 绝不切换中英文模式");
     assert!(e.preedit().is_empty(), "组合必须清空");
-    assert!(e.candidates().is_empty(), "候选必须清空");
+    assert!(e.candidates().is_empty(), "面板必须退出");
     let _ = fs::remove_file(&db);
 }
 
@@ -105,8 +105,8 @@ fn enter_without_candidates_commits_raw_letters_and_keeps_chinese() {
     let out = e.key(code(KEY_ENTER));
     assert_eq!(
         out,
-        Outcome::CommitAndForward("zzz".into()),
-        "无候选时 Enter 原样上屏字母并附换行（否则终端收到命令名却不执行）"
+        Outcome::Commit("zzz".into()),
+        "无候选时 Enter 原样上屏字母，不转发回车键"
     );
     assert!(e.chinese(), "Enter 上屏字母同样不得切换模式");
     assert!(e.preedit().is_empty());

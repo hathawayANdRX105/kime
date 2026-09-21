@@ -822,16 +822,6 @@ impl AppState {
                 // 点击，继续删应用字符），表不撤；物理 release 到达才停。
                 self.tap_pair(code);
             }
-            PressAction::CommitThenForward => {
-                // 先上屏文本（同步投递，wl_display roundtrip 由事件循环后续
-                // flush 保证），再放行原始按键：销掉同键旧记账后转发 press，
-                // 与 Forward 同族——release 会被放行给应用。
-                if let Outcome::CommitAndForward(text) = &outcome {
-                    self.apply_commit(text.clone(), qh);
-                }
-                self.swallowed.forward(code);
-                self.forward_key(time, code, true);
-            }
         }
         // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
         // 闪一次对应模式字，下一次按键收掉。
