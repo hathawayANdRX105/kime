@@ -443,6 +443,8 @@ struct AppState {
     pending_surrounding: Option<(String, usize)>,
     pending_cause: u32,
     /// content_type 本阶段只记录（日志/存字段），不参与决策。
+    /// 去重用的上次 content_type（合成器每次提交都回发，同值不记日志）
+    content_type: Option<(u32, u32)>,
     pending_content_type: Option<(u32, u32)>,
     /// 合成器告知的文本输入区（surface-local）。摆位归 zwp_input_popup_surface_v2
     /// 的 role 与合成器，本字段是「真的被摆位了」的诊断证据，不参与布局。
@@ -483,6 +485,7 @@ impl AppState {
             repeat: KeyRepeat::default(),
             pending_surrounding: None,
             pending_cause: 0,
+            content_type: None,
             pending_content_type: None,
             cursor_rect: None,
             shift_gesture: ShiftComposer::default(),
@@ -1025,7 +1028,12 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             }
             ZwpInputMethodEvent::ContentType { hint, purpose } => {
                 let (hint, purpose) = (wenum_to_u32(hint), wenum_to_u32(purpose));
-                log(&format!("content_type hint={hint} purpose={purpose}"));
+                // 去重：合成器每次提交都回发 content_type（实测单次打字 1000+ 条），
+                // 同值反复 eprintln 阻塞按键路径——只在变化时记日志。
+                if state.content_type != Some((hint, purpose)) {
+                    state.content_type = Some((hint, purpose));
+                    log(&format!("content_type hint={hint} purpose={purpose}"));
+                }
                 state.pending_content_type = Some((hint, purpose));
             }
             ZwpInputMethodEvent::Done { .. } => {

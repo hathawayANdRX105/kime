@@ -677,6 +677,7 @@ impl Engine {
             };
             match decoded {
                 Ok(syllables) => {
+                    let has_pending = !pending.is_empty();
                     let pending = pending.as_str();
                     let sp_joined = joined_key(&syllables, pending);
                     self.last_reading = syllables.clone();
@@ -758,7 +759,12 @@ impl Engine {
                     // 长串降级（与全拼路径同约）：整句/长组合词占满但不足一页时，
                     // 首音节单字候选追加到末尾，翻页翻得到「我」。全拼重试已经跑过
                     // 这条路径时结果已在列表里，按文本去重后是空操作。
-                    if !self.candidates.is_empty() {
+                    // 双拼降级：整句/组合词占满但不足一页时追加首音节单字。
+                    // 双拼一个键对就是一个音节，≥2 音节即可能是「漏了第二个拼音」
+                    // （nimf 想打 ni 但被解成 nimen）——用户要的是先选「你」再继续，
+                    // 不是被锁在「你们」整句里。末键半截（has_pending）时同样强制。
+                    // 此分支只在双拼模式内，全拼的 context_seed 契约不受影响。
+                    if !self.candidates.is_empty() && (has_pending || syllables.len() >= 2) {
                         let limit = self.config.candidate_limit;
                         let page = self.page_size();
                         Self::append_first_syllable_candidates(
@@ -767,6 +773,7 @@ impl Engine {
                             &syllables,
                             limit,
                             page,
+                            true,
                         );
                     }
                 }
@@ -984,6 +991,7 @@ impl Engine {
                     full,
                     self.config.candidate_limit,
                     self.page_size(),
+                    false,
                 );
             }
         }
@@ -1033,15 +1041,19 @@ impl Engine {
         syllables: &[String],
         limit: usize,
         page_size: usize,
+        force: bool,
     ) {
-        if syllables.len() < 3 || cands.len() >= page_size || limit == 0 {
+        if !force && syllables.len() < 3 || limit == 0 || syllables.is_empty() {
             return;
         }
         let Ok(mut extra) = dict.lookup_prefix(&syllables[..1], "", limit) else {
             return;
         };
         extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
-        extra.truncate(limit.saturating_sub(cands.len()));
+        // 候选满页也追加：整句补全占满时单字进不来，但翻页必须看得到它们
+        // （用户诉求就是翻页选单字）。page_size 只约束首页展示，不限制
+        // 候选总量；截断只受 candidate_limit 管。
+        extra.truncate(limit.saturating_sub(cands.len()).max(1));
         cands.extend(extra);
     }
     /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
