@@ -751,14 +751,11 @@ impl Engine {
                     // 不是被锁在「你们」整句里。末键半截（has_pending）时同样强制。
                     // 此分支只在双拼模式内，全拼的 context_seed 契约不受影响。
                     if !self.candidates.is_empty() && (has_pending || syllables.len() >= 2) {
-                        let limit = self.config.candidate_limit;
-                        let page = self.page_size();
                         Self::append_first_syllable_candidates(
                             &mut self.candidates,
                             &self.dict,
                             &syllables,
-                            limit,
-                            page,
+                            self.config.candidate_limit,
                             true,
                         );
                     }
@@ -976,7 +973,6 @@ impl Engine {
                     &self.dict,
                     full,
                     self.config.candidate_limit,
-                    self.page_size(),
                     false,
                 );
             }
@@ -1026,7 +1022,6 @@ impl Engine {
         dict: &Dict,
         syllables: &[String],
         limit: usize,
-        page_size: usize,
         force: bool,
     ) {
         if !force && syllables.len() < 3 || limit == 0 || syllables.is_empty() {
@@ -1036,10 +1031,11 @@ impl Engine {
             return;
         };
         extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
-        // 候选满页也追加：整句补全占满时单字进不来，但翻页必须看得到它们
-        // （用户诉求就是翻页选单字）。page_size 只约束首页展示，不限制
-        // 候选总量；截断只受 candidate_limit 管。
-        extra.truncate(limit.saturating_sub(cands.len()).max(1));
+        // 预算独立于主查询的 candidate_limit：之前 truncate 到「剩余空间」，
+        // 主查询占满 50 时剩余 0 → max(1) 只追加 1 个单字（zhongguoren 实测
+        // 只剩 1 个「中」）。参照 qingjian/fcitx5：候选总量可远超一页，首音节
+        // 单字全量进同一列表，翻页在平台层做。extra 本身已被 lookup 的 limit
+        // 约束为 freq 降序的前 limit 条，追加在末尾不污染层一/整句名次。
         cands.extend(extra);
     }
     /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
