@@ -9,8 +9,9 @@
 ## 开发方式
 
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
-- 本地只跑 `cargo check`（轻量验证）；**全量构建/测试放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test），本地不跑**。bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
-- 本地有 192 万词条的 SQLite 库（`~/.local/share/kime/dict.sqlite3`），跑基准时优先复用。
+- **本地禁止任何 `cargo build` / `cargo test` / `cargo run`**（含单个测试、example、`--bin`）：编译与测试一律放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test）。本地不验证正确性，靠 CI 绿灯为准；需要复现行为时写成**测试文件或 example 提交进仓库**，由 CI 跑，不在本地执行。
+- 本地允许的仅：读代码、grep/glob、`git` 操作、写文件；不产生任何 target/ 产物。
+- bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
 
 ## `.wt/` 工作目录保护（硬约束）
 
@@ -58,6 +59,6 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 1. **工作目录门禁**：子代理必须在 `.wt/<branch>` 工作，prompt 必须写明绝对路径 cwd。
 2. **任务量门禁**：单个子任务 ≤ 5 个文件、单一主题、单一修改范围。
-3. **真实复验（Audit）**：不轻信子代理自报的 "ALL PASS"——必须真跑验收命令、检查 diff 边界、核对真实测试计数。
+3. **真实复验（Audit）**：不轻信子代理自报的 "ALL PASS"——必须检查 diff 边界、核对真实测试计数；**验收命令一律由 PR 的 CI 跑**（见「开发方式」），主控本地不执行 cargo，靠 CI 绿灯 + 产物判断。
 4. **工具审查**：修改核心逻辑后先跑 `code-review-graph detect-changes` 检查结构面风险。
 5. **收尾报备**：汇报改了哪些文件、跑了哪些测试、性能对比、剩余风险。
