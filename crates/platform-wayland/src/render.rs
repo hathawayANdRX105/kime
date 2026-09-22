@@ -81,13 +81,57 @@ pub struct Renderer {
     cache: SwashCache,
 }
 
+/// 冷路径探针：`Renderer::new()` 末尾用**真实渲染路径**（layout→measure 整形、
+/// paint 再整形 + swash 光栅）跑一遍这段内容，把字体解析、缺字 fallback 选择、
+/// shape-run 缓存与 image_cache 一次性填满。标签经 layout() 包成 `"N. <text>"`，
+/// 前缀天然覆盖数字/点/空格（拉丁 + 标点）；扩展区稀有字故意写成 `\u{...}` 转义：
+/// fontdb 无覆盖时会走 cosmic-text 全字体线扫，每个 face 首次要解析 CJK 大表 +
+/// 建 harfrust shaper（实测 ~110ms 纯 CPU），这笔钱必须在进程启动期付掉，
+/// 而不是首个 ACTIVATE 的按键同步路径上。
+const WARMUP_PROBE: &[&str] = &[
+    // 常用 CJK（含实测肇事页首字「能」，与测试字面同源）
+    "能候选一啊中英",
+    // 拉丁字母 + 数字（剪贴板候选可以是任意文本；label 前缀另带 "N. "）
+    "abc123",
+    // Ext-A 实测肇事字：㲌 㴰 䏻 䘅
+    "\u{3C8C}",
+    "\u{3D30}",
+    "\u{43FB}",
+    "\u{4605}",
+    // 螚（U+879A，URO 内稀有字，实测肇事）
+    "\u{879A}",
+    // Ext-B 抽样：𠹌 𢆂
+    "\u{20E4C}",
+    "\u{22182}",
+    // 再抽 Ext-E / Ext-G 各一个，保证扫描面
+    "\u{2C429}",
+    "\u{30EDD}",
+];
+
 impl Renderer {
     /// FontSystem::new() 扫系统字体（fontconfig 路径），一次性、偏慢，只建一个。
+    /// 构造末尾立刻 warmup()：把字形冷路径成本从按键路径挪到进程启动期
+    /// （main 在 wayland 连接之前调用，守护进程启动期用户不可见）。
     pub fn new() -> Self {
-        Self {
+        let mut this = Self {
             font_system: FontSystem::new(),
             cache: SwashCache::new(),
-        }
+        };
+        this.warmup();
+        this
+    }
+
+    /// 冷路径预热：只填缓存的纯副作用，不改任何布局状态——warmup 之后的
+    /// measure/layout 结果与未预热时逐位一致（缓存只省重算，不改字体选择）。
+    /// 探针文本与真实 label 走同一套 Buffer::set_text(Shaping::Advanced) +
+    /// shape_until_scroll + buffer.draw 路径；临时 scratch 画完即丢。
+    /// 无字体环境（fontdb 为空）只是量不到字形：走 measure 既有的
+    /// warn_no_font 分支，本函数不引入任何 unwrap/expect。
+    fn warmup(&mut self) {
+        let probe: Vec<String> = WARMUP_PROBE.iter().map(|s| s.to_string()).collect();
+        let layout = self.layout(&probe);
+        let mut scratch = vec![0u8; layout.pixel_len()];
+        self.paint(&layout, 0, &mut scratch);
     }
 
     /// 测量一段文本的像素宽（横排、不换行）。

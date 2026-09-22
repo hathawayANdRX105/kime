@@ -202,10 +202,13 @@ struct PopupCanvas {
 }
 
 impl PopupCanvas {
+    // renderer 是 main 启动期预热好的渲染器（字形冷路径已 warmup），move 进来：
+    // 首次 ACTIVATE 不再付 ~110ms 的字体解析/fallback 成本
     fn new(
         im: &ZwpInputMethodV2,
         comp: &WlCompositor,
         shm: &WlShm,
+        renderer: Renderer,
         qh: &QueueHandle<AppState>,
     ) -> Self {
         let surface = comp.create_surface(qh, ());
@@ -215,7 +218,7 @@ impl PopupCanvas {
             surface,
             _role,
             shm: shm.clone(),
-            renderer: Renderer::new(),
+            renderer,
             buffers: [None, None],
             free: [true, true],
             frame: None,
@@ -430,6 +433,9 @@ struct AppState {
     shm: Option<WlShm>,
     /// 候选窗：候选条 + 一次性模式闪现；text_input_rectangle 只留日志
     popup: Option<PopupCanvas>,
+    /// 预热好的渲染器：main() 在 wayland 连接之前构造（Renderer::new 内含
+    /// 字形冷路径 warmup），ensure_popup 时 take 出来 move 进 PopupCanvas。
+    renderer: Option<Renderer>,
     /// xkb 解码：keymap/modifiers 事件喂状态，Key 事件取字符（取代旧手写码表）
     keyboard: Keyboard,
     /// 组合内长按自动重复：合成器不向 IM grab 投递 repeat（libinput 吞 value=2；
@@ -457,7 +463,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(target_seat: Option<String>) -> Self {
+    fn new(target_seat: Option<String>, renderer: Renderer) -> Self {
         Self {
             conn: None,
             input_method_manager: None,
@@ -478,6 +484,7 @@ impl AppState {
             compositor: None,
             shm: None,
             popup: None,
+            renderer: Some(renderer),
             keyboard: Keyboard::new(),
             repeat: KeyRepeat::default(),
             pending_surrounding: None,
@@ -609,7 +616,11 @@ impl AppState {
             log("wl_compositor/wl_shm 未绑定，候选窗不可用");
             return;
         };
-        self.popup = Some(PopupCanvas::new(im, &comp, &shm, qh));
+        // take 而非再 new：预热过的缓存只建一次就 move 走。popup surface/role
+        // 全程只建一次（见 PopupCanvas 文档），这条路径进程内最多走一遍；
+        // 万一将来允许重建，take 到 None 时兜底重新构造（重付一次预热，仅理论路径）。
+        let renderer = self.renderer.take().unwrap_or_else(Renderer::new);
+        self.popup = Some(PopupCanvas::new(im, &comp, &shm, renderer, qh));
         log("input popup 候选窗已建（已提交 1×1 透明首帧）");
     }
 
@@ -1341,11 +1352,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         log("使用默认 seat");
     }
 
+    // 冷路径预热前移到进程启动：候选窗首次渲染含 CJK 扩展区字形的页时，
+    // 缺字 fallback 全字体线扫 + 字体解析实测 134ms 帧延迟（~110ms 纯 CPU），
+    // 绝不能落在首个 ACTIVATE 的按键同步路径上。Renderer 不持有任何 wayland
+    // 对象（像素缓冲由调用方提供），所以在连 wayland 之前同步构造即可：
+    // 守护进程启动期用户不可见，不为此引入线程/异步。
+    let renderer = Renderer::new();
+
     let conn = Connection::connect_to_env()?;
 
     let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
     let qh: QueueHandle<AppState> = event_queue.handle();
-    let mut app = AppState::new(target_seat);
+    let mut app = AppState::new(target_seat, renderer);
     app.conn = Some(conn);
 
     globals.contents().with_list(|list| {
