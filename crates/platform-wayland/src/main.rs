@@ -423,10 +423,6 @@ struct AppState {
     tray: TrayIconManager,
     llm_worker: Option<LlmWorker>,
     llm_receiver: Option<Receiver<Vec<kime_core::dict::Candidate>>>,
-    /// Ctrl/Alt 按下旗标（键码 29/97、56/100 记账）：engine_press 构造 Key 时
-    /// 直接带进引擎。Shift 不存旗标——引擎的 shift 位看键码本身（shell_key）。
-    ctrl: bool,
-    alt: bool,
     /// press/release 配对记账（见 SwallowTracker）：press 被引擎吃掉的键，release 也不转发，
     /// 避免半截按键；press 一旦转发给应用，记账必须销掉，release 同样转发。
     swallowed: SwallowTracker,
@@ -478,8 +474,6 @@ impl AppState {
             tray: TrayIconManager::new(true),
             llm_worker: None,
             llm_receiver: None,
-            ctrl: false,
-            alt: false,
             swallowed: SwallowTracker::default(),
             compositor: None,
             shm: None,
@@ -722,7 +716,8 @@ impl AppState {
     ///
     fn clip_mode_key(&mut self, code: u32, qh: &QueueHandle<Self>) -> bool {
         let n = self.clip.candidates().len();
-        let action = clip_route(self.clip_pick.is_some(), self.clip_pick, self.ctrl, code, n);
+        let ctrl = self.keyboard.ctrl();
+        let action = clip_route(self.clip_pick.is_some(), self.clip_pick, ctrl, code, n);
         let consumed = !matches!(action, ClipAction::Forward);
         if consumed {
             // release 配对记账：clip 模式吞掉的 press，其 release 也吞，
@@ -780,11 +775,12 @@ impl AppState {
         }
         // 剪贴板模式优先：C-; 触发 / 导航 / 提交都在这里闭环，不进引擎。
         if self.clip_mode_key(code, qh) {
-            key_log(code, None, self.ctrl, self.alt, false, &Outcome::Consumed);
+            let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
+            key_log(code, None, ctrl, alt, false, &Outcome::Consumed);
             return;
         }
         let ch = self.keyboard.key_char(code);
-        let (ctrl, alt) = (self.ctrl, self.alt);
+        let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
         let mode_before = self.engine.as_ref().map_or(true, |e| e.chinese());
         let outcome = match self.engine.as_mut() {
             Some(engine) => engine.key(shell_key(code, ch, ctrl, alt)),
@@ -1241,6 +1237,12 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 state
                     .keyboard
                     .update_mods(mods_depressed, mods_latched, mods_locked, group);
+                // 真机诊断：mangowm 是否真发 Control/Alt 位（决定旗标推导是否可信）。
+                log(&format!(
+                    "Modifiers depressed=0x{mods_depressed:x} ctrl={} alt={}",
+                    state.keyboard.ctrl(),
+                    state.keyboard.alt()
+                ));
                 if let Some(vk) = &state.vk {
                     if state.vk_keymap_ready {
                         vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
@@ -1256,11 +1258,8 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
                 let released = matches!(key_state, WEnum::Value(KeyState::Released));
 
-                match key {
-                    29 | 97 => state.ctrl = pressed,
-                    56 | 100 => state.alt = pressed,
-                    _ => {}
-                }
+                // 键码嗅探只是时序兜底，旗标归属 keyboard.rs（Modifiers 推导权威）。
+                state.keyboard.note_key(key, pressed);
                 let is_shift = matches!(key, 42 | 54);
 
                 if released {
@@ -1308,7 +1307,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 if shift_holds_passthrough(
                     state.shift_gesture.on_key_press(),
                     state.keyboard.key_char(key),
-                    state.alt,
+                    state.keyboard.alt(),
                 ) {
                     state.forward_key(time, key, true);
                     return;

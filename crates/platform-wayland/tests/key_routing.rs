@@ -24,6 +24,7 @@ use xkbcommon::xkb;
 
 // evdev keycode（linux/input-event-codes.h）
 const KEY_CTRL: u32 = 29;
+const KEY_A: u32 = 30;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_B: u32 = 48;
 const KEY_F: u32 = 33;
@@ -81,8 +82,6 @@ struct Shell {
     engine: Engine,
     swallowed: SwallowTracker,
     repeat: KeyRepeat,
-    ctrl: bool,
-    alt: bool,
     /// vk.key 观测：(code, pressed)
     forwarded: Vec<(u32, bool)>,
     /// commit_string 观测
@@ -113,8 +112,6 @@ impl Shell {
                 engine,
                 swallowed: SwallowTracker::default(),
                 repeat: KeyRepeat::default(),
-                ctrl: false,
-                alt: false,
                 forwarded: Vec::new(),
                 commits: Vec::new(),
             },
@@ -122,7 +119,7 @@ impl Shell {
         )
     }
 
-    /// 真 press：dispatch 对 29|97/56|100 的旗标记账 + 合成器 Modifiers 事件
+    /// 真 press：dispatch 对 29|97/56|100 的 note_key 嗅探 + 合成器 Modifiers 事件
     /// （grab Key 旁必有一条，两步并成一步）+ engine_press。
     fn press(&mut self, code: u32) -> Outcome {
         self.set_modifier(code, true);
@@ -137,22 +134,27 @@ impl Shell {
         }
     }
 
+    /// 键码嗅探（main.rs Key 分支同构）：29|97/56|100 的按下/抬起进 note_key；
+    /// Ctrl 另补一条合成器 Modifiers 掩码（grab Key 旁必有一条，两步并成一步）。
+    /// 旗标归属 Keyboard——掩码推导权威、嗅探只填两帧之间的空档。
     fn set_modifier(&mut self, code: u32, down: bool) {
-        match code {
-            KEY_CTRL | 97 => {
-                self.ctrl = down;
-                self.keyboard
-                    .update_mods(if down { self.ctrl_bit } else { 0 }, 0, 0, 0);
-            }
-            56 | 100 => self.alt = down,
-            _ => {}
+        self.keyboard.note_key(code, down);
+        if matches!(code, KEY_CTRL | 97) {
+            self.keyboard
+                .update_mods(if down { self.ctrl_bit } else { 0 }, 0, 0, 0);
         }
+    }
+
+    /// 合成器 Modifiers 事件（main.rs Modifiers 分支同构）：掩码进 xkb state，
+    /// ctrl/alt 旗标由 Keyboard 自己推导——测试直接调它模拟「没有 29|97 键事件」。
+    fn update_mods(&mut self, depressed: u32) {
+        self.keyboard.update_mods(depressed, 0, 0, 0);
     }
 
     /// main.rs engine_press 的同构复刻（now_ms 换成假表 T0，qh 副作用换成账目）。
     fn engine_press(&mut self, code: u32, synthetic: bool) -> Outcome {
         let ch = self.keyboard.key_char(code);
-        let (ctrl, alt) = (self.ctrl, self.alt);
+        let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
         let outcome = self.engine.key(shell_key(code, ch, ctrl, alt));
         let composing = !self.engine.preedit().is_empty();
         let route = route_press(code, synthetic, composing, &outcome);
@@ -395,7 +397,8 @@ fn ctrl_held_key_fields_match_engine_contract() {
     let (mut sh, dir) = Shell::new("key_fields");
     sh.type_str("ni"); // 先建立组合（按住 Ctrl 打字会被引擎 Ignored，属另一条契约）
     sh.press(KEY_CTRL);
-    let key = shell_key(KEY_N, sh.keyboard.key_char(KEY_N), sh.ctrl, sh.alt);
+    let (ctrl, alt) = (sh.keyboard.ctrl(), sh.keyboard.alt());
+    let key = shell_key(KEY_N, sh.keyboard.key_char(KEY_N), ctrl, alt);
     assert_eq!(key.code, KEY_N);
     assert_eq!(key.ch, Some('n'), "真 xkb 下 Ctrl+N 必须带字符进引擎");
     assert!(key.ctrl && !key.shift && !key.alt);
@@ -540,4 +543,31 @@ fn clip_route_commit_exit_and_pass_through() {
     assert_eq!(clip_route(true, Some(0), false, 28, 0), ClipAction::Exit);
     // 模式内空列表 + 未知键也是退出+放行
     assert_eq!(clip_route(true, Some(0), false, 30, 0), ClipAction::Forward);
+}
+
+/// ⑥ Modifiers-only Ctrl（wtype 虚拟键盘 / grab 重建丢 29|97 Key 事件的回归钉桩）：
+/// 旗标只能来自合成器掩码的 xkb 推导——旧实现只认键码记账，Ctrl+A 的 'a' 会
+/// 不带 ctrl 位进引擎被当拼音吞掉（而它本该 Ignored → 放行给应用）。
+#[test]
+fn modifiers_only_ctrl_reaches_engine_without_key_events() {
+    let (mut sh, dir) = Shell::new("mods_only");
+    let ctrl_bit = sh.ctrl_bit;
+    // 全程没有 note_key(29|97)：仅凭 Modifiers 掩码必须点亮 ctrl 旗标。
+    sh.update_mods(ctrl_bit);
+    assert!(sh.keyboard.ctrl(), "掩码推导必须点亮 ctrl（键码记账缺席）");
+    // 空组合 + Ctrl + 字母：引擎 Ignored → route_press 转发应用。
+    assert_eq!(sh.press(KEY_A), Outcome::Ignored, "Ctrl+A 空组合必须放行");
+    assert!(
+        sh.forwarded.contains(&(KEY_A, true)),
+        "Ctrl+A 放行给应用: {:?}",
+        sh.forwarded
+    );
+    sh.release(KEY_A);
+    // 掩码清零 → 旗标必须灭（xkb 是唯一真相，不吃上一帧的记忆）。
+    sh.update_mods(0);
+    assert!(!sh.keyboard.ctrl(), "掩码清零必须灭 ctrl 旗标");
+    // 旗标灭后同键回归拼音路径：'a' 进引擎被消费（与第一段构成对照）。
+    assert_eq!(sh.press(KEY_A), Outcome::Consumed, "无 Ctrl 回到拼音路径");
+    sh.release(KEY_A);
+    fs::remove_dir_all(dir).unwrap();
 }

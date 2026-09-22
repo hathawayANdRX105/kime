@@ -9,9 +9,10 @@
 use platform_wayland::keyboard::Keyboard;
 use xkbcommon::xkb;
 
-fn us_keyboard() -> Keyboard {
+/// 键图文本是真机 fd 的同格式产物；抽出来给 wl_bit 复用（同一份键图取 mod 位）。
+fn compiled_us() -> xkb::Keymap {
     let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_names(
+    xkb::Keymap::new_from_names(
         &ctx,
         "evdev",
         "pc105",
@@ -20,14 +21,25 @@ fn us_keyboard() -> Keyboard {
         None,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
-    .expect("系统 xkb 数据不可用：编译 us 键图失败");
-    let text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+    .expect("系统 xkb 数据不可用：编译 us 键图失败")
+}
+
+fn us_keyboard() -> Keyboard {
+    let text = compiled_us().get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
     let mut kb = Keyboard::new();
     assert!(
         kb.set_keymap(&text),
         "xkb 自己产出的文本必须能被 set_keymap 装载"
     );
     kb
+}
+
+/// 修饰名 → wl_keyboard.modifiers 掩码位（bit 位 = 键图 mod 序号；虚拟 mod
+/// 序号 ≥ 8 同样按位编码）。MOD_INVALID = 键图没这个修饰，测试前提不成立直接红。
+fn wl_bit(name: &str) -> u32 {
+    let idx = compiled_us().mod_get_index(name);
+    assert_ne!(idx, xkb::MOD_INVALID, "us 键图缺修饰 {name}");
+    1u32 << idx
 }
 
 // evdev keycode（linux/input-event-codes.h）
@@ -169,4 +181,67 @@ fn ctrl_held_printable_survivors_go_through_primary_path() {
     // Ctrl+字母全解出：兜底没误伤引擎其余 ctrl 组合（C-n/C-p 翻页等）。
     assert_eq!(kb.key_char(49 /* n */), Some('n'));
     assert_eq!(kb.key_char(25 /* p */), Some('p'));
+}
+
+#[test]
+fn update_mods_ctrl_mask_derives_ctrl_flag() {
+    // 旗标权威来源是合成器 Modifiers 掩码（虚拟键盘/grab 重建后键码记账缺失，
+    // 只有掩码可信）：掩码到位 ctrl() 必须亮，清零必须灭。
+    let mut kb = us_keyboard();
+    assert!(!kb.ctrl(), "初始无修饰旗标必须为灭");
+    kb.update_mods(WL_CTRL, 0, 0, 0);
+    assert!(kb.ctrl(), "Control 位激活必须推导出 ctrl 旗标");
+    kb.update_mods(0, 0, 0, 0);
+    assert!(!kb.ctrl(), "掩码清零必须灭旗标");
+}
+
+#[test]
+fn update_mods_alt_mask_derives_alt_flag() {
+    // Alt 在 us/pc105 是虚拟 mod（序号 ≥ 8）：按「位 = mod 序号」喂掩码，
+    // 证明推导不依赖 Control/Shift 所在的 real mod 区（0..7）。
+    let mut kb = us_keyboard();
+    let alt_bit = wl_bit("Alt");
+    kb.update_mods(alt_bit, 0, 0, 0);
+    assert!(kb.alt(), "Alt 位激活必须推导出 alt 旗标");
+    assert!(!kb.ctrl(), "Alt 激活不得误亮 ctrl");
+    kb.update_mods(0, 0, 0, 0);
+    assert!(!kb.alt(), "掩码清零必须灭 alt 旗标");
+}
+
+#[test]
+fn note_key_sniff_sets_flags_between_modifiers_frames() {
+    // 键码嗅探（main.rs Key 分支同构）只填两帧 Modifiers 之间的空档：按下亮、
+    // 抬起灭；左右 Ctrl 码（29|97）与 Alt 码（56|100）都认，普通键是 no-op。
+    let mut kb = us_keyboard();
+    kb.note_key(29, true);
+    assert!(kb.ctrl(), "左 Ctrl 按下（无 Modifiers 帧）旗标须亮");
+    kb.note_key(29, false);
+    assert!(!kb.ctrl(), "左 Ctrl 抬起须灭");
+    kb.note_key(97, true);
+    assert!(kb.ctrl(), "右 Ctrl 按下同样点亮");
+    kb.note_key(97, false);
+    assert!(!kb.ctrl(), "右 Ctrl 抬起须灭");
+    kb.note_key(56, true);
+    assert!(kb.alt(), "左 Alt 按下点亮 alt");
+    kb.note_key(56, false);
+    assert!(!kb.alt(), "左 Alt 抬起须灭");
+    kb.note_key(100, true);
+    assert!(kb.alt(), "右 Alt 按下同样点亮");
+    kb.note_key(100, false);
+    assert!(!kb.alt(), "右 Alt 抬起须灭");
+    kb.note_key(KEY_A, true);
+    assert!(!kb.ctrl() && !kb.alt(), "普通字母键不得误触旗标");
+}
+
+#[test]
+fn wtype_mods_without_ctrl_keycode_still_derives_flag() {
+    // wtype 虚拟键盘从不发 29|97 物理键：Modifiers 带 Control 位 + 普通字母 Key。
+    // 旧实现只靠键码记账 → 旗标恒 false → ctrl+c 被当拼音吞；钉住掩码路径。
+    let mut kb = us_keyboard();
+    kb.note_key(KEY_A, true);
+    assert!(!kb.ctrl(), "普通字母 Key 不得凭空点亮 ctrl");
+    kb.update_mods(WL_CTRL, 0, 0, 0);
+    assert!(kb.ctrl(), "仅凭掩码（无 29|97 键码）必须推导出 ctrl");
+    kb.update_mods(0, 0, 0, 0);
+    assert!(!kb.ctrl(), "掩码清零灭旗标");
 }

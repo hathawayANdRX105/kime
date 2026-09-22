@@ -15,6 +15,14 @@ pub struct Keyboard {
     state: Option<xkb::State>,
     /// 键图里 Control 的 mod index（set_keymap 时缓存）；MOD_INVALID = 键图没这个修饰。
     ctrl_mod: xkb::ModIndex,
+    /// 键图里 Alt 的 mod index（同上；Alt 常是虚拟 mod，index ≥ 8）。
+    alt_mod: xkb::ModIndex,
+    /// Ctrl/Alt 旗标：两个来源收敛到本结构体——`note_key` 记 evdev 键码
+    /// （grab 重建丢 Key 事件前的兜底），`update_mods` 每次用合成器送来的
+    /// xkb 掩码重新推导（权威路径：虚拟键盘 wtype 不产生 29/56 物理键，
+    /// 旧实现只靠键码记账 → 旗标恒 false → ctrl+c 被当拼音吞掉）。
+    ctrl: bool,
+    alt: bool,
 }
 
 impl Default for Keyboard {
@@ -29,6 +37,9 @@ impl Keyboard {
             context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             state: None,
             ctrl_mod: xkb::MOD_INVALID,
+            alt_mod: xkb::MOD_INVALID,
+            ctrl: false,
+            alt: false,
         }
     }
 
@@ -42,6 +53,11 @@ impl Keyboard {
         ) {
             Some(keymap) => {
                 self.ctrl_mod = keymap.mod_get_index("Control");
+                self.alt_mod = keymap.mod_get_index("Alt");
+                // 换键图 = 旧 xkb 状态作废：旗标清零，等下一条 Modifiers 事件
+                // 经 update_mods 重新推导，避免拿旧键图的 index 读新状态。
+                self.ctrl = false;
+                self.alt = false;
                 self.state = Some(xkb::State::new(&keymap));
                 true
             }
@@ -59,6 +75,33 @@ impl Keyboard {
             return;
         };
         state.update_mask(depressed, latched, locked, group, 0, 0);
+        // 权威推导：每次 Modifiers 事件后用 xkb 有效态回读旗标，覆盖 note_key
+        // 的键码猜测——虚拟键盘/grab 重建场景键码路径拿不到 Ctrl，只有掩码可信。
+        // MOD_INVALID 必须短路：拿无效 index 问 is_active 是未定义行为级别的坑。
+        self.ctrl = self.ctrl_mod != xkb::MOD_INVALID
+            && state.mod_index_is_active(self.ctrl_mod, xkb::STATE_MODS_EFFECTIVE);
+        self.alt = self.alt_mod != xkb::MOD_INVALID
+            && state.mod_index_is_active(self.alt_mod, xkb::STATE_MODS_EFFECTIVE);
+    }
+
+    /// evdev 键码嗅探（29|97=Ctrl、56|100=Alt 的按下/抬起）：Modifiers 事件到达
+    /// 之前的时序兜底。每次 update_mods 都会整体重推导，本函数只负责两帧之间。
+    pub fn note_key(&mut self, key: u32, pressed: bool) {
+        match key {
+            29 | 97 => self.ctrl = pressed,
+            56 | 100 => self.alt = pressed,
+            _ => {}
+        }
+    }
+
+    /// Ctrl 旗标只读出口：main.rs 路由/日志统一从这里取，不再自持字段。
+    pub fn ctrl(&self) -> bool {
+        self.ctrl
+    }
+
+    /// Alt 旗标只读出口（同上）。
+    pub fn alt(&self) -> bool {
+        self.alt
     }
 
     /// evdev keycode → 当前状态下这个键打出的可打印字符。
