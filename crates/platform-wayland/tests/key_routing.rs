@@ -442,6 +442,7 @@ fn ctrl_digit_forwarded_ctrl_dot_consumed() {
 /// Enter 上屏字母后必须把原始回车键放行给应用：只 commit 不转发时
 /// Enter 契约：上屏原始字母串、面板退出，回车键本身**不再转发**——
 /// QQ/微信收到回车会把消息直接发出去；换行交给应用自己的后续按键。
+#[test]
 fn enter_commits_letters_and_swallows_the_key() {
     let (mut sh, dir) = Shell::new("enternofwd");
     // 无候选输入（zzz 不在种子词库）→ 原串上屏，按键被吞。
