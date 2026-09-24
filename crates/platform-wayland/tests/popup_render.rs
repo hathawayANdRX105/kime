@@ -73,9 +73,22 @@ fn candidate_bar_chip_follows_mode() {
     assert_eq!(zh.items[0].text, mode_chip(true));
     assert_eq!(en.items[0].text, mode_chip(false));
     assert_ne!(zh.items[0].text, en.items[0].text);
-    let zh_buf = paint(&mut r, &zh, 0);
-    let en_buf = paint(&mut r, &en, 0);
-    assert_ne!(zh_buf, en_buf, "两种模式的帧必须不同");
+    // 帧比对要按字形可区分性开关：CI 的 ubuntu-latest 没装 CJK 字体，「中」「英」
+    // 双双回退到同一个 .notdef 字形，两帧逐字节相同（run 36062714042 实测）。
+    // 那种环境里帧差异本就无从谈起，只在字体真能区分二者时才断言。
+    let zh_glyph = {
+        let l = r.chip_layout(true);
+        paint(&mut r, &l, 0)
+    };
+    let en_glyph = {
+        let l = r.chip_layout(false);
+        paint(&mut r, &l, 0)
+    };
+    if zh_glyph != en_glyph {
+        let zh_buf = paint(&mut r, &zh, 0);
+        let en_buf = paint(&mut r, &en, 0);
+        assert_ne!(zh_buf, en_buf, "字体能区分中/英时，两种模式的帧必须不同");
+    }
 }
 
 #[test]
