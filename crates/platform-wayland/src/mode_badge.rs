@@ -339,8 +339,7 @@ impl ModeBadge {
             return Err("mode-badge 尺寸非法");
         }
         let len = (w as usize) * (h as usize) * 4;
-        let fd =
-            unsafe { libc::memfd_create(b"kime-badge\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"kime-badge".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return Err("memfd_create 失败");
         }
