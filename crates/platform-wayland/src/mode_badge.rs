@@ -98,6 +98,18 @@ struct BadgeShmBuffer {
     h: u32,
 }
 
+/// 收到 release 之前就丢弃（合成器发 closed、进程收尾）也安全，不必等 release：
+///
+/// - `munmap` 只拆**本进程**的地址空间映射。合成器经 `wl_shm.create_pool` 拿到同一
+///   memfd 后自己 mmap，两边映射的是同一批 page cache 页；只要它还在读，那份映射
+///   本身就是引用，页就不会被回收。"正在扫描" 与 "最后一个引用已释放" 互斥。
+/// - 协议禁止的是 destroy 之后**改写**这块存储（"the surface contents become
+///   undefined"）。这里只拆自己的视图、关自己的 fd，之后再不碰 `ptr`/`fd`。
+/// - 真正的约束由 `free[slot]` 记账保证：没收到 release 就不写。而**不该**改成
+///   "没 release 就不 munmap"——本仓库已知合成器在焦点抖动时会扣住 release
+///   （见 main.rs 的 deactivate 说明），那样只会把映射泄漏出去。
+///
+/// wlroots / GTK / Qt / weston-simple-shm 的 teardown 同样是无条件 unmap+close。
 impl Drop for BadgeShmBuffer {
     fn drop(&mut self) {
         unsafe {

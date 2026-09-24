@@ -686,7 +686,7 @@ impl AppState {
     /// 角标只在模式真的翻转时才重画——它常驻显示，每帧重画纯属浪费，且重画要走
     /// 按键路径。`set_chinese` 返回是否真变了，没变就不碰 buffer。
     fn sync_mode_badge(&mut self, qh: &QueueHandle<Self>) {
-        let chinese = self.engine.as_ref().map_or(true, |e| e.chinese());
+        let chinese = self.engine.as_ref().is_none_or(|e| e.chinese());
         self.tray.set_chinese(chinese);
         let Some(badge) = self.badge.as_mut() else {
             return;
