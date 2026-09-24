@@ -33,7 +33,7 @@ fn non_bg(buf: &[u8]) -> usize {
 /// 模式字专用青绿色（CHIP = rgb(122,207,214)，ARGB8888 字节序 B,G,R,A → G 明显大于 R）。
 /// FG 灰（r=g）、HL 琥珀（r>g）、BG（r=g）及其任意抗锯齿混色都够不到这个判据。
 fn chip_pixels(buf: &[u8]) -> usize {
-    buf.chunks_exact(4)
+    buf.chunks(4)
         .filter(|p| p[1] as i32 > p[2] as i32 + 40)
         .count()
 }
