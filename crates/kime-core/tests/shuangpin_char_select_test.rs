@@ -33,6 +33,15 @@ const SEED: &str = "\
 你好\tni hao\t500000
 ";
 
+/// 混输回退专用：自然码 `aang` 解成 a(`aa`)+neng(`ng`)，层一/abbrev 都查不到；
+/// 全拼重试按 a+ang 命中「阿昂」。若双拼派生的单字「啊」还被追加进同一列表，
+/// 选它时 sp_active 已是 false（按字母切），会剩 `ang` 而不是 `ng`。
+const MIXED_SEED: &str = "\
+...
+啊\ta\t900000
+阿昂\ta ang\t50000
+";
+
 fn tmp_db(suffix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "kime_sp_consume_{}_{}_{}.sqlite",
@@ -48,13 +57,17 @@ fn tmp_db(suffix: &str) -> PathBuf {
 }
 
 fn seeded_engine(suffix: &str) -> (Engine, PathBuf, PathBuf) {
+    seeded_engine_with(suffix, SEED)
+}
+
+fn seeded_engine_with(suffix: &str, seed: &str) -> (Engine, PathBuf, PathBuf) {
     let db = tmp_db(suffix);
     let yaml = std::env::temp_dir().join(format!(
         "kime_sp_consume_seed_{}_{}.yaml",
         std::process::id(),
         suffix
     ));
-    fs::write(&yaml, SEED).unwrap();
+    fs::write(&yaml, seed).unwrap();
     let mut d = Dict::open(&db).unwrap();
     d.import(&yaml).unwrap();
     let e = Engine::new(
@@ -166,5 +179,28 @@ fn whole_word_selection_consumes_all_keys() {
     assert_eq!(select_text(&mut e, "能够"), "能够");
     assert!(e.preedit().is_empty(), "整词上屏后 preedit 应清空");
     assert!(e.candidates().is_empty(), "整词上屏后候选应清空");
+    cleanup(&db, &yaml);
+}
+
+#[test]
+fn full_pinyin_fallback_list_stays_pure_full_pinyin() {
+    let (mut e, db, yaml) = seeded_engine_with("mixed", MIXED_SEED);
+    for c in "aang".chars() {
+        e.key(ch(c));
+    }
+    // 双拼解 a+neng 查无词 → 全拼重试按 a+ang 命中「阿昂」，此后整串按全拼字母
+    // 语义解释（消耗不再是 2 键/音节），候选列表必须保持同源。
+    assert_eq!(e.preedit(), "aang", "全拼解释下 preedit 就是原始键串");
+    let list = texts(&e);
+    assert!(
+        list.contains(&"阿昂".to_string()),
+        "全拼回退应命中「阿昂」，实际 {list:?}"
+    );
+    assert!(
+        !list.contains(&"啊".to_string()),
+        "全拼语义下不得混入双拼派生的「啊」（选它会按字母切、剩 ang 而非 ng）：{list:?}"
+    );
+    assert_eq!(select_text(&mut e, "阿昂"), "阿昂");
+    assert!(e.preedit().is_empty(), "整词上屏后 preedit 应清空");
     cleanup(&db, &yaml);
 }

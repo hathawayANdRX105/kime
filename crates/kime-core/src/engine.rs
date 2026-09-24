@@ -741,6 +741,15 @@ impl Engine {
                             // 回到 2 键/音节，否则整句场景选单字又会按拼音字母数
                             // 多吃下一音节的键位。
                             self.sp_active = true;
+                        } else {
+                            // 全拼解释成立（preedit / last_reading / 候选全是全拼
+                            // 字母语义）：到此为止。下面的整句联想与首音节单字都由
+                            // syllables 生成，混进来会让同一列表混两套消耗语义——
+                            // 选这类双拼单字时 sp_active 已是 false，按字母切会切错
+                            // 键位：`aang` 解 a+neng 查无词、全拼命中「阿昂」后若再
+                            // 混进「啊」，选它剩 `ang`，正确是 `ng` 即 neng。
+                            self.merge_english();
+                            return;
                         }
                     }
                     // 整句联想：词库没有整串词条时（「我不知道你说的是什么」这类长句），
