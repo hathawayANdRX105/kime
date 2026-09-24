@@ -3,6 +3,7 @@
 pub mod clipboard_watch;
 pub mod context_batch;
 pub mod keyboard;
+pub mod mode_badge;
 pub mod render;
 pub mod repeat;
 pub mod route;

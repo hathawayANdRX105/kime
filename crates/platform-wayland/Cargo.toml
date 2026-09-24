@@ -7,6 +7,10 @@ edition.workspace = true
 kime-core = { path = "../kime-core" }
 wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+# zwlr_layer_shell_v1 / zwlr_layer_surface_v1 绑定：构建期由 wayland-scanner 生成代码，
+# 不引入任何原生库或额外守护进程，只是多几类 wayland 协议消息。合成器不支持
+# wlr-layer-shell 时绑定仍在，运行时拿不到该 global 就跳过徽标。
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # shape-run-cache：按 (text, attrs) 缓存整形结果，消掉 measure/paint 对同一批
 # 字形的双次整形（缺字 fallback 全扫是按键路径上的冷路径大头）。缓存由 FontSystem
 # 持有、无自动 trim：候选 label 集合有限且单条目极小，长会话的增长可接受
