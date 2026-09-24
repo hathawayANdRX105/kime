@@ -75,13 +75,24 @@ where
 /// `key code=<u32> ch=<char|-> mods=<c?><s?><a?> -> <Outcome>`，追加写
 /// /tmp/kime-ime.log。人打字 ≤10 键/s、长按满速重复 ~30 行/s，不引日志
 /// 框架；release 构建直接可见。写失败（只读/满盘）静默——日志不许卡键流。
+///
+/// 自截断：追加写发现文件已超 1MiB 就 set_len(0) 归零（保留文件本身）。
+/// seek(0) 在 O_APPEND 下无效——内核强制每次写落到当前文件尾，只有归零
+/// 才能让后续行从头写起。无人清理的 tmpfs 日志否则会一直涨到撑满为止。
 fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+    const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/kime-ime.log")
     {
+        if f.metadata()
+            .map(|m| m.len() > MAX_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = f.set_len(0);
+        }
         let _ = f.write_all(line.as_bytes());
     }
 }
