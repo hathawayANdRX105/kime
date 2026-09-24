@@ -66,6 +66,13 @@ pub struct Engine {
     candidates: Vec<Candidate>,
     /// 双拼解码表（如小鹤/自然码），用于 shuangpin 模式
     sp: Option<kime_shuangpin::Table>,
+    /// 当前候选是否出自双拼解码路径（含半截键 pending）。true 时选词消耗按**键位**计：
+    /// 一个完整双拼音节恒等于 2 个键位，其拼音字母数与键位数无关（neng 4 字母但
+    /// `ng` 只 2 键）——按字母消耗会吃掉下一音节的键位（长串逐字单选剩余拼音被截断的
+    /// 根因，见 [`Self::commit_candidate`]）。`refresh_candidates` 双拼解码成功分支置
+    /// true（双拼回退全拼后仍无候选时也恢复 true：候选全来自双拼音节序列）；
+    /// 全拼路径（双拼解码失败、或回退全拼查到了词）置 false。
+    sp_active: bool,
     /// 首个切分的读音序列（preedit/光标的显示依据）；learn 仅在被选候选自带
     /// pinyin 缺失时回退到它
     last_reading: Vec<String>,
@@ -132,6 +139,7 @@ impl Engine {
             cursor: 0,
             candidates: Vec::new(),
             sp: shuangpin.map(kime_shuangpin::Table::new),
+            sp_active: false,
             last_reading: Vec::new(),
             preedit: String::new(),
             page_index: 0,
@@ -215,6 +223,7 @@ impl Engine {
         self.page_index = 0;
         self.cursor = 0;
         self.last_joined.clear();
+        self.sp_active = false;
     }
 
     /// 选词上屏：learn + 清空候选/页码，但**只消耗被选候选覆盖的音节**，
@@ -237,8 +246,19 @@ impl Engine {
         } else {
             cand.pinyin.split('\'').map(str::to_string).collect()
         };
-        // 剩余字母 = 原串去掉已消耗音节的字母（按音节长度从头消费）。
-        let remaining = consume_prefix_letters(&self.letters, &consumed);
+        // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；双拼按**键位**
+        // 消耗（每音节恒 2 键），否则 neng（4 字母）会多吃掉下一音节的键位。
+        let remaining = if self.sp_active {
+            let k = consumed.len();
+            let cut = 2 * k;
+            if cut >= self.letters.len() {
+                String::new()
+            } else {
+                self.letters[cut..].to_string()
+            }
+        } else {
+            consume_prefix_letters(&self.letters, &consumed)
+        };
 
         self.candidates.clear();
         self.page_index = 0;
@@ -666,6 +686,7 @@ impl Engine {
                     let has_pending = !pending.is_empty();
                     let pending = pending.as_str();
                     let sp_joined = joined_key(&syllables, pending);
+                    self.sp_active = true;
                     self.last_reading = syllables.clone();
                     self.preedit = format!("{}{}", syllables.join(""), pending);
                     self.last_joined = sp_joined.clone();
@@ -714,6 +735,13 @@ impl Engine {
                         // 双拼解出错误音节（如 nihao→ni+ha）且查无词 → 全拼重试。
                         // 先试全拼：混输的键串按全拼才是对的，此时不该拿双拼音节硬凑句子。
                         self.refresh_full_pinyin();
+                        if self.candidates.is_empty() {
+                            // 全拼也查无词：键串仍只能按双拼键位解释（下面的整句
+                            // 联想 / 缺陷 A 回退候选全部来自 syllables），消耗必须
+                            // 回到 2 键/音节，否则整句场景选单字又会按拼音字母数
+                            // 多吃下一音节的键位。
+                            self.sp_active = true;
+                        }
                     }
                     // 整句联想：词库没有整串词条时（「我不知道你说的是什么」这类长句），
                     // Viterbi 组词是唯一的候选来源。双拼分支此前完全没接，长句一律 0 候选。
@@ -795,6 +823,8 @@ impl Engine {
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
     fn refresh_full_pinyin(&mut self) {
+        // 全拼候选按拼音字母消耗键串（双拼解码失败回退全拼时也走这里）。
+        self.sp_active = false;
         let segs = segment(&self.letters);
         let (reading, tail): (Vec<String>, String) = if let Some(reading) = segs.first().cloned() {
             let mut r = reading;
