@@ -182,17 +182,20 @@ impl CandidateWindow {
     }
 
     /// 按当前候选列表渲染并显示候选窗。无候选/隐藏帧 → 隐藏窗口。
-    /// `highlight` 为高亮项在 `candidates` 中的下标。
+    /// `highlight` 为高亮项在 `candidates` 中的下标（不含头部模式字）。
+    /// `chinese` 为当前中英模式，决定头部常驻模式字「中」/「英」。
     pub fn show_candidates(
         &mut self,
         candidates: &[Candidate],
         highlight: usize,
+        chinese: bool,
     ) -> Result<(), ConnectionError> {
         if candidates.is_empty() {
             self.hide();
             return Ok(());
         }
         self.renderer.set_candidates(candidates);
+        self.renderer.set_chinese(chinese);
         self.renderer.set_highlight(highlight);
         let frame = self.renderer.render();
         if frame.is_hidden() {

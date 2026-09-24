@@ -1,6 +1,9 @@
 //! X11 候选窗纯像素渲染测试（不连 X11）：布局数学 + 像素输出。
 //! 目标：抓住「空候选画了实底帧」「缓冲长度与宽高不符」「高亮越界 panic」
 //! 这类只在真机上才暴露的 bug。本测试不创建任何 X11 资源。
+//!
+//! 候选条第一项是常驻模式字（CHIP 色）：不可选、也永不高亮，
+//! 高亮下标只数候选（模式字不占号）。
 
 use kime_core::Candidate;
 use platform_x11::render::{LINE_HEIGHT, MARGIN_X, MARGIN_Y};
@@ -25,6 +28,14 @@ fn cands(n: usize) -> Vec<Candidate> {
 
 fn non_bg(buf: &[u8]) -> usize {
     buf.chunks(4).filter(|p| *p != BG).count()
+}
+
+/// 模式字专用青绿色（CHIP = rgb(122,207,214)，ARGB8888 字节序 B,G,R,A → G 明显大于 R）。
+/// FG 灰（r=g）、HL 琥珀（r>g）、BG（r=g）及其任意抗锯齿混色都够不到这个判据。
+fn chip_pixels(buf: &[u8]) -> usize {
+    buf.chunks_exact(4)
+        .filter(|p| p[1] as i32 > p[2] as i32 + 40)
+        .count()
 }
 
 #[test]
@@ -109,4 +120,47 @@ fn highlight_differs_from_normal_and_out_of_range_is_safe() {
     assert_ne!(oob.pixels, normal.pixels);
     assert_ne!(oob.pixels, highlighted.pixels);
     assert_eq!(oob.pixels.len(), oob.pixel_len());
+}
+
+#[test]
+fn candidate_bar_starts_with_mode_chip() {
+    let mut r = Renderer::new();
+    r.set_chinese(true);
+    r.set_candidates(&cands(3));
+    let f = r.render();
+    assert!(!f.is_hidden());
+    assert!(chip_pixels(&f.pixels) > 0, "候选条头部必须上 CHIP 色");
+}
+
+#[test]
+fn candidate_bar_chip_follows_mode() {
+    let mut r = Renderer::new();
+    r.set_candidates(&cands(3));
+    r.set_chinese(true);
+    let zh = r.render();
+    r.set_chinese(false);
+    let en = r.render();
+    assert!(zh.pixels != en.pixels, "中英两态必须画出不同的帧");
+    assert!(chip_pixels(&zh.pixels) > 0 && chip_pixels(&en.pixels) > 0);
+}
+
+#[test]
+fn chip_is_never_highlighted() {
+    let mut r = Renderer::new();
+    r.set_candidates(&cands(3));
+    r.set_highlight(0);
+    let hl0 = r.render();
+    // 越界高亮：候选全回 FG，模式字仍应是唯一的非灰/非琥珀色块
+    r.set_highlight(99);
+    let oob = r.render();
+    assert!(chip_pixels(&oob.pixels) > 0, "越界高亮不得抹掉模式字");
+    assert_eq!(
+        chip_pixels(&oob.pixels),
+        chip_pixels(&hl0.pixels),
+        "模式字像素数与高亮无关"
+    );
+    assert_ne!(
+        hl0.pixels, oob.pixels,
+        "高亮 0 与越界高亮必须画出不同的帧（候选 0 的 HL 生效）"
+    );
 }
