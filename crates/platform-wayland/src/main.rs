@@ -1306,6 +1306,19 @@ impl Dispatch<WlRegion, ()> for AppState {
     }
 }
 
+/// layer shell 本体：只用来 get_layer_surface，自身不发任何事件。
+impl Dispatch<ZwlrLayerShellV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _shell: &ZwlrLayerShellV1,
+        _event: <ZwlrLayerShellV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 /// layer surface 事件：configure 是「现在可以贴第一帧」的信号（ack 由 ModeBadge
 /// 内部完成，必须先于下一个 commit）；closed 是合成器收走表面，之后不再重建。
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {

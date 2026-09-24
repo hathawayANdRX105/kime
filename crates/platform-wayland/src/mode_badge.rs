@@ -258,6 +258,10 @@ impl ModeBadge {
                 Ok(b) => self.buffers[slot] = Some(b),
                 Err(e) => {
                     log(&format!("mode-badge buffer 分配失败: {e}"));
+                    // 分配失败不许把 dirty 吃掉：present 开头刚把它清成 false，
+                    // 这里直接 return 就等于把这一帧永久丢了——角标会静默停在旧模式，
+                    // 直到下一次模式翻转才"自愈"。置回 dirty 让 release/frame 再补。
+                    self.dirty = true;
                     return;
                 }
             }
@@ -266,6 +270,7 @@ impl ModeBadge {
         // 新建）；仍用 let-else 兜住，不拿运行期可失败的路径去 unwrap。
         let Some(b) = self.buffers[slot].as_ref() else {
             log("mode-badge: 槽位无 buffer，跳过本次 present");
+            self.dirty = true;
             return;
         };
         // 不变式：free[slot] 为真 ⇒ 合成器已归还此 buffer，不会再读这段内存
