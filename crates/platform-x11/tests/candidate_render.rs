@@ -140,8 +140,22 @@ fn candidate_bar_chip_follows_mode() {
     let zh = r.render();
     r.set_chinese(false);
     let en = r.render();
-    assert!(zh.pixels != en.pixels, "中英两态必须画出不同的帧");
     assert!(chip_pixels(&zh.pixels) > 0 && chip_pixels(&en.pixels) > 0);
+    // 帧比对按字形可区分性开关：CI 的 ubuntu-latest 没装 CJK 字体，「中」「英」
+    // 双双回退到同一个 .notdef 字形，两帧逐字节相同（wayland 侧 run 36062714042
+    // 实测）。先用另一个候选集探测这套字体到底能不能区分二者。
+    let mut probe = Renderer::new();
+    probe.set_candidates(&[cand("一")]);
+    probe.set_chinese(true);
+    let probe_zh = probe.render();
+    probe.set_chinese(false);
+    let probe_en = probe.render();
+    if probe_zh.pixels != probe_en.pixels {
+        assert!(
+            zh.pixels != en.pixels,
+            "字体能区分中/英时两态必须画出不同的帧"
+        );
+    }
 }
 
 #[test]
