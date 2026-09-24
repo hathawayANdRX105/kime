@@ -24,9 +24,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conn = Arc::new(conn);
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dict_path = format!("{}/.local/share/kime/dict.sqlite3", home);
-    let dict = Dict::open(&dict_path)?;
-    let config = Config::default();
+    // 配置与 wayland 前端同源：Config::load() 读 ~/.config/kime/config.toml
+    // （dict_path / shuangpin / punct_mode / fuzzy …）。此前这里写死
+    // Config::default()，XWayland 应用（微信/QQ/Electron 走 XIM）拿不到用户的
+    // 双拼方案与标点模式，行为与 wayland 前端分裂。
+    let mut config = Config::load();
+    if config.dict_path.is_empty() {
+        config.dict_path = format!("{}/.local/share/kime/dict.sqlite3", home);
+    }
+    let dict = Dict::open(&config.dict_path)?;
     let engine = Engine::new(dict, config);
 
     let mut im = X11IM::new(conn, screen_num, engine)?;
