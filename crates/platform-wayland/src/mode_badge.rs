@@ -81,6 +81,12 @@ fn warn_once(msg: &str) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadgeSlot(pub u8);
 
+/// wl_callback user data：把 frame 事件标记为「角标的」，否则分不清是候选条
+/// 还是角标那一块。候选条用 `()`，Rust 允许同一 Proxy 按 user data 类型并存
+/// 多个 `Dispatch` 实现，于是两边各自只收自己的回调。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadgeFrame;
+
 /// 一块 shm 画布：memfd 与其 mmap 必须同源（渲染写与合成器读必须落在同一段
 /// 内存）；Drop 时 munmap+close，WlBuffer 代理丢弃即 destroy。
 struct BadgeShmBuffer {
@@ -230,7 +236,7 @@ impl ModeBadge {
     where
         Data: Dispatch<WlShmPool, ()>
             + Dispatch<WlBuffer, BadgeSlot>
-            + Dispatch<WlCallback, ()>
+            + Dispatch<WlCallback, BadgeFrame>
             + 'static,
     {
         if !self.configured {
@@ -270,7 +276,7 @@ impl ModeBadge {
             .damage(0, 0, layout.width as i32, layout.height as i32);
         self.surface.commit();
         self.free[slot] = false;
-        self.frame = Some(self.surface.frame(qh, ()));
+        self.frame = Some(self.surface.frame(qh, BadgeFrame));
     }
 
     /// 合成器归还 buffer：对应槽位重新可用，欠的帧立刻补画。
@@ -278,7 +284,7 @@ impl ModeBadge {
     where
         Data: Dispatch<WlShmPool, ()>
             + Dispatch<WlBuffer, BadgeSlot>
-            + Dispatch<WlCallback, ()>
+            + Dispatch<WlCallback, BadgeFrame>
             + 'static,
     {
         log(&format!("mode-badge: buffer release slot={slot}"));
@@ -295,7 +301,7 @@ impl ModeBadge {
     where
         Data: Dispatch<WlShmPool, ()>
             + Dispatch<WlBuffer, BadgeSlot>
-            + Dispatch<WlCallback, ()>
+            + Dispatch<WlCallback, BadgeFrame>
             + 'static,
     {
         log("mode-badge: frame 回调到达");
@@ -329,10 +335,7 @@ impl ModeBadge {
         qh: &QueueHandle<Data>,
     ) -> Result<BadgeShmBuffer, &'static str>
     where
-        Data: Dispatch<WlShmPool, ()>
-            + Dispatch<WlBuffer, BadgeSlot>
-            + Dispatch<WlCallback, ()>
-            + 'static,
+        Data: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, BadgeSlot> + 'static,
     {
         let (w, h) = (layout.width, layout.height);
         if w == 0 || h == 0 || w > 8192 || h > 1024 {
