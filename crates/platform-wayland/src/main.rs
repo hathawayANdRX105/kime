@@ -678,7 +678,7 @@ impl AppState {
     /// 常驻模式角标：layer-shell 表面，全程只建一次。
     ///
     /// 缺 zwlr_layer_shell_v1 的合成器（GNOME/Wayland 原生、X11）直接跳过——角标是
-    /// 增强项，缺了不能拖累输入法本身。KIME_MODE_BADGE=0 同样跳过。
+    /// 增强项，缺了不能拖累输入法本身。仅显式设置 KIME_MODE_BADGE=1/true/on/yes 时构造。
     fn ensure_badge(&mut self, qh: &QueueHandle<Self>) {
         if self.badge.is_some() {
             return;

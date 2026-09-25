@@ -23,10 +23,18 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
 
 use crate::render::{Layout, Renderer};
 
-/// 徽标开关环境变量：未设置/空串=开；仅 `0`/`false`/`off`/`no`=关；其余按开处理。
+/// 徽标开关环境变量：仅 `1`/`true`/`on`/`yes` 显式开启，其余均关闭。
 pub const ENV: &str = "KIME_MODE_BADGE";
 
-/// 显式关闭的字面量（trim + 不分大小写）
+/// 显式开启的字面量（trim + 不分大小写）。
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+/// 显式关闭的字面量（trim + 不分大小写）。
 fn is_falsy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -34,39 +42,31 @@ fn is_falsy(value: &str) -> bool {
     )
 }
 
-/// 纯函数：None（未设置）= 开；否则非 falsy 即开。
+/// 纯函数：仅明确真值开启；未设置、空值、假值和未知值均保守关闭。
 pub fn badge_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        None => true,
-        Some(v) => !is_falsy(v),
-    }
+    value.is_some_and(is_truthy)
 }
 
-/// 读进程 env。无法识别的取值按「开」处理并 eprintln 告警一次。
+/// 纯函数：仅未知的非空值需要告警；默认值和已知真假值保持安静。
+pub fn badge_warning_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty() && !is_truthy(v) && !is_falsy(v))
+}
+
+/// 读进程 env。无法识别的非空取值保守关闭并 eprintln 告警一次。
 pub fn badge_enabled() -> bool {
     match env::var(ENV) {
         Ok(v) => {
-            if !v.trim().is_empty() && !is_recognized(&v) {
-                warn_once(&format!("{ENV} 取值「{v}」无法识别，模式徽标按开启处理"));
+            if badge_warning_from(Some(&v)) {
+                warn_once(&format!("{ENV} 取值「{v}」无法识别，模式徽标按关闭处理"));
             }
             badge_enabled_from(Some(&v))
         }
-        Err(env::VarError::NotPresent) => true,
+        Err(env::VarError::NotPresent) => false,
         Err(env::VarError::NotUnicode(_)) => {
-            warn_once(&format!("{ENV} 取值非 UTF-8，模式徽标按开启处理"));
-            true
+            warn_once(&format!("{ENV} 取值非 UTF-8，模式徽标按关闭处理"));
+            false
         }
     }
-}
-
-/// 显式开启的字面量；与 `is_falsy` 的关闭集合并起来即全部已知拼写。
-/// 只服务于告警判定：解析本身一律走 `badge_enabled_from`。
-fn is_recognized(value: &str) -> bool {
-    is_falsy(value)
-        || matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        )
 }
 
 fn warn_once(msg: &str) {
