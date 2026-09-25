@@ -103,6 +103,10 @@ struct BadgeShmBuffer {
 /// - `munmap` 只拆**本进程**的地址空间映射。合成器经 `wl_shm.create_pool` 拿到同一
 ///   memfd 后自己 mmap，两边映射的是同一批 page cache 页；只要它还在读，那份映射
 ///   本身就是引用，页就不会被回收。"正在扫描" 与 "最后一个引用已释放" 互斥。
+/// - 关键在 fd 的传递方式：wayland 走 `sendmsg` + `SCM_RIGHTS`，内核在**接收方** fd
+///   表里 dup 一份（见 `wayland-backend` 的 `rs/socket.rs`）。合成器持有的 memfd
+///   引用因此与本进程无关，本进程 `close(fd)` 不影响它那份——"客户端 unmap 了"
+///   与"最后一个引用没了"是两件事，前者推不出后者。
 /// - 协议禁止的是 destroy 之后**改写**这块存储（"the surface contents become
 ///   undefined"）。这里只拆自己的视图、关自己的 fd，之后再不碰 `ptr`/`fd`。
 /// - 真正的约束由 `free[slot]` 记账保证：没收到 release 就不写。而**不该**改成
@@ -121,7 +125,13 @@ impl Drop for BadgeShmBuffer {
 
 /// 常驻模式徽标：layer surface + 简单双缓冲。
 ///
-/// 表面只建一次、绝不销毁；常显与否由上层在启用时创建、停用时丢弃。
+/// 表面最多建一次（`ensure_badge` 幂等），合成器发 `closed` 之后不再重建。
+///
+/// **没有运行期"停用"这条路。** `KIME_MODE_BADGE` 只在构造**前**读一次，置 0 的
+/// 效果是"压根不构造"（见 main.rs 的 `ensure_badge`），env 不会在运行期重读。所以
+/// 本类型在进程内被丢弃的路径只有一条：合成器自己发 `closed`——那恰恰是它宣布
+/// "这块表面我收回了、不再读"的时刻。改动本类型时别把它当成"可随时开关的浮标"，
+/// 那会凭空造出一条带未归还 buffer 就销毁的路径。
 ///
 /// 不持有 `Renderer`：徽标与候选条共用 `AppState` 里的同一个，绘制时由调用方
 /// 传 `&mut Renderer` 进来（见 `present`）。徽标只在模式翻转时重画，而翻转发生
