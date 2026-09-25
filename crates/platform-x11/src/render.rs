@@ -220,7 +220,7 @@ impl Renderer {
             items.push((x, label.clone(), false));
             x += w + SEP;
         }
-        let width = (x - SEP + MARGIN_X).max(1);
+        let width = (x - SEP + MARGIN_X).clamp(1, 8192);
         let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
         let mut pixels = vec![0u8; width as usize * height as usize * 4];
         for px in pixels.chunks_mut(4) {

@@ -178,3 +178,37 @@ fn chip_is_never_highlighted() {
         "高亮 0 与越界高亮必须画出不同的帧（候选 0 的 HL 生效）"
     );
 }
+
+/// 超长候选不得把帧宽顶过 8192（钳位）更不得触到 u16 上限 65535（回绕打死连接）。
+/// 与 wayland 侧 `layout_width_never_exceeds_pool_guard` 同律：出口钳 8192，
+/// 远低于 put_image 的 u16 参数上限，`as u16` 永不回绕。
+#[test]
+fn frame_width_never_exceeds_u16_guard() {
+    // 单条数千汉字：远超 8192
+    let mut r = Renderer::new();
+    r.set_candidates(&[cand(&"啊".repeat(3000))]);
+    let f = r.render();
+    assert!(
+        (1..=8192).contains(&f.width),
+        "超长候选帧宽 {} 必须落在 1..=8192（钳位生效且不为 0）",
+        f.width
+    );
+    assert!(
+        f.width <= u16::MAX as u32,
+        "帧宽 {} 不得越 u16 上限",
+        f.width
+    );
+    // 缓冲长度与 width*height*4 自洽（XPutImage stride 契约）
+    assert_eq!(f.pixels.len(), f.pixel_len());
+    assert_eq!(f.pixels.len(), (f.width as usize) * (f.height as usize) * 4);
+
+    // 多条各数千字：累加后同样受钳
+    let many: Vec<Candidate> = (0..8)
+        .map(|i| cand(&format!("{}. {}", i + 1, "啊".repeat(1500))))
+        .collect();
+    let mut r = Renderer::new();
+    r.set_candidates(&many);
+    let f = r.render();
+    assert!(f.width <= 8192, "多候选累加后帧宽 {} 仍越界", f.width);
+    assert_eq!(f.pixels.len(), (f.width as usize) * (f.height as usize) * 4);
+}
