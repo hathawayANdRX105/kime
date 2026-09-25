@@ -7,11 +7,11 @@
 //! （上面刻意不写出测试属性的字面写法：门禁那条 awk 规则靠正则找属性起始行，
 //! 注释里出现同样字面量会被当成一个没有断言的空测试函数，报假警。）
 
-use platform_wayland::mode_badge::badge_enabled_from;
+use platform_wayland::mode_badge::{badge_enabled_from, badge_warning_from};
 
 #[test]
-fn unset_is_enabled() {
-    assert!(badge_enabled_from(None));
+fn unset_is_disabled() {
+    assert!(!badge_enabled_from(None));
 }
 
 #[test]
@@ -36,15 +36,15 @@ fn off_spellings_allow_surrounding_whitespace() {
 }
 
 #[test]
-fn empty_string_is_enabled() {
-    assert!(badge_enabled_from(Some("")));
-    assert!(badge_enabled_from(Some("   ")));
+fn empty_string_is_disabled() {
+    assert!(!badge_enabled_from(Some("")));
+    assert!(!badge_enabled_from(Some("   ")));
 }
 
 #[test]
-fn unrecognized_values_are_enabled() {
+fn unrecognized_values_are_disabled() {
     for v in ["maybe", "2", "-1", "yes please"] {
-        assert!(badge_enabled_from(Some(v)), "{v} 应开启");
+        assert!(!badge_enabled_from(Some(v)), "{v} 应保守关闭");
     }
 }
 
@@ -53,4 +53,18 @@ fn on_spellings_are_enabled() {
     for v in ["1", "true", "on", "yes", "YES", " On "] {
         assert!(badge_enabled_from(Some(v)), "{v} 应开启");
     }
+}
+
+#[test]
+fn only_unrecognized_non_empty_values_warn() {
+    for v in ["maybe", "2", "-1", "yes please"] {
+        assert!(badge_warning_from(Some(v)), "{v} 应告警");
+    }
+
+    for v in [
+        "", "   ", "0", "false", "off", "no", "1", "true", "on", "yes",
+    ] {
+        assert!(!badge_warning_from(Some(v)), "{v:?} 不应告警");
+    }
+    assert!(!badge_warning_from(None));
 }
