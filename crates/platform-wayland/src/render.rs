@@ -34,6 +34,14 @@ pub fn mode_chip(chinese: bool) -> &'static str {
     }
 }
 
+/// 模式 chip 闪现窗的终宽：左右留白 + 字形实测宽，钳在**终宽 ≤ 8192**。
+/// 钳位基准是 `create_buffer` 的守卫 `w > 8192`（守卫看的是终宽）：若钳字宽到 8192，
+/// 终宽 = MARGIN_X*2 + 8192 = 8212，越过守卫。故字形宽先钳到 `8192 - MARGIN_X * 2`。
+/// 正常单字 measure 仅 ~36px，钳位不触发；抽成纯函数只为钉住钳位基准（不依赖字体）。
+pub fn chip_window_width(glyph_w: u32) -> u32 {
+    MARGIN_X * 2 + glyph_w.min(8192 - MARGIN_X * 2)
+}
+
 /// 单个已摆放的项：x 为内容左沿，w 为实测宽；chip = 模式字（不编号、不可选）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacedItem {
@@ -186,13 +194,14 @@ impl Renderer {
     }
 
     /// 模式提示的一次性闪现小窗：只含 `中`/`英` 单字，下一次按键即清。
-    /// 高度与候选条同律（MARGIN_Y*2 + 行高），宽度 = 单字实测宽 + 左右留白。
+    /// 高度与候选条同律（MARGIN_Y*2 + 行高），宽度走 `chip_window_width`。
     pub fn chip_layout(&mut self, chinese: bool) -> Layout {
         let text = mode_chip(chinese).to_string();
         let height = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
-        let w = self.measure(&text).min(8192);
+        let measured = self.measure(&text);
+        let w = measured.min(8192 - MARGIN_X * 2);
         Layout {
-            width: MARGIN_X * 2 + w,
+            width: chip_window_width(measured),
             height,
             items: vec![PlacedItem {
                 x: MARGIN_X,
