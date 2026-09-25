@@ -23,6 +23,17 @@ const BG: [u8; 4] = [38, 30, 30, 255];
 const FG: Color = Color::rgba(220, 220, 230, 255);
 /// 高亮项：琥珀色，深底对比足够
 const HL: Color = Color::rgba(255, 220, 120, 255);
+/// 模式字：青绿系，与 FG/HL 及其抗锯齿混色都不撞
+const CHIP: Color = Color::rgba(122, 207, 214, 255);
+
+/// 模式标识字：候选条常驻头部，切换时立即跟随当前模式。
+pub fn mode_chip(chinese: bool) -> &'static str {
+    if chinese {
+        "中"
+    } else {
+        "英"
+    }
+}
 
 /// 冷路径探针：与 platform-wayland/src/render.rs 的 WARMUP_PROBE 同源同款
 /// （两处 render.rs 是复制粘贴关系，改一处须同步另一处）。构造期用**真实渲染
@@ -83,6 +94,7 @@ impl RenderedFrame {
 pub struct Renderer {
     candidates: Vec<Candidate>,
     highlight: usize,
+    chinese: bool,
     visible: bool,
     x: i32,
     y: i32,
@@ -103,6 +115,7 @@ impl Renderer {
         let mut this = Self {
             candidates: Vec::new(),
             highlight: 0,
+            chinese: true,
             visible: false,
             x: 0,
             y: 0,
@@ -158,6 +171,11 @@ impl Renderer {
         self.highlight = highlight;
     }
 
+    /// 设置当前中英模式（候选条头部模式字）。默认中文。
+    pub fn set_chinese(&mut self, chinese: bool) {
+        self.chinese = chinese;
+    }
+
     pub fn set_position(&mut self, x: i32, y: i32) {
         self.x = x;
         self.y = y;
@@ -182,7 +200,7 @@ impl Renderer {
             return RenderedFrame::hidden();
         }
 
-        // 横排单行摆放：每项 "N. 候选"，定宽分隔，总宽随内容自适应。
+        // 横排单行摆放：头部常驻模式字，其后每项 "N. 候选"，定宽分隔，总宽随内容自适应。
         // 先把标签全部生成出来（measure 要 &mut self，与遍历借用冲突）
         let labels: Vec<String> = self
             .candidates
@@ -190,11 +208,16 @@ impl Renderer {
             .enumerate()
             .map(|(i, c)| format!("{}. {}", i + 1, c.text))
             .collect();
-        let mut items = Vec::with_capacity(labels.len());
+        // 末位 bool = 是否模式字：模式字恒 CHIP 色，不编号也不吃高亮
+        let mut items: Vec<(u32, String, bool)> = Vec::with_capacity(labels.len() + 1);
         let mut x = MARGIN_X;
+        let chip = mode_chip(self.chinese).to_string();
+        let chip_w = self.measure(&chip);
+        items.push((x, chip, true));
+        x += chip_w + SEP;
         for label in &labels {
             let w = self.measure(label);
-            items.push((x, label.clone()));
+            items.push((x, label.clone(), false));
             x += w + SEP;
         }
         let width = (x - SEP + MARGIN_X).max(1);
@@ -205,8 +228,16 @@ impl Renderer {
         }
         let band_top = MARGIN_Y as i32;
         let band_h = LINE_HEIGHT.ceil() as i32;
-        for (i, (ox, label)) in items.iter().enumerate() {
-            let color = if i == self.highlight { HL } else { FG };
+        // 高亮下标只数候选：模式字不参与计数，用原始 enumerate 下标会整体错位一格
+        let mut cand_idx = 0usize;
+        for (item_x, label, is_chip) in &items {
+            let color = if *is_chip {
+                CHIP
+            } else {
+                let c = if cand_idx == self.highlight { HL } else { FG };
+                cand_idx += 1;
+                c
+            };
             let mut buffer =
                 Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
             buffer.set_size(None, None);
@@ -217,7 +248,7 @@ impl Renderer {
                 Some(run) => band_top + (band_h - run.line_height as i32) / 2 - run.line_top as i32,
                 None => band_top,
             };
-            let ox = *ox as i32;
+            let ox = *item_x as i32;
             buffer.draw(
                 &mut self.font_system,
                 &mut self.cache,
