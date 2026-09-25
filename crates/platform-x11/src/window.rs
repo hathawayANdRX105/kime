@@ -212,6 +212,17 @@ impl CandidateWindow {
         y: i32,
         frame: &RenderedFrame,
     ) -> Result<(), ConnectionError> {
+        // 尺寸守卫：put_image 的宽高参数是 u16，超限会把 65536 回绕成 0、
+        // 打出协议错误打死整条 X 连接（issue #48）。render() 出口已钳 8192，
+        // 这里是防"绕过 render() 直接喂帧"的最后一道（show_at 是 pub）。
+        // 越界帧跳过上传并告警，XIM 进程继续活着。
+        if frame.width > u16::MAX as u32 || frame.height > u16::MAX as u32 {
+            eprintln!(
+                "[platform-x11] 候选帧 {}x{} 超出 u16，跳过上传（width 应已钳 8192，这里越界说明上游钳位失效）",
+                frame.width, frame.height
+            );
+            return Ok(());
+        }
         let (px, py) = place_window((x, y), (frame.width, frame.height), self.screen_size);
         let next = Geometry {
             x: px,
