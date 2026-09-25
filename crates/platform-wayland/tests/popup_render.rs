@@ -5,7 +5,7 @@
 //! 契约：候选条的第一项永远是模式字（`中`/`英`）——它不可选、永不高亮，
 //! 高亮下标只数候选；空候选 = 1×1 隐藏帧（模式字也不出现）。
 
-use platform_wayland::render::mode_chip;
+use platform_wayland::render::{chip_window_width, mode_chip};
 use platform_wayland::render::{LINE_HEIGHT, MARGIN_X, MARGIN_Y, SEP};
 use platform_wayland::{Layout, Renderer};
 
@@ -183,4 +183,20 @@ fn layout_width_never_exceeds_pool_guard() {
     // chip 小窗同律
     let c = r.chip_layout(true);
     assert!(c.width <= 8192, "chip 宽度 {} 越界", c.width);
+}
+
+/// 钉死 chip 钳位基准：终宽必须 ≤ 8192（create_buffer 守卫上限），且钳的是终宽而非字宽。
+/// 纯函数、不依赖字体——把钳位挪回「字宽基准 8192」会让 `chip_window_width(8192) == 8212`
+/// 直接让本测试变红，不需要真机或 8192px 宽的字形。
+#[test]
+fn chip_window_width_clamps_final_width_not_glyph_width() {
+    // 正常单字宽：终宽 = 留白 + 字宽，钳位不触发
+    assert_eq!(chip_window_width(36), MARGIN_X * 2 + 36);
+    // 字宽恰在钳位边：终宽 = 留白 + (8192 - 留白) = 8192
+    assert_eq!(chip_window_width(8192 - MARGIN_X * 2), 8192);
+    // 越界字宽：终宽钳死 8192，绝不出 8212
+    assert_eq!(chip_window_width(8192), 8192);
+    assert_eq!(chip_window_width(u32::MAX), 8192);
+    // 与 layout() 出口基准对齐：两者都以 8192 为终宽上限
+    assert!(chip_window_width(u32::MAX) <= 8192);
 }

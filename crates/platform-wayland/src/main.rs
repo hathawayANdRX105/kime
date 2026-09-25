@@ -345,6 +345,9 @@ impl PopupCanvas {
                 Ok(b) => self.buffers[slot] = Some(b),
                 Err(e) => {
                     log(&format!("popup buffer 分配失败: {e}"));
+                    // 本帧没上屏：把 dirty 置回，等下次 frame 回调重新 present，
+                    // 否则候选条静默停在旧内容（与无空闲槽位那条早退行为对齐）
+                    self.dirty = true;
                     return;
                 }
             }
