@@ -36,7 +36,7 @@
 # === COMMIT (CM) ===
 #   CM-01: FAIL — commit 标题非 conventional commit
 #   CM-02: FAIL — commit 标题含 CJK
-#   CM-03: WARN — commit 与 PR 不一致
+#   CM-03: FAIL — commit 与 PR 不一致
 #
 # === REVIEW (RV) ===
 #   RV-01: FAIL — review 评论含 checkbox
@@ -60,12 +60,4 @@
 # severity_overrides:
 #   PR-05: "INFO"
 
-severity_overrides:
-  # 历史提交 8f7ed46 "fix: Shift 中英切换+..." 含 CJK 且已在 origin/main 上不可改写,
-  # 自此 gate 对自带 CJK 的历史标题产生误伤。降级 WARN 让新提交可以过关。
-  CM-02: "WARN"
-  # 历史提交 2bb1855 "diag(wayland): popup buffer 槽位与候选内容可观测日志" 的类型 diag
-  # 不在 CM-01 白名单, 且已在 origin/main 上不可改写; CM-01 扫描历史窗口, 在 main 上
-  # 死锁所有新提交（窗口滑不出去, 因为提交进不去）。同 CM-02 先例降级 WARN。
-  # 根治 = gate 源码仓: CM-01 只查新标题, 或白名单补 diag。
-  CM-01: "WARN"
+severity_overrides: {}
