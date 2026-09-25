@@ -679,6 +679,13 @@ impl AppState {
         };
         self.badge = Some(ModeBadge::new(&shell, &comp, &shm, qh));
         log("常驻模式角标已建（等待合成器 configure）");
+        // 建面即刻对齐一次真实模式。`ModeBadge::new` 的初值是 `chinese: true`，
+        // 而引擎也是 `true` 起步，正常启动下两者天然一致、这里等价于空操作。
+        // 但 global 到达顺序不利时（本函数幂等 + 缺项早退，谁最后到谁触发），角标
+        // 可能在用户已经切到英文之后才建出来——那就会先画一个错的「中」，要等下一个
+        // 键才被 `sync_mode_badge` 自愈。此刻还没 configure，`sync_mode_badge` 走的是
+        // "只记账不 attach"那条分支，正好把真实模式存进 `ModeBadge`，首帧即正确。
+        self.sync_mode_badge(qh);
     }
 
     /// 模式指示的单一入口：把 `engine.chinese()` 同时喂给托盘桩与常驻角标。
