@@ -169,6 +169,7 @@ impl ModeBadge {
         comp: &WlCompositor,
         shm: &WlShm,
         qh: &QueueHandle<Data>,
+        size: (u32, u32),
     ) -> Self
     where
         Data: Dispatch<WlSurface, ()>
@@ -189,6 +190,13 @@ impl ModeBadge {
         layer_surface.set_margin(8, 8, 8, 8);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer_surface.set_exclusive_zone(-1);
+        // 尺寸必须显式给定，不能留 0 让合成器指派：协议规定「某维尺寸为 0 时，
+        // 该维必须锚定对边」，而角标只在 Top|Right 单侧锚定——水平维宽度 0 时
+        // 无法满足 Left+Right，wlroots 报 "width 0 requested without setting
+        // left and right anchors" 协议错误、直接杀掉连接（真机日志 396 行、
+        // 进程 crash-loop 的根因）。显式 set_size 后两维均非 0，校验通过；
+        // configure 会回报同尺寸。尺寸取 chip 自然尺寸（调用方探测两模式取宽者）。
+        layer_surface.set_size(size.0, size.1);
         // 协议原文：layer surface 默认照收 pointer/touch/tablet，要点击穿透
         // 必须显式把 input region 置空；与 keyboard_interactivity=None 各管
         // 一半输入通道，少任何一个徽标都会吃掉点击。
@@ -266,6 +274,16 @@ impl ModeBadge {
         }
         self.dirty = false;
         let layout = renderer.chip_layout(self.chinese);
+        // 帧尺寸用合成器在 configure 里指派的 w/h（set_size 后恒非 0）：
+        // buffer 必须恰好铺满 layer surface 的指派尺寸，用 chip 自然尺寸做帧
+        // 宽会在尺寸不一致时被合成器当"小于表面"处理，出现半空黑边。
+        // chip 项仍画在 MARGIN_X 左沿，右侧留白为同色背景，视觉等价。
+        let layout = {
+            let mut l = layout;
+            l.width = self.width.max(1);
+            l.height = self.height.max(1);
+            l
+        };
         let Some(slot) = self.pick_slot(&layout) else {
             log("mode-badge: 两槽位都被合成器占用，present 挂起（等 release/frame）");
             self.dirty = true;

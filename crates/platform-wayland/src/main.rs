@@ -85,13 +85,20 @@ where
 /// 自截断：追加写发现文件已超 1MiB 就 set_len(0) 归零（保留文件本身）。
 /// seek(0) 在 O_APPEND 下无效——内核强制每次写落到当前文件尾，只有归零
 /// 才能让后续行从头写起。无人清理的 tmpfs 日志否则会一直涨到撑满为止。
+///
+/// 路径可用 `KIME_LOG_FILE` 环境变量覆盖（默认 /tmp/kime-ime.log）：调试实例
+/// 与常驻实例并存时各写各的文件，互不截断（两个实例写同一文件会反复 set_len(0)）。
+fn log_file() -> String {
+    std::env::var("KIME_LOG_FILE").unwrap_or_else(|_| "/tmp/kime-ime.log".to_string())
+}
+
 fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/kime-ime.log")
+        .open(log_file())
     {
         if f.metadata()
             .map(|m| m.len() > MAX_LOG_BYTES)
@@ -452,6 +459,10 @@ struct AppState {
     target_seat: Option<String>,
     engine: Option<Engine>,
     should_exit: bool,
+    /// 调试实例模式（KIME_DEBUG_BADGES_ONLY=1）：只测常驻角标/候选条。
+    /// seat 被常驻 kime-ime 占着时，第二个 IM 实例收到 UNAVAILABLE 就退出——
+    /// 调试实例要留在进程里让角标可见，故此时忽略该事件（无 IM 功能，仅渲染）。
+    badges_only: bool,
     im_serial: u32,
     tray: TrayIconManager,
     llm_worker: Option<LlmWorker>,
@@ -500,6 +511,8 @@ struct AppState {
 
 impl AppState {
     fn new(target_seat: Option<String>, renderer: Renderer) -> Self {
+        // 调试实例模式：KIME_DEBUG_BADGES_ONLY=1 时 seat 被占也不退出（见字段注释）
+        let badges_only = std::env::var_os("KIME_DEBUG_BADGES_ONLY").is_some();
         Self {
             conn: None,
             input_method_manager: None,
@@ -512,6 +525,7 @@ impl AppState {
             target_seat,
             engine: None,
             should_exit: false,
+            badges_only,
             im_serial: 0,
             tray: TrayIconManager::new(true),
             llm_worker: None,
@@ -680,8 +694,16 @@ impl AppState {
         ) else {
             return;
         };
-        self.badge = Some(ModeBadge::new(&shell, &comp, &shm, qh));
-        log("常驻模式角标已建（等待合成器 configure）");
+        // 显式给角标定尺寸（两模式 chip 取宽者，高度同律）：不给尺寸时 wlroots
+        // 对"宽度 0 + 单侧锚点"报协议错误杀掉连接（真机 crash-loop 根因）。
+        let zh = self.renderer.chip_layout(true);
+        let en = self.renderer.chip_layout(false);
+        let size = (zh.width.max(en.width), zh.height.max(en.height));
+        self.badge = Some(ModeBadge::new(&shell, &comp, &shm, qh, size));
+        log(&format!(
+            "常驻模式角标已建 {}x{}（等待合成器 configure）",
+            size.0, size.1
+        ));
         // 建面即刻对齐一次真实模式。`ModeBadge::new` 的初值是 `chinese: true`，
         // 而引擎也是 `true` 起步，正常启动下两者天然一致、这里等价于空操作。
         // 但 global 到达顺序不利时（本函数幂等 + 缺项早退，谁最后到谁触发），角标
@@ -1179,7 +1201,13 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             }
             ZwpInputMethodEvent::Unavailable => {
                 log("input_method UNAVAILABLE — another IM owns the seat");
-                state.should_exit = true;
+                if state.badges_only {
+                    // 调试实例（KIME_DEBUG_BADGES_ONLY=1）：常驻 IM 占着 seat，
+                    // 本实例只做角标/候选条渲染验证，IM 功能归常驻实例，不退出。
+                    log("调试实例模式：忽略 UNAVAILABLE，只验证角标/候选条渲染");
+                } else {
+                    state.should_exit = true;
+                }
             }
             _ => {}
         }
