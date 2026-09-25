@@ -15,6 +15,7 @@ use kime_core::{Engine, Outcome};
 use platform_wayland::clipboard_watch::spawn as spawn_clipboard_watcher;
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
+use platform_wayland::mode_badge::{badge_enabled, BadgeFrame, BadgeSlot, ModeBadge};
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
 use platform_wayland::route::{
     clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
@@ -30,6 +31,7 @@ use wayland_client::{
         wl_callback::WlCallback,
         wl_compositor::WlCompositor,
         wl_keyboard::KeyState,
+        wl_region::WlRegion,
         wl_registry::{Event as RegistryEvent, WlRegistry},
         wl_seat::{self, WlSeat},
         wl_shm::WlShm,
@@ -49,6 +51,10 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1;
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
+    Event as ZwlrLayerSurfaceEvent, ZwlrLayerSurfaceV1,
 };
 
 fn log(msg: &str) {
@@ -79,13 +85,20 @@ where
 /// 自截断：追加写发现文件已超 1MiB 就 set_len(0) 归零（保留文件本身）。
 /// seek(0) 在 O_APPEND 下无效——内核强制每次写落到当前文件尾，只有归零
 /// 才能让后续行从头写起。无人清理的 tmpfs 日志否则会一直涨到撑满为止。
+///
+/// 路径可用 `KIME_LOG_FILE` 环境变量覆盖（默认 /tmp/kime-ime.log）：调试实例
+/// 与常驻实例并存时各写各的文件，互不截断（两个实例写同一文件会反复 set_len(0)）。
+fn log_file() -> String {
+    std::env::var("KIME_LOG_FILE").unwrap_or_else(|_| "/tmp/kime-ime.log".to_string())
+}
+
 fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/kime-ime.log")
+        .open(log_file())
     {
         if f.metadata()
             .map(|m| m.len() > MAX_LOG_BYTES)
@@ -185,7 +198,12 @@ impl Drop for ShmBuffer {
     }
 }
 
-/// wl_buffer user data：release 回来后该槽位重新可用。
+/// wl_buffer user data：候选条归还 buffer 后据此找回槽位。
+///
+/// 角标的 buffer 走的是 `mode_badge::BadgeSlot` 与另一份 `Dispatch<WlBuffer,
+/// BadgeSlot>` 实现——归属由**类型**分派决定，不是靠枚举变体。两者记错的后果
+/// 一样致命（复用合成器仍持有的 buffer → `wl_shm.create_pool invalid arguments`
+/// 打死整条连接），而类型分派比"变体对不对"更难写错。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BufferSlot(u8);
 
@@ -198,7 +216,6 @@ struct PopupCanvas {
     surface: WlSurface,
     _role: ZwpInputPopupSurfaceV2,
     shm: WlShm,
-    renderer: Renderer,
     buffers: [Option<ShmBuffer>; 2],
     free: [bool; 2],
     frame: Option<WlCallback>,
@@ -215,13 +232,14 @@ struct PopupCanvas {
 }
 
 impl PopupCanvas {
-    // renderer 是 main 启动期预热好的渲染器（字形冷路径已 warmup），move 进来：
-    // 首次 ACTIVATE 不再付 ~110ms 的字体解析/fallback 成本
+    // renderer 由 AppState 持有并以 &mut 传进来：候选条与常驻角标共用同一个已
+    // 预热的渲染器（AppState::renderer），单 FontSystem、单次 warmup。两个表面
+    // 不会同时借用——单线程事件循环，谁先画谁借。
     fn new(
         im: &ZwpInputMethodV2,
         comp: &WlCompositor,
         shm: &WlShm,
-        renderer: Renderer,
+        renderer: &mut Renderer,
         qh: &QueueHandle<AppState>,
     ) -> Self {
         let surface = comp.create_surface(qh, ());
@@ -231,7 +249,6 @@ impl PopupCanvas {
             surface,
             _role,
             shm: shm.clone(),
-            renderer,
             buffers: [None, None],
             free: [true, true],
             frame: None,
@@ -241,7 +258,7 @@ impl PopupCanvas {
             chinese: true,
             chip: None,
         };
-        canvas.present(qh);
+        canvas.present(renderer, qh);
         canvas
     }
 
@@ -250,6 +267,7 @@ impl PopupCanvas {
         candidates: Vec<String>,
         highlight: usize,
         chinese: bool,
+        renderer: &mut Renderer,
         qh: &QueueHandle<AppState>,
     ) {
         if self.content == candidates && self.highlight == highlight && self.chinese == chinese {
@@ -258,19 +276,19 @@ impl PopupCanvas {
         self.content = candidates;
         self.highlight = highlight;
         self.chinese = chinese;
-        self.present(qh);
+        self.present(renderer, qh);
     }
 
     /// 中英切换瞬间：闪现一次只含 中/英 的小窗（工单第 1 条）。
-    fn flash_chip(&mut self, chinese: bool, qh: &QueueHandle<AppState>) {
+    fn flash_chip(&mut self, chinese: bool, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         self.chip = Some(chinese);
-        self.present(qh);
+        self.present(renderer, qh);
     }
 
     /// 下一次按键收掉闪现；没闪现时零成本。
-    fn clear_chip(&mut self, qh: &QueueHandle<AppState>) {
+    fn clear_chip(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         if self.chip.take().is_some() {
-            self.present(qh);
+            self.present(renderer, qh);
         }
     }
 
@@ -280,13 +298,13 @@ impl PopupCanvas {
     /// 不再到达，free[] 卡在 false 且与实际所有权脱节，下一次 present 复用旧
     /// pool → wl_shm.create_pool invalid arguments 致协议错误崩溃。deactivate
     /// 是唯一能确定「合成器不再持有我的 buffer」的时刻，重置槽位记账。
-    fn hide(&mut self, qh: &QueueHandle<AppState>) {
+    fn hide(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         let visible = self.chip.is_some() || !self.content.is_empty() || self.highlight != 0;
         self.chip = None;
         self.content.clear();
         self.highlight = 0;
         if visible {
-            self.present(qh);
+            self.present(renderer, qh);
         }
         // 重置在 present 之后：隐藏帧要先画完，再让槽位回到「全部可用」。
         // buffer 对象保留（尺寸命中时复用），只重置归属记账。
@@ -295,30 +313,30 @@ impl PopupCanvas {
         self.dirty = false;
     }
 
-    fn on_release(&mut self, slot: usize, qh: &QueueHandle<AppState>) {
+    fn on_release(&mut self, slot: usize, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         log(&format!("popup: buffer release slot={slot}"));
         if slot < 2 {
             self.free[slot] = true;
         }
         if self.dirty {
-            self.present(qh);
+            self.present(renderer, qh);
         }
     }
 
-    fn on_frame(&mut self, qh: &QueueHandle<AppState>) {
+    fn on_frame(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         log("popup: frame 回调到达");
         self.frame = None;
         if self.dirty {
-            self.present(qh);
+            self.present(renderer, qh);
         }
     }
 
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
-    fn present(&mut self, qh: &QueueHandle<AppState>) {
+    fn present(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         self.dirty = false;
         let layout = match self.chip {
-            Some(chinese) => self.renderer.chip_layout(chinese),
-            None => self.renderer.layout(&self.content, self.chinese),
+            Some(chinese) => renderer.chip_layout(chinese),
+            None => renderer.layout(&self.content, self.chinese),
         };
         let Some(slot) = self.pick_slot(&layout) else {
             log("popup: 两槽位都被合成器占用，present 挂起（等 release/frame）");
@@ -330,7 +348,7 @@ impl PopupCanvas {
         });
         if !reuse {
             // 槽位里的旧 buffer 必已 release（free 才会走到这），换掉安全
-            match Self::create_buffer(&self.shm, &layout, slot, qh) {
+            match Self::create_buffer(&self.shm, &layout, BufferSlot(slot as u8), qh) {
                 Ok(b) => self.buffers[slot] = Some(b),
                 Err(e) => {
                     log(&format!("popup buffer 分配失败: {e}"));
@@ -344,7 +362,7 @@ impl PopupCanvas {
         {
             let b = self.buffers[slot].as_ref().unwrap();
             let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.len) };
-            self.renderer.paint(&layout, self.highlight, pixels);
+            renderer.paint(&layout, self.highlight, pixels);
         }
         let b = self.buffers[slot].as_ref().unwrap();
         self.surface.attach(Some(&b.buffer), 0, 0);
@@ -375,7 +393,7 @@ impl PopupCanvas {
     fn create_buffer(
         shm: &WlShm,
         layout: &Layout,
-        slot: usize,
+        slot: BufferSlot,
         qh: &QueueHandle<AppState>,
     ) -> Result<ShmBuffer, &'static str> {
         let (w, h) = (layout.width, layout.height);
@@ -415,7 +433,7 @@ impl PopupCanvas {
             (w * 4) as i32,
             wayland_client::protocol::wl_shm::Format::Argb8888,
             qh,
-            BufferSlot(slot as u8),
+            slot,
         );
         pool.destroy();
         Ok(ShmBuffer {
@@ -441,6 +459,10 @@ struct AppState {
     target_seat: Option<String>,
     engine: Option<Engine>,
     should_exit: bool,
+    /// 调试实例模式（KIME_DEBUG_BADGES_ONLY=1）：只测常驻角标/候选条。
+    /// seat 被常驻 kime-ime 占着时，第二个 IM 实例收到 UNAVAILABLE 就退出——
+    /// 调试实例要留在进程里让角标可见，故此时忽略该事件（无 IM 功能，仅渲染）。
+    badges_only: bool,
     im_serial: u32,
     tray: TrayIconManager,
     llm_worker: Option<LlmWorker>,
@@ -452,9 +474,15 @@ struct AppState {
     shm: Option<WlShm>,
     /// 候选窗：候选条 + 一次性模式闪现；text_input_rectangle 只留日志
     popup: Option<PopupCanvas>,
-    /// 预热好的渲染器：main() 在 wayland 连接之前构造（Renderer::new 内含
-    /// 字形冷路径 warmup），ensure_popup 时 take 出来 move 进 PopupCanvas。
-    renderer: Option<Renderer>,
+    /// 预热好的渲染器：main() 在 wayland 连接之前构造（Renderer::new 内含字形冷
+    /// 路径 warmup）。候选条与常驻角标**共用这一个**——角标只在模式翻转时重画，
+    /// 而翻转就在按键路径上，另建一个渲染器等于把 ~110ms 的字体 fallback 扫描
+    /// 重新砸回第一次 Shift。
+    renderer: Renderer,
+    /// zwlr_layer_shell_v1：合成器不支持时为 None，角标整条跳过（其余功能不受影响）
+    layer_shell: Option<ZwlrLayerShellV1>,
+    /// 常驻模式角标：layer-shell 表面，全程只建一次
+    badge: Option<ModeBadge>,
     /// xkb 解码：keymap/modifiers 事件喂状态，Key 事件取字符（取代旧手写码表）
     keyboard: Keyboard,
     /// 组合内长按自动重复：合成器不向 IM grab 投递 repeat（libinput 吞 value=2；
@@ -483,6 +511,8 @@ struct AppState {
 
 impl AppState {
     fn new(target_seat: Option<String>, renderer: Renderer) -> Self {
+        // 调试实例模式：KIME_DEBUG_BADGES_ONLY=1 时 seat 被占也不退出（见字段注释）
+        let badges_only = std::env::var_os("KIME_DEBUG_BADGES_ONLY").is_some();
         Self {
             conn: None,
             input_method_manager: None,
@@ -495,6 +525,7 @@ impl AppState {
             target_seat,
             engine: None,
             should_exit: false,
+            badges_only,
             im_serial: 0,
             tray: TrayIconManager::new(true),
             llm_worker: None,
@@ -503,7 +534,9 @@ impl AppState {
             compositor: None,
             shm: None,
             popup: None,
-            renderer: Some(renderer),
+            renderer,
+            layer_shell: None,
+            badge: None,
             keyboard: Keyboard::new(),
             repeat: KeyRepeat::default(),
             pending_surrounding: None,
@@ -635,12 +668,69 @@ impl AppState {
             log("wl_compositor/wl_shm 未绑定，候选窗不可用");
             return;
         };
-        // take 而非再 new：预热过的缓存只建一次就 move 走。popup surface/role
-        // 全程只建一次（见 PopupCanvas 文档），这条路径进程内最多走一遍；
-        // 万一将来允许重建，take 到 None 时兜底重新构造（重付一次预热，仅理论路径）。
-        let renderer = self.renderer.take().unwrap_or_else(Renderer::new);
-        self.popup = Some(PopupCanvas::new(im, &comp, &shm, renderer, qh));
+        // 渲染器留在 AppState 上不 take：候选条与角标共用它，构造 canvas 时借一下
+        // 即可（见 PopupCanvas::new）。popup surface/role 全程只建一次。
+        let canvas = PopupCanvas::new(im, &comp, &shm, &mut self.renderer, qh);
+        self.popup = Some(canvas);
         log("input popup 候选窗已建（已提交 1×1 透明首帧）");
+    }
+
+    /// 常驻模式角标：layer-shell 表面，全程只建一次。
+    ///
+    /// 缺 zwlr_layer_shell_v1 的合成器（GNOME/Wayland 原生、X11）直接跳过——角标是
+    /// 增强项，缺了不能拖累输入法本身。KIME_MODE_BADGE=0 同样跳过。
+    fn ensure_badge(&mut self, qh: &QueueHandle<Self>) {
+        if self.badge.is_some() {
+            return;
+        }
+        if !badge_enabled() {
+            log("KIME_MODE_BADGE 已关闭，不建常驻角标");
+            return;
+        }
+        let (Some(shell), Some(comp), Some(shm)) = (
+            self.layer_shell.clone(),
+            self.compositor.clone(),
+            self.shm.clone(),
+        ) else {
+            return;
+        };
+        // 显式给角标定尺寸（两模式 chip 取宽者，高度同律）：不给尺寸时 wlroots
+        // 对"宽度 0 + 单侧锚点"报协议错误杀掉连接（真机 crash-loop 根因）。
+        let zh = self.renderer.chip_layout(true);
+        let en = self.renderer.chip_layout(false);
+        let size = (zh.width.max(en.width), zh.height.max(en.height));
+        self.badge = Some(ModeBadge::new(&shell, &comp, &shm, qh, size));
+        log(&format!(
+            "常驻模式角标已建 {}x{}（等待合成器 configure）",
+            size.0, size.1
+        ));
+        // 建面即刻对齐一次真实模式。`ModeBadge::new` 的初值是 `chinese: true`，
+        // 而引擎也是 `true` 起步，正常启动下两者天然一致、这里等价于空操作。
+        // 但 global 到达顺序不利时（本函数幂等 + 缺项早退，谁最后到谁触发），角标
+        // 可能在用户已经切到英文之后才建出来——那就会先画一个错的「中」，要等下一个
+        // 键才被 `sync_mode_badge` 自愈。此刻还没 configure，`sync_mode_badge` 走的是
+        // "只记账不 attach"那条分支，正好把真实模式存进 `ModeBadge`，首帧即正确。
+        self.sync_mode_badge(qh);
+    }
+
+    /// 模式指示的单一入口：把 `engine.chinese()` 同时喂给托盘桩与常驻角标。
+    ///
+    /// 角标只在模式真的翻转时才重画——它常驻显示，每帧重画纯属浪费，且重画要走
+    /// 按键路径。`set_chinese` 返回是否真变了，没变就不碰 buffer。
+    fn sync_mode_badge(&mut self, qh: &QueueHandle<Self>) {
+        let chinese = self.engine.as_ref().is_none_or(|e| e.chinese());
+        self.tray.set_chinese(chinese);
+        let Some(badge) = self.badge.as_mut() else {
+            return;
+        };
+        // 角标尚未收到 configure：协议禁止此时 attach buffer，present 自身会挡。
+        if !badge.is_configured() {
+            badge.set_chinese(chinese);
+            return;
+        }
+        if badge.set_chinese(chinese) {
+            badge.present(&mut self.renderer, qh);
+        }
     }
 
     /// 候选条渲染的单一入口：剪贴板模式画剪贴板候选（历史+预设），否则画引擎页。
@@ -676,7 +766,7 @@ impl AppState {
         // 无条件读一次即可（空引擎退回中文默认）。
         let chinese = self.engine.as_ref().map_or(true, |e| e.chinese());
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.set_content(page, hl, chinese, qh);
+            canvas.set_content(page, hl, chinese, &mut self.renderer, qh);
         }
     }
 
@@ -684,7 +774,7 @@ impl AppState {
     /// 只在 deactivate 用；键流上的清空走 popup_show。
     fn popup_hide(&mut self, qh: &QueueHandle<AppState>) {
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.hide(qh);
+            canvas.hide(&mut self.renderer, qh);
         }
     }
     /// 切走应用时作废在途组合：引擎组合 + 发往旧应用的 preedit 一起清。
@@ -705,7 +795,6 @@ impl AppState {
             let Some(engine) = self.engine.as_ref() else {
                 return;
             };
-            self.tray.set_chinese(engine.chinese());
             let pe = engine.preedit().to_string();
             log(&format!("consumed preedit={pe}"));
             if let Some(im) = &self.input_method {
@@ -720,6 +809,8 @@ impl AppState {
                 context,
             )
         };
+        // 引擎的不可变借用到此结束，才能借 &mut self 去同步模式指示
+        self.sync_mode_badge(qh);
         self.popup_show(qh);
         if let Some(worker) = &self.llm_worker {
             worker.request(syllables, context);
@@ -857,11 +948,14 @@ impl AppState {
             }
         }
         // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
-        // 闪一次对应模式字，下一次按键收掉。
+        // 闪一次对应模式字，下一次按键收掉；常驻角标同时翻面。
+        // sync_mode_badge 幂等（set_chinese 没变就不碰 buffer），放这里是为了覆盖
+        // 任何一条没走 apply_consumed 的路由。
         let mode_now = self.engine.as_ref().map_or(mode_before, |e| e.chinese());
+        self.sync_mode_badge(qh);
         if mode_now != mode_before {
             if let Some(canvas) = self.popup.as_mut() {
-                canvas.flash_chip(mode_now, qh);
+                canvas.flash_chip(mode_now, &mut self.renderer, qh);
             }
         }
         self.try_recv_llm(qh);
@@ -920,10 +1014,22 @@ impl Dispatch<WlRegistry, GlobalListContents> for AppState {
                     state.compositor =
                         Some(registry.bind::<WlCompositor, (), AppState>(name, 1, qh, ()));
                     log(&format!("bound wl_compositor name={name}"));
+                    state.ensure_badge(qh);
                 }
                 "wl_shm" if version >= 1 => {
                     state.shm = Some(registry.bind::<WlShm, (), AppState>(name, 1, qh, ()));
                     log(&format!("bound wl_shm name={name}"));
+                    // 角标要三样齐备，global 到达顺序不定：谁最后到谁触发一次
+                    // 幂等的建面尝试（ensure_badge 缺项早退）
+                    state.ensure_badge(qh);
+                }
+                // 合成器不支持就没有这一条：角标整条跳过，输入法其余功能不受影响
+                "zwlr_layer_shell_v1" if version >= 1 => {
+                    let ver = version.min(1);
+                    state.layer_shell =
+                        Some(registry.bind::<ZwlrLayerShellV1, (), AppState>(name, ver, qh, ()));
+                    log(&format!("bound zwlr_layer_shell_v1 name={name} v{ver}"));
+                    state.ensure_badge(qh);
                 }
                 "wl_seat" if version >= 1 => {
                     let ver = version.min(7);
@@ -1095,7 +1201,13 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             }
             ZwpInputMethodEvent::Unavailable => {
                 log("input_method UNAVAILABLE — another IM owns the seat");
-                state.should_exit = true;
+                if state.badges_only {
+                    // 调试实例（KIME_DEBUG_BADGES_ONLY=1）：常驻 IM 占着 seat，
+                    // 本实例只做角标/候选条渲染验证，IM 功能归常驻实例，不退出。
+                    log("调试实例模式：忽略 UNAVAILABLE，只验证角标/候选条渲染");
+                } else {
+                    state.should_exit = true;
+                }
             }
             _ => {}
         }
@@ -1148,7 +1260,7 @@ impl Dispatch<WlShmPool, ()> for AppState {
     }
 }
 
-/// 合成器归还 buffer：对应槽位重新可用，欠的帧立刻补画。
+/// 合成器归还候选条的 buffer：对应槽位重新可用，欠的帧立刻补画。
 impl Dispatch<WlBuffer, BufferSlot> for AppState {
     fn event(
         state: &mut Self,
@@ -1160,13 +1272,31 @@ impl Dispatch<WlBuffer, BufferSlot> for AppState {
     ) {
         if matches!(event, <WlBuffer as Proxy>::Event::Release) {
             if let Some(canvas) = state.popup.as_mut() {
-                canvas.on_release(slot.0 as usize, qh);
+                canvas.on_release(slot.0 as usize, &mut state.renderer, qh);
             }
         }
     }
 }
 
-/// frame 回调：上一帧已被合成器显示，可以安全画下一帧。
+/// 合成器归还角标的 buffer：与上面按 user data 类型分流，两个表面互不串台。
+impl Dispatch<WlBuffer, BadgeSlot> for AppState {
+    fn event(
+        state: &mut Self,
+        _buffer: &WlBuffer,
+        event: <WlBuffer as Proxy>::Event,
+        slot: &BadgeSlot,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, <WlBuffer as Proxy>::Event::Release) {
+            if let Some(badge) = state.badge.as_mut() {
+                badge.on_release(slot.0 as usize, &mut state.renderer, qh);
+            }
+        }
+    }
+}
+
+/// frame 回调（候选条）：上一帧已被合成器显示，可以安全画下一帧。
 impl Dispatch<WlCallback, ()> for AppState {
     fn event(
         state: &mut Self,
@@ -1177,7 +1307,85 @@ impl Dispatch<WlCallback, ()> for AppState {
         qh: &QueueHandle<Self>,
     ) {
         if let Some(canvas) = state.popup.as_mut() {
-            canvas.on_frame(qh);
+            canvas.on_frame(&mut state.renderer, qh);
+        }
+    }
+}
+
+/// frame 回调（角标）：与上面按 user data 类型分流——同一 Proxy 可以有多份
+/// `Dispatch`，Rust 依 `Data` 选派发。两个表面都无脑重画是浪费（present 不看
+/// dirty，每次都真画一帧）。
+impl Dispatch<WlCallback, BadgeFrame> for AppState {
+    fn event(
+        state: &mut Self,
+        _cb: &WlCallback,
+        _event: <WlCallback as Proxy>::Event,
+        _data: &BadgeFrame,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let Some(badge) = state.badge.as_mut() {
+            badge.on_frame(&mut state.renderer, qh);
+        }
+    }
+}
+
+/// 空 input region：只为满足点击穿透，`create_region` 之后立刻 drop，本对象
+/// 不会收到任何事件。
+impl Dispatch<WlRegion, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _region: &WlRegion,
+        _event: <WlRegion as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// layer shell 本体：只用来 get_layer_surface，自身不发任何事件。
+impl Dispatch<ZwlrLayerShellV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _shell: &ZwlrLayerShellV1,
+        _event: <ZwlrLayerShellV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// layer surface 事件：configure 是「现在可以贴第一帧」的信号（ack 由 ModeBadge
+/// 内部完成，必须先于下一个 commit）；closed 是合成器收走表面，之后不再重建。
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _surface: &ZwlrLayerSurfaceV1,
+        event: ZwlrLayerSurfaceEvent,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ZwlrLayerSurfaceEvent::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                log(&format!("badge configure {width}x{height} serial={serial}"));
+                if let Some(badge) = state.badge.as_mut() {
+                    badge.on_configure(serial, width, height);
+                    // on_configure 置了 dirty：首帧必须画出来，否则表面映射了也是空白
+                    badge.present(&mut state.renderer, qh);
+                }
+            }
+            ZwlrLayerSurfaceEvent::Closed => {
+                log("badge layer surface 被合成器关闭，不再重建");
+                state.badge = None;
+            }
+            _ => {}
         }
     }
 }
@@ -1315,7 +1523,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 // 模式闪现生命周期：任何一次按下（消费或放行都算）先收掉上一次闪现。
                 // release 不收：切换裁决在 Shift 松手处，抬起若也清，闪现活不过一个手势。
                 if let Some(canvas) = state.popup.as_mut() {
-                    canvas.clear_chip(qh);
+                    canvas.clear_chip(&mut state.renderer, qh);
                 }
 
                 if is_shift {
@@ -1435,12 +1643,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (),
                     ));
                 }
+                "zwlr_layer_shell_v1" if global.version >= 1 => {
+                    let ver = global.version.min(1);
+                    log(&format!("Found zwlr_layer_shell_v1 v{ver}"));
+                    app.layer_shell =
+                        Some(globals.registry().bind::<ZwlrLayerShellV1, (), AppState>(
+                            global.name,
+                            ver,
+                            &qh,
+                            (),
+                        ));
+                }
                 _ => {}
             }
         }
     });
     app.try_bind_im(&qh);
     app.try_bind_vk(&qh);
+    // 角标要 layer-shell + compositor + shm 三者齐备，而上面遍历顺序不定，
+    // 所以统一在遍历结束后建一次（ensure_badge 内部自带幂等与缺项早退）
+    app.ensure_badge(&qh);
     log("event loop");
 
     // 手写 poll 循环取代 blocking_dispatch：合成器不给 IM grab 投 repeat，长按节奏
