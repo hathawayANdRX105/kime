@@ -4,6 +4,7 @@ members = [
     "crates/kime-pinyin",
     "crates/kime-shuangpin",
     "crates/kime-core",
+    "crates/kime-render",
     "bin/kime",
     "crates/platform-wayland",
     "crates/platform-x11",

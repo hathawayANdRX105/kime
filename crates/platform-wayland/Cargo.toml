@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kime-core = { path = "../kime-core" }
+kime-render = { path = "../kime-render" }
 wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 # zwlr_layer_shell_v1 / zwlr_layer_surface_v1 绑定：构建期由 wayland-scanner 生成代码，
