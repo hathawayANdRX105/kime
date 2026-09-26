@@ -24,8 +24,7 @@ const HL: Color = Color::rgba(255, 220, 120, 255);
 /// 模式字：青绿系，与 FG/HL 及其抗锯齿混色都不撞
 const CHIP: Color = Color::rgba(122, 207, 214, 255);
 
-/// 模式标识字：常驻候选条的首项（`layout` 的第一项），中英切换瞬间另走
-/// `chip_layout` 闪一次小窗。
+/// 模式标识字：中英切换瞬间 `chip_layout` 闪一次小窗用（常驻候选条不摆模式字）。
 pub fn mode_chip(chinese: bool) -> &'static str {
     if chinese {
         "中"
@@ -42,7 +41,8 @@ pub fn chip_window_width(glyph_w: u32) -> u32 {
     MARGIN_X * 2 + glyph_w.min(8192 - MARGIN_X * 2)
 }
 
-/// 单个已摆放的项：x 为内容左沿，w 为实测宽；chip = 模式字（不编号、不可选）。
+/// 单个已摆放的项：x 为内容左沿，w 为实测宽；chip = 模式字（只出现在 `chip_layout`
+/// 闪现小窗，不编号、不可选）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacedItem {
     pub x: u32,
@@ -52,7 +52,7 @@ pub struct PlacedItem {
 }
 
 /// 一帧的完整摆放结果。空候选 → 1×1（隐藏帧，像素全透明）。
-/// 有候选时首项是常驻模式字：它不占高亮下标，中英切换瞬间另走 `chip_layout`。
+/// 候选条只摆 "N. 候选"；模式字不常驻，中英切换瞬间另走 `chip_layout`。
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub width: u32,
@@ -137,7 +137,7 @@ impl Renderer {
     /// warn_no_font 分支，本函数不引入任何 unwrap/expect。
     fn warmup(&mut self) {
         let probe: Vec<String> = WARMUP_PROBE.iter().map(|s| s.to_string()).collect();
-        let layout = self.layout(&probe, true);
+        let layout = self.layout(&probe);
         let mut scratch = vec![0u8; layout.pixel_len()];
         self.paint(&layout, 0, &mut scratch);
     }
@@ -160,28 +160,17 @@ impl Renderer {
         w.ceil().max(0.0) as u32
     }
 
-    /// 横排单行摆放：首项是常驻模式字（`chinese` = 当前中英模式，决定画「中」还是「英」），
-    /// 其后每项 "N. 候选"，定宽分隔，总宽随内容自适应。
+    /// 横排单行摆放：每项 "N. 候选"，定宽分隔，总宽随内容自适应。
     /// candidates 已是当前页（调用方切好片），这里不再截断。
     /// 高度只含边距 + 行高：合成器已把 popup 摆在光标旁，表面内不再留光标行空行。
-    /// 模式字常驻候选条首项（工单第 1 条）；`chip_layout` 只是切换瞬间的闪现小窗。
-    /// 空候选 → 隐藏帧（模式字也不出现）。
-    pub fn layout(&mut self, candidates: &[String], chinese: bool) -> Layout {
+    /// 模式字不常驻候选条：中英切换只闪一次 `chip_layout` 小窗。
+    /// 空候选 → 隐藏帧。
+    pub fn layout(&mut self, candidates: &[String]) -> Layout {
         if candidates.is_empty() {
             return Layout::hidden();
         }
-        let mut items = Vec::with_capacity(candidates.len() + 1);
+        let mut items = Vec::with_capacity(candidates.len());
         let mut x = MARGIN_X;
-        // 模式字压在最左：候选不重画的一刻也能一眼分清中英
-        let chip = mode_chip(chinese).to_string();
-        let chip_w = self.measure(&chip);
-        items.push(PlacedItem {
-            x,
-            w: chip_w,
-            text: chip,
-            chip: true,
-        });
-        x += chip_w + SEP;
         for (i, text) in candidates.iter().enumerate() {
             let label = format!("{}. {}", i + 1, text);
             let w = self.measure(&label);
@@ -240,7 +229,7 @@ impl Renderer {
         }
         let band_top = MARGIN_Y;
         let band_h = LINE_HEIGHT.ceil() as i32;
-        // highlight 是页内候选下标，模式字永远不算候选
+        // highlight 是页内候选下标，chip 项（闪现小窗的唯一项）永远不算候选
         let mut cand_idx = 0usize;
         for item in &layout.items {
             let color = if item.chip {

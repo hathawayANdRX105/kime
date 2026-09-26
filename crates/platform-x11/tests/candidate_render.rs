@@ -2,8 +2,7 @@
 //! 目标：抓住「空候选画了实底帧」「缓冲长度与宽高不符」「高亮越界 panic」
 //! 这类只在真机上才暴露的 bug。本测试不创建任何 X11 资源。
 //!
-//! 候选条第一项是常驻模式字（CHIP 色）：不可选、也永不高亮，
-//! 高亮下标只数候选（模式字不占号）。
+//! 候选条只摆 "N. 候选"，不画模式字；高亮下标即页内候选下标。
 
 use kime_core::Candidate;
 use platform_x11::render::{LINE_HEIGHT, MARGIN_X, MARGIN_Y};
@@ -123,60 +122,13 @@ fn highlight_differs_from_normal_and_out_of_range_is_safe() {
 }
 
 #[test]
-fn candidate_bar_starts_with_mode_chip() {
+fn candidate_bar_has_no_mode_chip() {
     let mut r = Renderer::new();
-    r.set_chinese(true);
     r.set_candidates(&cands(3));
     let f = r.render();
     assert!(!f.is_hidden());
-    assert!(chip_pixels(&f.pixels) > 0, "候选条头部必须上 CHIP 色");
-}
-
-#[test]
-fn candidate_bar_chip_follows_mode() {
-    let mut r = Renderer::new();
-    r.set_candidates(&cands(3));
-    r.set_chinese(true);
-    let zh = r.render();
-    r.set_chinese(false);
-    let en = r.render();
-    assert!(chip_pixels(&zh.pixels) > 0 && chip_pixels(&en.pixels) > 0);
-    // 帧比对按字形可区分性开关：CI 的 ubuntu-latest 没装 CJK 字体，「中」「英」
-    // 双双回退到同一个 .notdef 字形，两帧逐字节相同（wayland 侧 run 36062714042
-    // 实测）。先用另一个候选集探测这套字体到底能不能区分二者。
-    let mut probe = Renderer::new();
-    probe.set_candidates(&[cand("一")]);
-    probe.set_chinese(true);
-    let probe_zh = probe.render();
-    probe.set_chinese(false);
-    let probe_en = probe.render();
-    if probe_zh.pixels != probe_en.pixels {
-        assert!(
-            zh.pixels != en.pixels,
-            "字体能区分中/英时两态必须画出不同的帧"
-        );
-    }
-}
-
-#[test]
-fn chip_is_never_highlighted() {
-    let mut r = Renderer::new();
-    r.set_candidates(&cands(3));
-    r.set_highlight(0);
-    let hl0 = r.render();
-    // 越界高亮：候选全回 FG，模式字仍应是唯一的非灰/非琥珀色块
-    r.set_highlight(99);
-    let oob = r.render();
-    assert!(chip_pixels(&oob.pixels) > 0, "越界高亮不得抹掉模式字");
-    assert_eq!(
-        chip_pixels(&oob.pixels),
-        chip_pixels(&hl0.pixels),
-        "模式字像素数与高亮无关"
-    );
-    assert_ne!(
-        hl0.pixels, oob.pixels,
-        "高亮 0 与越界高亮必须画出不同的帧（候选 0 的 HL 生效）"
-    );
+    assert!(non_bg(&f.pixels) > 0, "整帧只有背景 = 画了空帧");
+    assert_eq!(chip_pixels(&f.pixels), 0, "候选条里不该有模式字色");
 }
 
 /// 超长候选不得把帧宽顶过 8192（钳位）更不得触到 u16 上限 65535（回绕打死连接）。

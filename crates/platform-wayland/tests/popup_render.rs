@@ -2,8 +2,8 @@
 //! 核心目标：抓到「从不 set_text 画空帧」「buffer 尺寸校验错」「高亮越界 panic」
 //! 「模式字错位/漏画」这类只在真机上才暴露的 bug。
 //!
-//! 契约：候选条的第一项永远是模式字（`中`/`英`）——它不可选、永不高亮，
-//! 高亮下标只数候选；空候选 = 1×1 隐藏帧（模式字也不出现）。
+//! 契约：候选条只摆 "N. 候选"，不画模式字，高亮下标即页内候选下标；空候选 = 1×1
+//! 隐藏帧。模式字只在中英切换瞬间走 `chip_layout` 闪一次小窗。
 
 use platform_wayland::render::{chip_window_width, mode_chip};
 use platform_wayland::render::{LINE_HEIGHT, MARGIN_X, MARGIN_Y, SEP};
@@ -42,7 +42,7 @@ fn mode_chip_differs_between_modes_and_is_nonempty() {
 #[test]
 fn empty_candidates_is_1x1_fully_transparent() {
     let mut r = Renderer::new();
-    let l = r.layout(&[], true);
+    let l = r.layout(&[]);
     assert!(l.is_hidden(), "空候选必须就是隐藏帧");
     assert_eq!((l.width, l.height), (1, 1));
     assert_eq!(l.pixel_len(), 4);
@@ -51,44 +51,16 @@ fn empty_candidates_is_1x1_fully_transparent() {
 }
 
 #[test]
-fn candidate_bar_starts_with_mode_chip() {
+fn candidate_bar_starts_with_first_candidate() {
     let mut r = Renderer::new();
-    let l = r.layout(&cands(8), true);
-    assert_eq!(l.items.len(), 9, "候选条 = 1 个模式字 + 8 个候选");
-    assert!(l.items[0].chip, "首项必须是模式字");
-    assert_eq!(l.items[0].text, mode_chip(true));
-    assert_eq!(l.items[0].x, MARGIN_X, "模式字贴着左边留白");
-    assert!(l.items[1..].iter().all(|i| !i.chip), "模式字只在首位");
-    assert_eq!(l.items[1].text, "1. 候选1", "第二个才是首个候选");
+    let l = r.layout(&cands(8));
+    assert_eq!(l.items.len(), 8, "候选条只有 8 个候选，没有模式字");
+    assert!(l.items.iter().all(|i| !i.chip), "候选条里不得有模式字");
+    assert_eq!(l.items[0].text, "1. 候选1", "首项就是首个候选");
+    assert_eq!(l.items[0].x, MARGIN_X, "首项贴着左边留白");
     let buf = paint(&mut r, &l, 0);
     assert!(non_bg(&buf) > 0, "整帧只有背景 = 画了空帧");
-    assert!(chip_pixels(&buf) > 0, "候选条头部必须上 CHIP 色");
-}
-
-#[test]
-fn candidate_bar_chip_follows_mode() {
-    let mut r = Renderer::new();
-    let zh = r.layout(&cands(3), true);
-    let en = r.layout(&cands(3), false);
-    assert_eq!(zh.items[0].text, mode_chip(true));
-    assert_eq!(en.items[0].text, mode_chip(false));
-    assert_ne!(zh.items[0].text, en.items[0].text);
-    // 帧比对要按字形可区分性开关：CI 的 ubuntu-latest 没装 CJK 字体，「中」「英」
-    // 双双回退到同一个 .notdef 字形，两帧逐字节相同（run 36062714042 实测）。
-    // 那种环境里帧差异本就无从谈起，只在字体真能区分二者时才断言。
-    let zh_glyph = {
-        let l = r.chip_layout(true);
-        paint(&mut r, &l, 0)
-    };
-    let en_glyph = {
-        let l = r.chip_layout(false);
-        paint(&mut r, &l, 0)
-    };
-    if zh_glyph != en_glyph {
-        let zh_buf = paint(&mut r, &zh, 0);
-        let en_buf = paint(&mut r, &en, 0);
-        assert_ne!(zh_buf, en_buf, "字体能区分中/英时，两种模式的帧必须不同");
-    }
+    assert_eq!(chip_pixels(&buf), 0, "候选条里不该出现模式字的 CHIP 色");
 }
 
 #[test]
@@ -114,7 +86,7 @@ fn height_has_no_external_gap_and_ignores_candidate_count() {
     let mut r = Renderer::new();
     let want = MARGIN_Y * 2 + LINE_HEIGHT.ceil() as u32;
     for n in [1usize, 3, 8, 20] {
-        let l = r.layout(&cands(n), true);
+        let l = r.layout(&cands(n));
         assert_eq!(l.height, want, "{n} 个候选的高度应恰为边距+行高");
     }
 }
@@ -122,21 +94,21 @@ fn height_has_no_external_gap_and_ignores_candidate_count() {
 #[test]
 fn width_grows_with_content() {
     let mut r = Renderer::new();
-    let l = r.layout(&cands(8), true);
-    let more = r.layout(&cands(9), true);
+    let l = r.layout(&cands(8));
+    let more = r.layout(&cands(9));
     assert!(more.width > l.width, "候选数增加宽度未增");
-    let short = r.layout(&vec!["一".to_string(); 8], true);
+    let short = r.layout(&vec!["一".to_string(); 8]);
     assert!(short.width < l.width, "不同候选集宽度应不同");
     // 首项左沿 = 留白，第二项至少隔一个分隔宽
     assert_eq!(l.items[0].x, MARGIN_X);
     assert!(l.items[1].x >= l.items[0].x + l.items[0].w + SEP);
-    assert_eq!(l.items[1].text, "1. 候选1", "第二个才是首个候选");
+    assert_eq!(l.items[1].text, "2. 候选2", "第二项是第二个候选");
 }
 
 #[test]
 fn highlight_changes_pixels_and_out_of_range_is_safe() {
     let mut r = Renderer::new();
-    let l = r.layout(&cands(3), true);
+    let l = r.layout(&cands(3));
     let base = paint(&mut r, &l, 0);
     let other = paint(&mut r, &l, 1);
     assert_ne!(base, other, "高亮项必须区别于普通项");
@@ -165,7 +137,7 @@ fn layout_width_never_exceeds_pool_guard() {
     let mut r = Renderer::new();
     // 超长候选：单条 5000 字，强制 x 累加远超 8192
     let huge = vec!["啊".repeat(5000)];
-    let l = r.layout(&huge, true);
+    let l = r.layout(&huge);
     assert!(
         l.width <= 8192,
         "layout 宽度 {} 超过 create_buffer 守卫上限，pool size 会与 shm 长度不符",
@@ -177,7 +149,7 @@ fn layout_width_never_exceeds_pool_guard() {
 
     // 多条超长候选同样受钳
     let many = (0..8).map(|_| "啊".repeat(2000)).collect::<Vec<_>>();
-    let l = r.layout(&many, true);
+    let l = r.layout(&many);
     assert!(l.width <= 8192, "多候选累加后宽度 {} 仍然越界", l.width);
 
     // chip 小窗同律
