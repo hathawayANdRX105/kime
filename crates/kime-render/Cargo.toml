@@ -1,0 +1,12 @@
+[package]
+name = "kime-render"
+description = "候选窗像素渲染共享内核：排版参数、字形测量与 ARGB8888 光栅"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# shape-run-cache：按 (text, attrs) 缓存整形结果，消掉 measure/光栅对同一批字形的
+# 双次整形（缺字 fallback 全扫是按键路径上的冷路径大头）。缓存由 FontSystem 持有、
+# 无自动 trim：候选 label 集合有限且单条目极小，长会话的增长可接受（取舍：用一点
+# 内存换按键同步路径上的整形 CPU）。
+cosmic-text = { version = "0.19.0", features = ["shape-run-cache"] }
