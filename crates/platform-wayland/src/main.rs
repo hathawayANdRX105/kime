@@ -224,8 +224,6 @@ struct PopupCanvas {
     /// 待显示内容：当前页候选 + 页内高亮下标
     content: Vec<String>,
     highlight: usize,
-    /// 当前中英模式：驱动候选条首项的常驻模式字，也参与 set_content 去重
-    chinese: bool,
     /// 模式提示闪现：Some = 刚发生中英切换，画只含 中/英 的小窗；
     /// 下一次任意按键（Key 处理开头）清掉。
     chip: Option<bool>,
@@ -255,7 +253,6 @@ impl PopupCanvas {
             dirty: false,
             content: Vec::new(),
             highlight: 0,
-            chinese: true,
             chip: None,
         };
         canvas.present(renderer, qh);
@@ -266,16 +263,14 @@ impl PopupCanvas {
         &mut self,
         candidates: Vec<String>,
         highlight: usize,
-        chinese: bool,
         renderer: &mut Renderer,
         qh: &QueueHandle<AppState>,
     ) {
-        if self.content == candidates && self.highlight == highlight && self.chinese == chinese {
+        if self.content == candidates && self.highlight == highlight {
             return;
         }
         self.content = candidates;
         self.highlight = highlight;
-        self.chinese = chinese;
         self.present(renderer, qh);
     }
 
@@ -336,7 +331,7 @@ impl PopupCanvas {
         self.dirty = false;
         let layout = match self.chip {
             Some(chinese) => renderer.chip_layout(chinese),
-            None => renderer.layout(&self.content, self.chinese),
+            None => renderer.layout(&self.content),
         };
         let Some(slot) = self.pick_slot(&layout) else {
             log("popup: 两槽位都被合成器占用，present 挂起（等 release/frame）");
@@ -762,11 +757,8 @@ impl AppState {
             }
         };
         log(&format!("popup_show 候选={page:?} hl={hl}"));
-        // 引擎读取必须在下面 popup 的可变借用之前：剪贴板分支不碰引擎，
-        // 无条件读一次即可（空引擎退回中文默认）。
-        let chinese = self.engine.as_ref().map_or(true, |e| e.chinese());
         if let Some(canvas) = self.popup.as_mut() {
-            canvas.set_content(page, hl, chinese, &mut self.renderer, qh);
+            canvas.set_content(page, hl, &mut self.renderer, qh);
         }
     }
 
