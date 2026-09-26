@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.19.51"
+version = "0.19.65"
 edition = "2021"
 
 [[bench]]
