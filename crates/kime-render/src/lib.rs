@@ -45,8 +45,8 @@ pub fn panel_width(x: u32) -> u32 {
 
 /// 整帧铺底色。
 pub fn fill_background(buf: &mut [u8]) {
-    for px in buf.chunks_exact_mut(4) {
-        px.copy_from_slice(&BG);
+    for px in buf.as_chunks_mut::<4>() {
+        *px = BG;
     }
 }
 
