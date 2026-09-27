@@ -970,6 +970,37 @@ impl AppState {
             self.engine_press(code, now as u32, true, qh);
         }
     }
+
+    /// 连接断开后调用:清掉所有绑在旧连接上的 wayland 对象(它们的 proxy 已失效),
+    /// 保留 engine/renderer/配置等进程内状态,重连时重新 bind。
+    fn reset_wayland_objects(&mut self) {
+        self.input_method_manager = None;
+        self.input_method = None;
+        self.grab = None;
+        self.vk_manager = None;
+        self.vk = None;
+        self.vk_keymap_ready = false;
+        self.seats.clear();
+        self.compositor = None;
+        self.shm = None;
+        self.layer_shell = None;
+        self.popup = None;
+        self.badge = None;
+    }
+    /// 正常退出前:显式走协议销毁 vk/im(grab 无显式 destroy,drop 即可)并 flush,
+    /// 让 vk 走「协议 destroy」而非「断开连接时服务端自动销毁」,避开 mangowm 崩会路径。
+    fn teardown_wayland_objects(&mut self) {
+        if let Some(vk) = self.vk.take() {
+            vk.destroy();
+        }
+        if let Some(im) = self.input_method.take() {
+            im.destroy();
+        }
+        self.grab = None;
+        if let Some(c) = &self.conn {
+            c.flush();
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for AppState {
@@ -1555,37 +1586,31 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let mut target_seat = None;
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--seat" && i + 1 < args.len() {
-            target_seat = Some(args[i + 1].clone());
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
+enum RunOutcome {
+    /// 正常退出(should_exit)
+    Done,
+    /// wayland 连接断开(协议错误/合成器重启)→ 重连
+    ConnLost,
+    /// 致命(连不上/注册失败)→ 退出进程
+    Fatal(Box<dyn std::error::Error>),
+}
 
-    if let Some(s) = &target_seat {
-        log(&format!("目标 seat: {s}"));
-    } else {
-        log("使用默认 seat");
-    }
-
-    // 冷路径预热前移到进程启动：候选窗首次渲染含 CJK 扩展区字形的页时，
-    // 缺字 fallback 全字体线扫 + 字体解析实测 134ms 帧延迟（~110ms 纯 CPU），
-    // 绝不能落在首个 ACTIVATE 的按键同步路径上。Renderer 不持有任何 wayland
-    // 对象（像素缓冲由调用方提供），所以在连 wayland 之前同步构造即可：
-    // 守护进程启动期用户不可见，不为此引入线程/异步。
-    let renderer = Renderer::new();
-
-    let conn = Connection::connect_to_env()?;
-
-    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
+/// 连一次 wayland、bind 全局对象、跑事件循环,直到:
+///   - 正常退出(should_exit)→ Done
+///   - 连接断开(协议错误/合成器重启)→ ConnLost(调用方重连,保住 IME 进程)
+///   - 致命错误(连不上/注册失败)→ Fatal
+/// 收敛核心:mangowm 崩/重启或偶发协议错误时,不再让整个 kime 进程跟着死——
+/// 那样外部 `while :; do` 会反复重拉,每次拉起销毁 vk 又反复踩 mangowm 崩会。
+fn run_once(app: &mut AppState) -> RunOutcome {
+    let conn = match Connection::connect_to_env() {
+        Ok(c) => c,
+        Err(e) => return RunOutcome::Fatal(e.into()),
+    };
+    let (globals, mut event_queue) = match registry_queue_init::<AppState>(&conn) {
+        Ok(x) => x,
+        Err(e) => return RunOutcome::Fatal(e.into()),
+    };
     let qh: QueueHandle<AppState> = event_queue.handle();
-    let mut app = AppState::new(target_seat, renderer);
     app.conn = Some(conn);
 
     globals.contents().with_list(|list| {
@@ -1652,18 +1677,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     app.try_bind_im(&qh);
     app.try_bind_vk(&qh);
-    // 角标要 layer-shell + compositor + shm 三者齐备，而上面遍历顺序不定，
-    // 所以统一在遍历结束后建一次（ensure_badge 内部自带幂等与缺项早退）
+    // 角标要 layer-shell + compositor + shm 三者齐备,遍历顺序不定,统一在此建(幂等)
     app.ensure_badge(&qh);
     log("event loop");
 
-    // 手写 poll 循环取代 blocking_dispatch：合成器不给 IM grab 投 repeat，长按节奏
-    // 要靠本循环在「无 wayland 事件」时也被定时器叫醒；poll 超时本身充当计时器，
-    // 不引 calloop/timerfd 任何新依赖（libc 已在依赖树）。
-    let backend = app.conn.as_ref().expect("conn set above").backend();
-    let display_fd = backend.poll_fd().as_raw_fd();
+    // 手写 poll 循环:合成器不给 IM grab 投 repeat,长按节奏靠本循环在无事件时
+    // 被 poll 超时叫醒;poll 超时当计时器,不引 calloop/timerfd。
+    let display_fd = app
+        .conn
+        .as_ref()
+        .expect("conn set above")
+        .backend()
+        .poll_fd()
+        .as_raw_fd();
     while !app.should_exit {
-        event_queue.flush()?;
+        // 连接断开(flush 协议/IO 错)→ ConnLost,重连保进程
+        if let Err(e) = event_queue.flush() {
+            log(&format!("flush: wayland 连接断开({e})"));
+            return RunOutcome::ConnLost;
+        }
         let timeout_ms: i32 = match app.repeat.next_due() {
             Some(due) => due.saturating_sub(now_ms()).min(i32::MAX as u64) as i32,
             None => -1,
@@ -1673,26 +1705,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             events: libc::POLLIN,
             revents: 0,
         }];
-        // SAFETY: pfd 是有效的单个 pollfd，nfds=1。
+        // SAFETY: pfd 是有效的单个 pollfd,nfds=1。
         let ret = unsafe { libc::poll(pfd.as_mut_ptr(), pfd.len() as libc::nfds_t, timeout_ms) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(err.into());
+            return RunOutcome::Fatal(err.into());
         }
-        let woke = pfd[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0;
-        if woke {
-            // 只在 socket 确实可读时进 prepare_read().read()（它会阻塞等数据）。
+        if pfd[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            // 只在 socket 确实可读时进 prepare_read().read()(它会阻塞等数据)。
             if let Some(guard) = event_queue.prepare_read() {
-                guard.read()?;
+                if let Err(e) = guard.read() {
+                    log(&format!("read: wayland 连接断开({e})"));
+                    return RunOutcome::ConnLost;
+                }
             }
         } else {
             app.tick_repeats(&qh);
         }
-        event_queue.dispatch_pending(&mut app)?;
+        if let Err(e) = event_queue.dispatch_pending(&mut *app) {
+            log(&format!("dispatch: wayland 连接断开({e})"));
+            return RunOutcome::ConnLost;
+        }
     }
+    app.teardown_wayland_objects();
     log("exit");
+    RunOutcome::Done
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    let mut target_seat = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--seat" && i + 1 < args.len() {
+            target_seat = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    if let Some(s) = &target_seat {
+        log(&format!("目标 seat: {s}"));
+    } else {
+        log("使用默认 seat");
+    }
+
+    // 冷路径预热前移到进程启动:候选窗首渲 CJK 扩展区字形页时缺字 fallback 全字体
+    // 线扫+字体解析 ~134ms 帧延迟,绝不能落进首个 ACTIVATE 的按键同步路径。
+    // Renderer 不持 wayland 对象,连 wayland 之前同步构造即可,不引线程/异步。
+    let renderer = Renderer::new();
+    let mut app = AppState::new(target_seat, renderer);
+    let mut backoff_ms: u32 = 1_000;
+
+    loop {
+        match run_once(&mut app) {
+            RunOutcome::Done => break,
+            RunOutcome::ConnLost => {
+                // 复位旧连接上的 wayland 对象,退避后重连;进程保持存活,IME 不断。
+                app.reset_wayland_objects();
+                log(&format!(
+                    "wayland 连接断开,{backoff_ms}ms 后重连(进程不退出,不靠外部循环反复杀/拉)"
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(u64::from(backoff_ms)));
+                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+            }
+            RunOutcome::Fatal(e) => return Err(e),
+        }
+    }
     Ok(())
 }
