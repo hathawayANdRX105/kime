@@ -811,18 +811,31 @@ impl AppState {
 
     fn apply_commit(&mut self, text: String, qh: &QueueHandle<Self>) {
         log(&format!("commit {text}"));
-        self.deliver_commit(text, qh);
+        // 选词只消耗已选音节时（d7dc44e 起），引擎 letters 里还有剩余拼音：
+        // 与 apply_consumed 同形把剩余 preedit（光标在尾）同步给应用，输入框立刻
+        // 显示「剩余拼音 + 候选」，可继续选词/退格回溯（fcitx5 预选行为）。
+        let (preedit, cursor) = self.engine.as_ref().map_or((String::new(), 0), |e| {
+            (e.preedit().to_string(), e.preedit_cursor() as i32)
+        });
+        self.deliver_commit(text, preedit, cursor, qh);
     }
 
     /// 投递上屏（无日志）：剪贴板候选文本不落 /tmp/kime-ime.log（隐私——
-    /// 日志可含任意复制内容）。
-    fn deliver_commit(&mut self, text: String, qh: &QueueHandle<Self>) {
+    /// 日志可含任意复制内容）。preedit/cursor = 提交后仍要继续显示的剩余组合。
+    fn deliver_commit(
+        &mut self,
+        text: String,
+        preedit: String,
+        cursor: i32,
+        qh: &QueueHandle<Self>,
+    ) {
         if let Some(im) = &self.input_method {
             im.commit_string(text);
-            im.set_preedit_string(String::new(), 0, 0);
+            im.set_preedit_string(preedit, 0, cursor);
             im.commit(self.im_serial);
         }
         // 走 popup_show 而非 hide：中文模式下候选已被引擎清空 → 自然回到隐藏帧；
+        // 剩余拼音在途时候选重排 → 候选条原地刷新；
         // 若这次提交同时翻转了中英模式（Shift 上屏原串），翻转检测在 Key 处理里闪窗。
         self.popup_show(qh);
     }
@@ -858,7 +871,7 @@ impl AppState {
                 self.clip_pick = None;
                 match text {
                     // 剪贴板文本不进日志：走无日志投递路径
-                    Some(text) => self.deliver_commit(text, qh),
+                    Some(text) => self.deliver_commit(text, String::new(), 0, qh),
                     None => self.popup_show(qh),
                 }
             }

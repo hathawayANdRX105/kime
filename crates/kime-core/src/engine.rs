@@ -97,6 +97,10 @@ pub struct Engine {
     /// 上一次 kime 上屏的 (text, reading)，bigram 挖掘的「上文」。
     /// 比 surrounding_text 可靠：恒为 kime 自己的提交，不含粘贴/启动前的文本。
     last_commit: Option<(String, String)>,
+    /// fcitx5 式词级撤销：最近若干次「选词」各自消耗的拼音键串（LIFO，
+    /// 全拼 = 消耗字母、双拼 = 消耗键位）。组合空时 Backspace 弹栈顶重新
+    /// 进 letters（可再选词、也可继续组词）；清组合整栈清空。
+    undo_consumed: Vec<String>,
 }
 
 impl Engine {
@@ -151,6 +155,7 @@ impl Engine {
             after_digit: false,
             context: None,
             last_commit: None,
+            undo_consumed: Vec::new(),
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -224,6 +229,8 @@ impl Engine {
         self.cursor = 0;
         self.last_joined.clear();
         self.sp_active = false;
+        // 放弃组合（Esc / 切英文 / Enter 原始上屏）连带丢弃词级撤销历史
+        self.undo_consumed.clear();
     }
 
     /// 选词上屏：learn + 清空候选/页码，但**只消耗被选候选覆盖的音节**，
@@ -248,6 +255,7 @@ impl Engine {
         };
         // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；双拼按**键位**
         // 消耗（每音节恒 2 键），否则 neng（4 字母）会多吃掉下一音节的键位。
+        let old_len = self.letters.len();
         let remaining = if self.sp_active {
             let k = consumed.len();
             let cut = 2 * k;
@@ -262,11 +270,22 @@ impl Engine {
 
         self.candidates.clear();
         self.page_index = 0;
-        self.cursor = 0;
         self.last_joined.clear();
         self.preedit.clear();
         self.last_reading.clear();
+        // 词级撤销：记下本次选词消耗的拼音键串（原串前段），组合空时 Backspace
+        // 弹栈顶可退回该拼音（重新选词或继续组词，fcitx5 同族行为）。
+        let undo_entry = self.letters[..old_len - remaining.len()].to_string();
         self.letters = remaining;
+        if !undo_entry.is_empty() {
+            self.undo_consumed.push(undo_entry);
+            if self.undo_consumed.len() > 64 {
+                self.undo_consumed.remove(0);
+            }
+        }
+        // 光标落在剩余拼音末尾：caret 在「最后」，后续打字续在尾部；
+        // 此前复位 0 导致剩余 preedit 前移、新字符插到头部（「光标不是最后」根因）。
+        self.cursor = self.letters.len();
 
         if !self.letters.is_empty() {
             self.refresh_candidates();
@@ -315,10 +334,18 @@ impl Engine {
         }
 
         // Backspace — evdev KEY_BACKSPACE（14），ch 通常为 None。删光标**前**一个字符
-        // （组合内光标语义）。空组合 → Ignored 放行给应用；长按的自动重复按 press
-        // 逐次到达，每次消费删一个字符，与引擎无状态假设一致。
+        // （组合内光标语义）；组合已空时按 fcitx5 词级撤销：把最近一次选词消耗的
+        // 拼音弹回 letters（候选重建，可再选词、也可继续组词）；栈空才 Ignored 放行。
+        // 长按的自动重复按 press 逐次到达，每次消费删一个字符，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
             if self.letters.is_empty() {
+                if let Some(consumed) = self.undo_consumed.pop() {
+                    self.letters = consumed;
+                    self.cursor = self.letters.len();
+                    self.page_index = 0;
+                    self.refresh_candidates();
+                    return Outcome::Consumed;
+                }
                 return Outcome::Ignored;
             }
             if self.cursor > 0 {
@@ -1523,6 +1550,112 @@ mod tests {
     #[test]
     fn backspace_on_empty_is_ignored() {
         let (mut e, db, yaml) = engine_with_fixture();
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 部分选词（选词只消耗已选音节）后光标必须落在剩余拼音末尾：
+    /// 后续打字续在尾部而不是插进剩余拼音头部（2.1「光标不是最后」回归）。
+    #[test]
+    fn partial_selection_keeps_caret_at_tail() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihaos".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit(你好), got {:?}", other),
+        }
+        assert_eq!(e.letters, "s", "剩余拼音必须保留");
+        assert_eq!(e.cursor(), e.letters.len(), "光标必须在剩余拼音末尾");
+        assert_eq!(e.preedit_cursor(), e.letters.len());
+        e.key(k('h'));
+        assert_eq!(e.letters, "sh", "新字符续在剩余拼音尾部");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// fcitx5 词级撤销：选词后组合已空，Backspace 把本次选词消耗的拼音弹回
+    /// letters（候选重建，可再选词或继续组词），不删应用侧字符。
+    #[test]
+    fn backspace_pops_last_selected_word() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        // 组合空 + 栈非空：退格 = 撤销选词，不是删应用字符
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihao");
+        assert!(
+            e.candidates().iter().any(|c| c.text == "你好"),
+            "弹回后候选必须重建"
+        );
+        // 逐个删掉弹回的拼音后，栈已空 → 退格放行给应用
+        for _ in 0..5 {
+            assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        }
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 部分选词场景的撤销链：先按正常删字路径吃掉剩余拼音，退到空组合后
+    /// 才弹选词消耗的拼音段。
+    #[test]
+    fn backspace_partial_selection_undoes_in_order() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihaos".chars() {
+            e.key(k(c));
+        }
+        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
+        assert_eq!(e.letters, "s");
+        // 剩余拼音 s 先按普通退格删掉
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert!(e.letters.is_empty());
+        // 此时退格弹的是选词消耗段
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihao");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 双拼：撤销弹回的是**键位串**（非拼音），候选经重新解码重建。
+    #[test]
+    fn shuangpin_backspace_undo_restores_keys() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        for c in "nihc".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihc", "双拼撤销弹回键位串");
+        assert_eq!(e.preedit(), "nihao", "弹回后按双拼解码重建 preedit");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 清组合（Esc 有组合时）连带丢弃词级撤销历史，避免跨话题误弹旧拼音。
+    #[test]
+    fn esc_with_composition_drops_undo_stack() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
+        assert!(e.letters.is_empty());
+        // 起一段新组合再 Esc 清掉 → 撤销栈一并丢弃
+        assert_eq!(e.key(k('n')), Outcome::Consumed);
+        assert_eq!(e.key(code_k(KEY_ESC)), Outcome::Consumed);
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
