@@ -222,6 +222,10 @@ struct ShmBuffer {
 
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
+        // 崩溃取证：buffer 被 drop（munmap+close+代理销毁）的时刻与尺寸。
+        // 若 drop 发生在合成器仍持有该 buffer 时（release 未到），随后的
+        // create_pool/create_buffer 就可能越界——与 pool 创建日志对时间线。
+        log(&format!("popup buffer drop w={} h={}", self.w, self.h));
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
@@ -454,6 +458,9 @@ impl PopupCanvas {
             return Err("mmap 失败");
         }
         let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        // 崩溃取证：create_pool 是 wl_shm 唯一建池入口，崩前最后一行这条日志
+        // 即肇事 pool 规格（w/h/len），对照 mangowm 的池校验定根因。
+        log(&format!("popup create_pool w={w} h={h} len={len}"));
         let pool = shm.create_pool(fd_borrowed, len as i32, qh, ());
         let buffer = pool.create_buffer(
             0,
