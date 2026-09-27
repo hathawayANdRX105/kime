@@ -77,6 +77,7 @@ impl X11IM {
             std::env::var_os("KIME_DEBUG").is_some(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        let server = X11rbServer::init(conn.clone(), screen_num, IM_NAME, xim::ALL_LOCALES)?;
         // 候选窗创建失败只降级（无候选窗、仅 preedit），不拖垮 IM 主循环。
         let window = match CandidateWindow::new(conn.clone(), screen_num) {
             Ok(w) => Some(w),
