@@ -215,7 +215,10 @@ struct ShmBuffer {
     buffer: WlBuffer,
     fd: i32,
     ptr: *mut u8,
+    /// mmap 长度（池规格，下限 4096）
     len: usize,
+    /// 像素字节数 w*h*4（paint 切片长度，Renderer::paint 断言相等）
+    plen: usize,
     w: u32,
     h: u32,
 }
@@ -377,7 +380,7 @@ impl PopupCanvas {
             return;
         };
         let reuse = self.buffers[slot].as_ref().is_some_and(|b| {
-            b.w == layout.width && b.h == layout.height && b.len == layout.pixel_len()
+            b.w == layout.width && b.h == layout.height && b.plen == layout.pixel_len()
         });
         if !reuse {
             // 槽位里的旧 buffer 必已 release（free 才会走到这），换掉安全
@@ -394,7 +397,7 @@ impl PopupCanvas {
         }
         {
             let b = self.buffers[slot].as_ref().unwrap();
-            let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.len) };
+            let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
             renderer.paint(&layout, self.highlight, pixels);
         }
         let b = self.buffers[slot].as_ref().unwrap();
@@ -433,7 +436,12 @@ impl PopupCanvas {
         if w == 0 || h == 0 || w > 8192 || h > 1024 {
             return Err("popup 尺寸非法");
         }
-        let len = (w as usize) * (h as usize) * 4;
+        // 池下限一页（4096）：1×1 隐藏帧裸算只有 4 字节池，是 wl_shm 池里的畸形
+        // 规格——自定义合成器（mangowm）的 create_pool 校验对过小池可能判
+        // invalid arguments（#65 崩溃类，09-28 16295 行现场）。memfd 多给 4KB
+        // 无代价；buffer 仍按 w×h 建，池内 [0, w*h*4) 有效。
+        let plen = (w as usize) * (h as usize) * 4;
+        let len = plen.max(4096);
         let fd =
             unsafe { libc::memfd_create(b"kime-popup\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
         if fd < 0 {
@@ -477,6 +485,7 @@ impl PopupCanvas {
             fd,
             ptr: ptr as *mut u8,
             len,
+            plen,
             w,
             h,
         })
