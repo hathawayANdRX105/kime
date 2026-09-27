@@ -1560,18 +1560,20 @@ mod tests {
     #[test]
     fn partial_selection_keeps_caret_at_tail() {
         let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihaos".chars() {
+        // nihaoni：[ni,hao,ni] 分段，唯一候选 你好（fixture 无单字「你」），
+        // 选词消耗 ni+hao，剩 "ni"
+        for c in "nihaoni".chars() {
             e.key(k(c));
         }
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected Commit(你好), got {:?}", other),
         }
-        assert_eq!(e.letters, "s", "剩余拼音必须保留");
+        assert_eq!(e.letters, "ni", "剩余拼音必须保留");
         assert_eq!(e.cursor(), e.letters.len(), "光标必须在剩余拼音末尾");
         assert_eq!(e.preedit_cursor(), e.letters.len());
         e.key(k('h'));
-        assert_eq!(e.letters, "sh", "新字符续在剩余拼音尾部");
+        assert_eq!(e.letters, "nih", "新字符续在剩余拼音尾部");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1610,12 +1612,14 @@ mod tests {
     #[test]
     fn backspace_partial_selection_undoes_in_order() {
         let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihaos".chars() {
+        for c in "nihaoni".chars() {
             e.key(k(c));
         }
         assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
-        assert_eq!(e.letters, "s");
-        // 剩余拼音 s 先按普通退格删掉
+        assert_eq!(e.letters, "ni");
+        // 剩余拼音 ni 先按普通退格删掉
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "n");
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         assert!(e.letters.is_empty());
         // 此时退格弹的是选词消耗段
