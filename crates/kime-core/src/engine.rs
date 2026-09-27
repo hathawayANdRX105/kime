@@ -99,7 +99,8 @@ pub struct Engine {
     last_commit: Option<(String, String)>,
     /// fcitx5 式词级撤销：最近若干次「选词」各自消耗的拼音键串（LIFO，
     /// 全拼 = 消耗字母、双拼 = 消耗键位）。组合空时 Backspace 弹栈顶重新
-    /// 进 letters（可再选词、也可继续组词）；清组合整栈清空。
+    /// 进 letters（可再选词、也可继续组词）。栈是提交历史而非组合状态：
+    /// 清组合（Esc / Shift-flush / Enter 原样）不触碰它。
     undo_consumed: Vec<String>,
 }
 
@@ -229,8 +230,9 @@ impl Engine {
         self.cursor = 0;
         self.last_joined.clear();
         self.sp_active = false;
-        // 放弃组合（Esc / 切英文 / Enter 原始上屏）连带丢弃词级撤销历史
-        self.undo_consumed.clear();
+        // undo_consumed 栈不在此触碰：撤销历史是提交历史而非组合状态，
+        // 必须跨组合清空存活（fcitx5 对齐：mangowm 焦点抖动高频 ACTIVATE/DEACTIVATE，
+        // shell ACTIVATE 路径喂合成 Esc 清组合，若顺带清栈则上屏词永远退不回拼音）。
     }
 
     /// 选词上屏：learn + 清空候选/页码，但**只消耗被选候选覆盖的音节**，
@@ -1648,19 +1650,65 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// 清组合（Esc 有组合时）连带丢弃词级撤销历史，避免跨话题误弹旧拼音。
+    /// 清组合不触碰词级撤销栈（提交历史）：Esc 清掉新组合后，组合空时
+    /// Backspace 仍能弹回选词消耗的拼音（候选重建）。
     #[test]
-    fn esc_with_composition_drops_undo_stack() {
+    fn esc_with_composition_keeps_undo_stack() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
         }
-        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
         assert!(e.letters.is_empty());
-        // 起一段新组合再 Esc 清掉 → 撤销栈一并丢弃
+        // 起一段新组合再 Esc 清掉（shell ACTIVATE 合成 Esc 同此路径）
         assert_eq!(e.key(k('n')), Outcome::Consumed);
         assert_eq!(e.key(code_k(KEY_ESC)), Outcome::Consumed);
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert!(e.preedit().is_empty());
+        // 组合已清但撤销栈留存：退格弹回选词消耗段
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihao");
+        assert!(
+            e.candidates().iter().any(|c| c.text == "你好"),
+            "弹回后候选必须重建"
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合切英文，
+    /// 不是提交选词；词级撤销栈是提交历史不受影响——切回中文后
+    /// Backspace 弹回选词消耗的拼音。空 letters 的 Shift 只切英文、不清组合，不受本路径影响。
+    #[test]
+    fn shift_flush_keeps_undo_stack() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        // 起一段新组合再 Shift：实测语义 = Commit(原字母) + clear_composition + 切英文
+        assert_eq!(e.key(k('n')), Outcome::Consumed);
+        match e.key(shift_k(KEY_LEFTSHIFT)) {
+            Outcome::Commit(t) => assert_eq!(t, "n", "shift-flush 上屏的是原字母"),
+            other => panic!("expected Commit(n), got {:?}", other),
+        }
+        assert!(!e.chinese());
+        assert!(e.letters.is_empty());
+        // 切回中文：组合空时退格弹回选词消耗段
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihao");
+        assert!(
+            e.candidates().iter().any(|c| c.text == "你好"),
+            "弹回后候选必须重建"
+        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
