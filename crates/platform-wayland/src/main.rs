@@ -289,10 +289,15 @@ impl PopupCanvas {
 
     /// 强制隐藏（deactivate 用）：候选与未清的闪现窗一并抹掉。
     ///
-    /// 焦点抖动（ACTIVATE/DEACTIVATE 高频切换）时合成器挂起的 buffer release
-    /// 不再到达，free[] 卡在 false 且与实际所有权脱节，下一次 present 复用旧
-    /// pool → wl_shm.create_pool invalid arguments 致协议错误崩溃。deactivate
-    /// 是唯一能确定「合成器不再持有我的 buffer」的时刻，重置槽位记账。
+    /// 只清内容；若可见则补画一帧（有闲槽就画 1×1 透明隐藏帧，没闲槽则挂起
+    /// 等 release/frame 补画）。
+    ///
+    /// **不复位 free[]**：刚 attach 上的 buffer 仍被合成器持有，直到它的 release
+    /// 到达。单方面把槽位标记「可用」，下一次 present 就会替换并 drop 这个仍被
+    /// 引用的 WlBuffer（munmap + close + 代理销毁）→ 合成器随后读该 buffer 时撞上
+    /// 已关 fd / 已销毁 buffer，wl_shm 协议错误打死整条连接（#65 的 09-19 崩溃：
+    /// hide 之后第一帧 present 即 create_pool 越界）。槽位归还一律由
+    /// on_release / on_frame 驱动。
     fn hide(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         let visible = self.chip.is_some() || !self.content.is_empty() || self.highlight != 0;
         self.chip = None;
@@ -301,9 +306,7 @@ impl PopupCanvas {
         if visible {
             self.present(renderer, qh);
         }
-        // 重置在 present 之后：隐藏帧要先画完，再让槽位回到「全部可用」。
-        // buffer 对象保留（尺寸命中时复用），只重置归属记账。
-        self.free = [true, true];
+        // buffer 对象保留（尺寸命中时复用）；归属记账不动，由 release/frame 归还。
         self.frame = None;
         self.dirty = false;
     }
