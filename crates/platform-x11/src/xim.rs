@@ -273,8 +273,9 @@ where
         let (outcome, preedit) = {
             let mut engine = self.engine.lock();
             let outcome = engine.key(key);
+            // Commit 也要取剩余组合：选词只消耗已选音节时，剩余拼音转为新 preedit
             let preedit = match outcome {
-                Outcome::Consumed => Some(engine.preedit().to_owned()),
+                Outcome::Consumed | Outcome::Commit(_) => Some(engine.preedit().to_owned()),
                 _ => None,
             };
             (outcome, preedit)
@@ -289,9 +290,19 @@ where
                 Ok(true)
             }
             Outcome::Commit(text) => {
-                server.preedit_draw(&mut user_ic.ic, "")?;
                 server.commit(&user_ic.ic, &text)?;
-                self.hide_window();
+                // 先上屏已选词，剩余拼音（若有）转为新的组合显示——fcitx5 预选行为；
+                // 无剩余则清 preedit 并收候选窗。
+                match preedit {
+                    Some(pe) if !pe.is_empty() => {
+                        server.preedit_draw(&mut user_ic.ic, &pe)?;
+                        self.update_window();
+                    }
+                    _ => {
+                        server.preedit_draw(&mut user_ic.ic, "")?;
+                        self.hide_window();
+                    }
+                }
                 Ok(true)
             }
             Outcome::Ignored => Ok(false),
