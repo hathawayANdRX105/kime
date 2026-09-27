@@ -1089,7 +1089,8 @@ impl AppState {
         }
         self.grab = None;
         if let Some(c) = &self.conn {
-            c.flush();
+            // 拆除阶段 flush 失败（socket 已死）是预期路径：不 abort 重连流程
+            let _ = c.flush();
         }
     }
 }
@@ -1715,9 +1716,9 @@ enum RunOutcome {
 /// 连一次 wayland、bind 全局对象、跑事件循环,直到:
 ///   - 正常退出(should_exit)→ Done
 ///   - 连接断开(协议错误/合成器重启)→ ConnLost(调用方重连,保住 IME 进程)
-///   - 致命错误(连不上/注册失败)→ Fatal
-/// 收敛核心:mangowm 崩/重启或偶发协议错误时,不再让整个 kime 进程跟着死——
-/// 那样外部 `while :; do` 会反复重拉,每次拉起销毁 vk 又反复踩 mangowm 崩会。
+///   - 致命错误（连不上/注册失败）→ Fatal
+///
+/// 收敛核心：mangowm 崩/重启或偶发协议错误时，不再让整个 kime 进程跟着死——
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,
