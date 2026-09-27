@@ -986,6 +986,18 @@ impl AppState {
         self.layer_shell = None;
         self.popup = None;
         self.badge = None;
+        // zwp_input_method_v2 协议状态同样绑在旧对象上,必须一并复位:
+        // im_serial 按「本对象已发出的 done 事件数」计数,新对象的 done 计数从 0 起。
+        // 若不复位,commit(serial) 携带旧对象的大值,合成器判「serial 与历史 done 数
+        // 不符」→ 不应用 pending 状态 → commit_string 全部被吞,上屏失效(进程不重启则永久)。
+        self.im_serial = 0;
+        self.pending_surrounding = None;
+        self.pending_cause = 0;
+        // 按键记账同理绑在旧 grab 上:复位前窗口(重连→再次 ACTIVATE)里过期的
+        // 长按重复表会在下一次 tick 合成一次幽灵按键;Shift 手势残留同理。
+        // content_type/cursor_rect 仅日志去重、重连即重发,不复位(与 AppState::new 同形)。
+        self.repeat = KeyRepeat::default();
+        self.shift_gesture = ShiftComposer::default();
     }
     /// 正常退出前:显式走协议销毁 vk/im(grab 无显式 destroy,drop 即可)并 flush,
     /// 让 vk 走「协议 destroy」而非「断开连接时服务端自动销毁」,避开 mangowm 崩会路径。
@@ -1777,4 +1789,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重连回归：连接断开重连时，`zwp_input_method_v2` 换新对象，
+    /// 其 done 计数从 0 起。`im_serial` 若沿用旧对象的大值，`commit(serial)` 会被
+    /// 合成器判为「serial 与历史 done 数不符」→ 不应用 pending 状态 → `commit_string`
+    /// 全部被吞，中文上屏失效且进程不重启就永久。同族风险：长按重复表/Shift 手势
+    /// 残留在「重连→再次 ACTIVATE」窗口里合成幽灵按键。此测试钉住「重连必须把
+    /// 绑定在旧连接上的协议状态与按键记账复位回初值」。
+    #[test]
+    fn reconnect_reset_restores_connection_state() {
+        let mut app = AppState::new(None, Renderer::new());
+
+        // 模拟旧连接累积的脏状态
+        app.im_serial = 47;
+        app.pending_surrounding = Some(("abc".into(), 1usize));
+        app.pending_cause = 2;
+        app.repeat.arm(30, 1_000);
+        app.shift_gesture.on_shift_press(1_000);
+
+        app.reset_wayland_objects();
+
+        // 必须精确回到新对象/新连接初值（与 AppState::new 的初始化一致）
+        assert_eq!(
+            app.im_serial, 0,
+            "im_serial 未随重连复位 → commit serial 失配，上屏被吞"
+        );
+        assert!(
+            app.pending_surrounding.is_none(),
+            "pending_surrounding 未随重连复位"
+        );
+        assert_eq!(app.pending_cause, 0, "pending_cause 未随重连复位");
+        assert!(
+            app.repeat.next_due().is_none(),
+            "长按重复表未随重连复位 → 复位前窗口合成幽灵按键"
+        );
+        assert!(!app.shift_gesture.active(), "Shift 手势未随重连复位");
+    }
 }
