@@ -99,8 +99,11 @@ pub struct Engine {
     last_commit: Option<(String, String)>,
     /// fcitx5 式词级撤销：最近若干次「选词」各自消耗的拼音键串（LIFO，
     /// 全拼 = 消耗字母、双拼 = 消耗键位）。组合空时 Backspace 弹栈顶重新
-    /// 进 letters（可再选词、也可继续组词）。栈是提交历史而非组合状态：
-    /// 清组合（Esc / Shift-flush / Enter 原样）不触碰它。
+    /// 进 letters（可再选词、也可继续组词）。
+    /// 生命周期 = 一个「输入串」（burst）：选词 push（cap 64）；输入串结束
+    ///（标点上屏 / Enter 原样上屏 / Shift-flush 原样上屏 / 空组合 Shift 翻转中英）
+    /// 清空；Esc 清组合与同实例焦点抖动**保留**（#70 契约）；真实切应用（新 IM
+    /// 实例 / 重连）由壳调 [`Self::clear_undo`] 清空。
     undo_consumed: Vec<String>,
 }
 
@@ -113,6 +116,31 @@ impl Engine {
     /// 诊断/测试用：词图格子缓存是否为空。
     pub fn span_cache_is_empty(&self) -> bool {
         self.span_cache.is_empty()
+    }
+
+    /// 诊断/测试用：当前拼音字母串（KIME_DEBUG 状态日志用）。
+    pub fn letters(&self) -> &str {
+        &self.letters
+    }
+
+    /// 诊断/测试用：词级撤销栈深度（KIME_DEBUG 状态日志用）。
+    pub fn undo_depth(&self) -> usize {
+        self.undo_consumed.len()
+    }
+
+    /// 诊断/测试用：词级撤销栈顶（最近一次选词消耗的拼音键串）。
+    pub fn undo_top(&self) -> Option<&str> {
+        self.undo_consumed.last().map(String::as_str)
+    }
+
+    /// 清空词级撤销栈。
+    ///
+    /// 壳在「真实切应用 / IM 重连」（全新输入串开始）时调用：旧 burst 的
+    /// 撤销历史不得跨应用边界存活——否则用户没输入任何键，退格就把旧词
+    /// 弹进面板（v0.19.68 回归，投诉 2）。Esc / 同实例焦点抖动**不走**此路
+    /// （栈必须跨组合清空存活，#70 契约，见 [`Self::clear_composition`]）。
+    pub fn clear_undo(&mut self) {
+        self.undo_consumed.clear();
     }
 
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -320,12 +348,16 @@ impl Engine {
             && (k.code == KEY_LEFTSHIFT || k.code == KEY_RIGHTSHIFT)
         {
             if self.letters.is_empty() {
+                // 空组合 Shift 翻转（中↔英双向）= 话题切换、输入串结束：清空撤销栈
+                self.undo_consumed.clear();
                 self.chinese = !self.chinese;
                 return Outcome::Consumed;
             }
             let text = self.letters.clone();
             self.clear_composition();
             self.chinese = false;
+            // Shift-flush 原样上屏 = 输入串结束：清空撤销栈
+            self.undo_consumed.clear();
             return Outcome::Commit(text);
         }
 
@@ -476,6 +508,8 @@ impl Engine {
                 // 英文标点模式：不转换，原样输出（也不维护引号状态）
                 if self.punct_mode == crate::config::PunctMode::English {
                     self.quote_open = None;
+                    // 标点上屏 = 输入串结束：清空撤销栈
+                    self.undo_consumed.clear();
                     return Outcome::Commit(c.to_string());
                 }
                 // 成对引号：map_punct 只给开引号；连着按的第二次在这里换成闭引号。
@@ -489,7 +523,8 @@ impl Engine {
                     _ => mapped,
                 };
                 if self.letters.is_empty() {
-                    // 情况 A：无预编辑串，直接上屏标点
+                    // 情况 A：无预编辑串，直接上屏标点（= 输入串结束：清空撤销栈）
+                    self.undo_consumed.clear();
                     return Outcome::Commit(mapped.to_string());
                 } else {
                     // 有预编辑串，检查是否存在候选词
@@ -498,12 +533,15 @@ impl Engine {
                         // commit_candidate 处理；标点拼到本次提交文本尾。
                         match self.commit_candidate(&top) {
                             Outcome::Commit(t) => {
-                                return Outcome::Commit(format!("{}{}", t, mapped))
+                                // 情况 B 上屏 = 输入串结束：清空撤销栈
+                                self.undo_consumed.clear();
+                                return Outcome::Commit(format!("{}{}", t, mapped));
                             }
                             other => return other,
                         }
                     } else {
-                        // 情况 C：无候选词，字母串+标点上屏
+                        // 情况 C：无候选词，字母串+标点上屏（= 输入串结束：清空撤销栈）
+                        self.undo_consumed.clear();
                         return Outcome::Commit(format!("{}{}", self.letters, mapped));
                     }
                 }
@@ -538,13 +576,15 @@ impl Engine {
         }
         // Enter（code 28）— 上屏原始字母串、面板退出，不提交候选词：
         //   有字母 → 原样上屏（声明「我打的是字母不是拼音」），组合清空、
-        //            面板消失。不转发回车键本身——QQ/微信收到回车会把消息
-        //            直接发出去；要换行由应用自己的后续按键决定。
+        //            面板消失、撤销栈清空（输入串结束）。不转发回车键本身——QQ/微信
+        //            收到回车会把消息直接发出去；要换行由应用自己的后续按键决定。
         //   无字母 → Ignored，回车原样放行。
         if k.ch.is_none() && k.code == 28 {
             if !self.letters.is_empty() {
                 let text = self.letters.clone();
                 self.clear_composition();
+                // Enter 原样上屏 = 输入串结束：清空撤销栈
+                self.undo_consumed.clear();
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
@@ -1678,11 +1718,12 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合切英文，
-    /// 不是提交选词；词级撤销栈是提交历史不受影响——切回中文后
-    /// Backspace 弹回选词消耗的拼音。空 letters 的 Shift 只切英文、不清组合，不受本路径影响。
+    /// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合切英文——
+    /// 输入串随原样上屏结束，词级撤销链随 burst 终止：切回中文（空组合翻转也清栈）
+    /// 后退格放行给应用，不再弹回旧选词的拼音（v0.19.68 前语义是保留，3eb8279
+    /// 的 `shift_flush_keeps_undo_stack` 语义反转）。
     #[test]
-    fn shift_flush_keeps_undo_stack() {
+    fn shift_flush_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1692,7 +1733,8 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert!(e.letters.is_empty());
-        // 起一段新组合再 Shift：实测语义 = Commit(原字母) + clear_composition + 切英文
+        assert_eq!(e.undo_depth(), 1);
+        // 起一段新组合再 Shift：原字母上屏 + 清组合 + 切英文，burst 结束
         assert_eq!(e.key(k('n')), Outcome::Consumed);
         match e.key(shift_k(KEY_LEFTSHIFT)) {
             Outcome::Commit(t) => assert_eq!(t, "n", "shift-flush 上屏的是原字母"),
@@ -1700,15 +1742,70 @@ mod tests {
         }
         assert!(!e.chinese());
         assert!(e.letters.is_empty());
-        // 切回中文：组合空时退格弹回选词消耗段
+        assert_eq!(
+            e.undo_depth(),
+            0,
+            "shift-flush 上屏即输入串结束，撤销链终止"
+        );
+        // 切回中文（空组合翻转同样清栈）：退格放行，不再弹旧词
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
         assert!(e.chinese());
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.letters, "nihao");
-        assert!(
-            e.candidates().iter().any(|c| c.text == "你好"),
-            "弹回后候选必须重建"
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 标点上屏 = 输入串结束：选词后接标点（组合空 → 情况 A 直接上屏标点），
+    /// 撤销链随 burst 终止，退格放行给应用、不再弹回旧选词的拼音。
+    #[test]
+    fn punct_commit_ends_undo_chain() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        assert_eq!(e.undo_depth(), 1, "选词 push 消耗段入栈");
+        // 标点上屏（组合空，情况 A）终结 burst
+        match e.key(k('.')) {
+            Outcome::Commit(t) => assert_eq!(t, "。", "中文标点模式映射 . → 。"),
+            other => panic!("expected Commit(。), got {:?}", other),
+        }
+        assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
+        assert_eq!(
+            e.key(code_k(KEY_BACKSPACE)),
+            Outcome::Ignored,
+            "栈已清，退格放行"
         );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 空组合 Shift 翻转（中→英）= 话题切换、输入串结束：选词后切英文，
+    /// 撤销链终止；切回中文（英→中同样清栈）后退格放行，不再弹旧词。
+    #[test]
+    fn english_toggle_clears_undo_stack() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihao".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Commit, got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        assert_eq!(e.undo_depth(), 1);
+        // 空 letters：Shift 切英文（翻转前清栈）
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(!e.chinese());
+        assert_eq!(e.undo_depth(), 0, "切英文即输入串结束，撤销链终止");
+        // 切回中文：退格放行，不再弹旧词
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
