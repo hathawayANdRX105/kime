@@ -3,9 +3,11 @@
 
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{LazyLock, Mutex};
 
 use kime_core::config::Config;
 use kime_core::dict::Dict;
@@ -107,6 +109,35 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
             let _ = f.set_len(0);
         }
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// KIME_DEBUG=1 状态转移日志：追加写 /tmp/kime-ime-debug.log（写失败静默忽略，
+/// 日志不许卡键流）。main() 启动读一次 env 落进 [`DEBUG`]；关闭时每个调用点
+/// 一次静态读就返回——零文件 I/O、零格式化、零分配。
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// 惰性打开的追加写句柄（首条日志时打开，之后常驻；进程退出随析构 flush）。
+static DEBUG_FILE: LazyLock<Mutex<Option<BufWriter<File>>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 记一条 KIME_DEBUG 状态日志（行内容由闭包**惰性**构造：关着时连格式化都不做）。
+fn debug_log(line: impl FnOnce() -> String) {
+    if !DEBUG.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut guard = DEBUG_FILE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/kime-ime-debug.log")
+            .ok()
+            .map(BufWriter::new);
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{}", line());
     }
 }
 
@@ -449,6 +480,10 @@ struct AppState {
     conn: Option<Connection>,
     input_method_manager: Option<ZwpInputMethodManagerV2>,
     input_method: Option<ZwpInputMethodV2>,
+    /// 最近一次 ACTIVATE 的 IM 实例（记录 wayland 对象 id）：ACTIVATE 时实例 id
+    /// 变化 = 真实切应用（新 IM 实例）→ `engine.clear_undo()`（旧 burst 的撤销链
+    /// 不得跨应用边界）；同实例焦点抖动不清（#70 契约）。DEACTIVATE 不改此字段。
+    im_instance: Option<ZwpInputMethodV2>,
     grab: Option<ZwpInputMethodKeyboardGrabV2>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
     vk: Option<ZwpVirtualKeyboardV1>,
@@ -515,6 +550,7 @@ impl AppState {
             conn: None,
             input_method_manager: None,
             input_method: None,
+            im_instance: None,
             grab: None,
             vk_manager: None,
             vk: None,
@@ -923,6 +959,22 @@ impl AppState {
             }
         };
         key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
+        // KIME_DEBUG 状态快照（关着时闭包不会执行，零开销）：键码/字符/outcome +
+        // 引擎状态 {letters, preedit, cursor, undo_depth, undo_top}，供远端诊断
+        // 逐键还原状态转移。
+        if let Some(engine) = self.engine.as_ref() {
+            let undo_top = engine.undo_top().unwrap_or("-");
+            debug_log(|| {
+                format!(
+                    "key code={code} ch={ch:?} -> {outcome:?} | letters={:?} preedit={:?} cursor={} undo=[{}, {}]",
+                    engine.letters(),
+                    engine.preedit(),
+                    engine.cursor(),
+                    engine.undo_depth(),
+                    undo_top,
+                )
+            });
+        }
         // 消费之后组合是否还在：重复只在「组合内编辑键」起表（契约）。
         let composing = self
             .engine
@@ -992,6 +1044,12 @@ impl AppState {
     fn reset_wayland_objects(&mut self) {
         self.input_method_manager = None;
         self.input_method = None;
+        self.im_instance = None;
+        // 重连 = 全新 IM 实例：引擎进程内保留，但旧 burst 的撤销栈必须随之作废
+        // （重连后首个 ACTIVATE 的 im_instance 比较基准已清空，不会误清/漏清）。
+        if let Some(engine) = self.engine.as_mut() {
+            engine.clear_undo();
+        }
         self.grab = None;
         self.vk_manager = None;
         self.vk = None;
@@ -1002,6 +1060,7 @@ impl AppState {
         self.layer_shell = None;
         self.popup = None;
         self.badge = None;
+        debug_log(|| "wayland conn-lost -> reset objects (engine kept, clear_undo)".to_string());
     }
     /// 正常退出前:显式走协议销毁 vk/im(grab 无显式 destroy,drop 即可)并 flush,
     /// 让 vk 走「协议 destroy」而非「断开连接时服务端自动销毁」,避开 mangowm 崩会路径。
@@ -1164,7 +1223,31 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
         match event {
             ZwpInputMethodEvent::Activate => {
                 log("input_method ACTIVATE");
+                // 真实切应用 = 新 IM 实例（id 变化）：旧 burst 的撤销栈不得跨应用
+                // 边界——否则用户没输入任何键，退格就弹旧词出面板。同实例焦点
+                // 抖动（mangowm 高频 ACTIVATE/DEACTIVATE）不清（#70 契约）。
+                let switched = match state.im_instance.as_ref() {
+                    Some(old) => old.id() != im.id(),
+                    None => false,
+                };
+                if switched {
+                    if let Some(engine) = state.engine.as_mut() {
+                        engine.clear_undo();
+                    }
+                }
                 state.input_method = Some(im.clone());
+                state.im_instance = Some(im.clone());
+                debug_log(|| {
+                    format!(
+                        "ACTIVATE im#{} -> {}",
+                        im.id(),
+                        if switched {
+                            "new instance -> clear_undo"
+                        } else {
+                            "same instance (no clear)"
+                        }
+                    )
+                });
                 state.ensure_engine();
                 state.ensure_popup(im, qh);
                 let grab = im.grab_keyboard(qh, ());
@@ -1176,6 +1259,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             }
             ZwpInputMethodEvent::Deactivate => {
                 log("input_method DEACTIVATE");
+                // DEACTIVATE 不动撤销栈（焦点抖动安全，#70）：只清组合。
+                debug_log(|| format!("DEACTIVATE im#{}", im.id()));
                 state.grab = None;
                 state.repeat.clear();
                 state.shift_gesture.reset();
@@ -1768,6 +1853,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         log(&format!("目标 seat: {s}"));
     } else {
         log("使用默认 seat");
+    }
+    // KIME_DEBUG=1：状态转移日志开关，启动读一次 env（之后按键路径零 env 读取）。
+    DEBUG.store(std::env::var_os("KIME_DEBUG").is_some(), Ordering::Relaxed);
+    if DEBUG.load(Ordering::Relaxed) {
+        log("KIME_DEBUG=1: 状态日志追加写 /tmp/kime-ime-debug.log");
     }
 
     // 冷路径预热前移到进程启动:候选窗首渲 CJK 扩展区字形页时缺字 fallback 全字体

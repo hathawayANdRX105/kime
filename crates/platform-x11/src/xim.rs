@@ -5,6 +5,7 @@
 //! selected Chinese text back to the focused XIM client.
 
 use std::error::Error;
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -26,6 +27,37 @@ const XIM_FORWARD_KEY_PRESS: u32 = 1;
 const X11_KEYCODE_OFFSET: u32 = 8;
 const KEY_ESC: u32 = 1;
 
+/// KIME_DEBUG=1 状态转移日志：X11 前端自写自己的文件 /tmp/kime-ime-debug-x11.log
+///（与 wayland 前端 /tmp/kime-ime-debug.log 同形、各写各的，互不截断）。
+/// 写失败静默忽略，日志不许卡键流。`X11IM::new` 启动读一次 env。
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 惰性打开的追加写句柄（首条日志时打开；进程退出随析构 flush）。
+static DEBUG_FILE: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 记一条 KIME_DEBUG 状态日志（行内容由闭包**惰性**构造：关着时零文件 I/O）。
+fn debug_log(line: impl FnOnce() -> String) {
+    if !DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut guard = DEBUG_FILE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/kime-ime-debug-x11.log")
+            .ok()
+            .map(std::io::BufWriter::new);
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{}", line());
+    }
+}
+
 pub struct X11IM {
     conn: Arc<RustConnection>,
     server: X11rbServer<Arc<RustConnection>>,
@@ -40,7 +72,11 @@ impl X11IM {
         screen_num: usize,
         engine: Engine,
     ) -> Result<Self, Box<dyn Error>> {
-        let server = X11rbServer::init(conn.clone(), screen_num, IM_NAME, xim::ALL_LOCALES)?;
+        // KIME_DEBUG=1：状态转移日志开关，启动读一次 env（之后按键路径零 env 读取）。
+        DEBUG.store(
+            std::env::var_os("KIME_DEBUG").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // 候选窗创建失败只降级（无候选窗、仅 preedit），不拖垮 IM 主循环。
         let window = match CandidateWindow::new(conn.clone(), screen_num) {
             Ok(w) => Some(w),
@@ -74,6 +110,10 @@ struct Handler {
     keyboard: xkb::State,
     /// None = 候选窗不可用（降级到纯 preedit 模式）
     window: Option<CandidateWindow>,
+    /// 最近一次 set_focus 的输入上下文 id（每个 XIM 应用一个 IC）。
+    /// 同应用焦点抖动（同一 IC 反复 set/unset focus）不清撤销栈（#70 契约）；
+    /// 换应用（新 IC 的 set_focus）= 真实切应用 → `engine.clear_undo()`。
+    last_ic_id: Option<u16>,
 }
 
 impl Handler {
@@ -94,6 +134,7 @@ impl Handler {
             engine: Arc::new(Mutex::new(engine)),
             keyboard: xkb::State::new(&keymap),
             window,
+            last_ic_id: None,
         }
     }
 
@@ -203,6 +244,13 @@ where
         server.preedit_draw(&mut user_ic.ic, "")?;
         self.hide_window();
         self.clear_composition();
+        // 被销毁的 IC 若正是当前焦点 IC：它的输入串已结束，撤销栈随之作废。
+        let ic_id = user_ic.ic.input_context_id().get();
+        if self.last_ic_id == Some(ic_id) {
+            self.engine.lock().clear_undo();
+            self.last_ic_id = None;
+        }
+        debug_log(|| format!("DESTROY_IC ic#{ic_id}"));
         Ok(())
     }
 
@@ -230,6 +278,24 @@ where
         server.preedit_draw(&mut user_ic.ic, "")?;
         self.hide_window();
         self.clear_composition();
+        // 真实切应用 = 新输入上下文（换应用才有新 IC）：旧 burst 的撤销栈不得
+        // 跨应用边界。同应用焦点抖动（同一 IC 反复 set/unset focus）不清栈（#70）。
+        let ic_id = user_ic.ic.input_context_id().get();
+        let switched = self.last_ic_id != Some(ic_id);
+        if switched {
+            self.engine.lock().clear_undo();
+        }
+        self.last_ic_id = Some(ic_id);
+        debug_log(|| {
+            format!(
+                "SET_FOCUS ic#{ic_id} -> {}",
+                if switched {
+                    "new ic -> clear_undo"
+                } else {
+                    "same ic (no clear)"
+                }
+            )
+        });
         Ok(())
     }
 
@@ -241,6 +307,9 @@ where
         server.preedit_draw(&mut user_ic.ic, "")?;
         self.hide_window();
         self.clear_composition();
+        // 不动撤销栈（焦点抖动安全，#70）：last_ic_id 保留，同应用重新聚焦
+        // （set_focus 同 ic id）不会误清。
+        debug_log(|| format!("UNSET_FOCUS ic#{}", user_ic.ic.input_context_id().get()));
         Ok(())
     }
 
@@ -280,6 +349,23 @@ where
             };
             (outcome, preedit)
         };
+
+        // KIME_DEBUG 状态快照（关着时闭包不执行，零开销）：键 + outcome + 引擎状态
+        // {letters, preedit, cursor, undo_depth, undo_top}，与 wayland 前端同形。
+        debug_log(|| {
+            let engine = self.engine.lock();
+            format!(
+                "key code={} ch={:?} -> {:?} | letters={:?} preedit={:?} cursor={} undo=[{}, {}]",
+                key.code,
+                key.ch,
+                outcome,
+                engine.letters(),
+                engine.preedit(),
+                engine.cursor(),
+                engine.undo_depth(),
+                engine.undo_top().unwrap_or("-"),
+            )
+        });
 
         match outcome {
             Outcome::Consumed => {
