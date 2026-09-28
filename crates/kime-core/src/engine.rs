@@ -358,16 +358,17 @@ impl Engine {
             && (k.code == KEY_LEFTSHIFT || k.code == KEY_RIGHTSHIFT)
         {
             if self.letters.is_empty() {
-                // 空组合 Shift 翻转（中↔英双向）= 话题切换、输入串结束：清空撤销栈
-                self.undo_consumed.clear();
+                // 空组合 Shift 翻转（中↔英双向）= 话题切换。#77 不变式
+                // （letters 空 ⟹ 栈空，由 clear_composition 保证）已清栈，
+                // 此处不再冗余清栈——冗余行会掩盖不变式被破坏的 bug。
                 self.chinese = !self.chinese;
                 return Outcome::Consumed;
             }
             let text = self.letters.clone();
+            // 清组合（#77 起同步清撤销栈）+ 切英文：Shift-flush 原样上屏
+            // = 输入串结束，撤销链随组合消亡。
             self.clear_composition();
             self.chinese = false;
-            // Shift-flush 原样上屏 = 输入串结束：清空撤销栈
-            self.undo_consumed.clear();
             return Outcome::Commit(text);
         }
 
@@ -544,8 +545,8 @@ impl Engine {
                     _ => mapped,
                 };
                 if self.letters.is_empty() {
-                    // 情况 A：无预编辑串，直接上屏标点（= 输入串结束：清空撤销栈）
-                    self.undo_consumed.clear();
+                    // 情况 A：无预编辑串，直接上屏标点。#77 不变式
+                    // （letters 空 ⟹ 栈空）保证撤销栈已空，不冗余清栈。
                     return Outcome::Commit(mapped.to_string());
                 } else {
                     // 有预编辑串，检查是否存在候选词
