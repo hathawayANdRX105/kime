@@ -38,6 +38,11 @@ pub struct Config {
     /// 标点模式：chinese = 全角中文标点，english = 原样 ASCII 标点
     #[serde(default = "default_punct_mode")]
     pub punct_mode: PunctMode,
+    /// jev 语义门控端点（OpenAI 兼容 /v1/chat/completions）；None = mine-lm 不门控（纯计数）
+    pub jev_endpoint: Option<String>,
+    /// jev 模型名称（默认 jev-latest）
+    #[serde(default = "default_jev_model")]
+    pub jev_model: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +72,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         let dict_path = std::env::var("HOME")
@@ -85,6 +94,8 @@ impl Default for Config {
             page_size: 10,
             candidate_limit: 50,
             punct_mode: PunctMode::Chinese,
+            jev_endpoint: None,
+            jev_model: "jev-latest".to_string(),
         }
     }
 }

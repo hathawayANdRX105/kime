@@ -4,6 +4,7 @@
 //!   kime build-dict --in <sqlite> --out <bin>
 //!   kime config <list|get KEY|set KEY VALUE>
 //!   kime english [--dict <path>] <字母串>...
+//!   kime mine-lm [--dict <path>] [--jev] [--jev-endpoint <url>] [--jev-key <key>]
 //!   kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
 //!
@@ -179,22 +180,55 @@ fn main() -> ExitCode {
         }
         Some("mine-lm") => {
             let mut dict_path: Option<PathBuf> = None;
+            let mut jev_enabled = false;
+            let mut jev_endpoint: Option<String> = None;
+            let mut jev_key: Option<String> = None;
             let mut sub_args = args_iter.peekable();
             while let Some(arg) = sub_args.next() {
-                if arg == "--dict" {
-                    dict_path = sub_args.next().map(PathBuf::from);
+                match arg.as_str() {
+                    "--dict" => dict_path = sub_args.next().map(PathBuf::from),
+                    // jev 语义门控（#88）：准入候选先过 jev 判定再学库；
+                    // 端点 = CLI 覆盖 > config.jev_endpoint；key = CLI > KIME_JEV_KEY
+                    // 环境变量（凭据不落 config/词库/任何提交文件）
+                    "--jev" => jev_enabled = true,
+                    "--jev-endpoint" => jev_endpoint = sub_args.next().map(String::from),
+                    "--jev-key" => jev_key = sub_args.next().map(String::from),
+                    _ => {}
                 }
             }
             let path = dict_path.unwrap_or_else(default_dict_path);
+            let gate: Option<kime_core::lm::Jeving> = if jev_enabled {
+                let config = Config::load();
+                let endpoint = match jev_endpoint.or(config.jev_endpoint) {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        eprintln!(
+                            "mine-lm: --jev 需要端点（config jev_endpoint 或 --jev-endpoint）"
+                        );
+                        return ExitCode::from(2);
+                    }
+                };
+                let key = jev_key.or_else(|| std::env::var("KIME_JEV_KEY").ok());
+                Some(kime_core::lm::Jeving::new(endpoint, config.jev_model, key))
+            } else {
+                None
+            };
             let start = std::time::Instant::now();
             return match Dict::open(&path) {
-                Ok(d) => match kime_core::lm::mine(d.conn()) {
+                Ok(d) => match kime_core::lm::mine_gated(d.conn(), gate.as_ref()) {
                     Ok(st) => {
                         eprintln!(
                             "mined: log {} rows, admitted {} pairs, tail_mined {} pairs, evicted {}, purged {}, gen {} in {:?}",
                             st.log_rows, st.admitted, st.tail_mined, st.evicted, st.purged_rows,
                             st.generation, start.elapsed()
                         );
+                        // 无 --jev 时不打印这行：无门控路径输出与合入前一致
+                        if gate.is_some() {
+                            eprintln!(
+                                "jev gate: rejected {} pairs, fallback {} pairs",
+                                st.jev_gated, st.jev_skipped
+                            );
+                        }
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
