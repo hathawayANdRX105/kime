@@ -348,7 +348,10 @@ impl Engine {
         if quote_key != self.quote_open {
             self.quote_open = None;
         }
-        // Shift 单独按下：无组合时切中英；有预编辑时上屏原串再切英文。
+        // Shift 单独按下（#83 起无持久模式）：无组合 = 空操作（轻点锁死根子
+        // 已删：英文字母靠「按住 Shift 打字」临时透传表达，壳层手势裁决层
+        // 也不再补交切模式）；有组合 = 上屏原字母串（输入串结束，撤销链
+        // 随组合消亡），模式不变。
         if k.ch.is_none()
             && k.shift
             && !k.ctrl
@@ -356,21 +359,16 @@ impl Engine {
             && (k.code == KEY_LEFTSHIFT || k.code == KEY_RIGHTSHIFT)
         {
             if self.letters.is_empty() {
-                // 空组合 Shift 翻转（中↔英双向）= 话题切换。#77 不变式
-                // （letters 空 ⟹ 栈空，由 clear_composition 保证）已清栈，
-                // 此处不再冗余清栈——冗余行会掩盖不变式被破坏的 bug。
-                self.chinese = !self.chinese;
                 return Outcome::Consumed;
             }
             let text = self.letters.clone();
-            // 清组合（#77 起同步清撤销栈）+ 切英文：Shift-flush 原样上屏
-            // = 输入串结束，撤销链随组合消亡。
+            // 清组合（#77 起同步清撤销栈）：Shift-flush 原样上屏 = 输入串结束。
             self.clear_composition();
-            self.chinese = false;
             return Outcome::Commit(text);
         }
 
-        // 英文模式：除上面已处理的 shift 外，其余键一律放行。
+        // 英文模式（#83 起休眠：chinese 恒 true，本分支不可达；保留待后续
+        // 模式系统清理）：其余键一律放行。
         if !self.chinese {
             self.quote_open = None;
             return Outcome::Ignored;
@@ -1492,18 +1490,14 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
+    /// #83：双拼模式下空组合 Shift = 空操作（无持久模式），拼音照常可打
+    /// （旧用例断言「Shift 切英文后双拼停用」——模式已删）。
     #[test]
-    fn english_mode_disables_shuangpin() {
+    fn shift_empty_is_noop_shuangpin() {
         let (mut e, db, yaml) = engine_with_shuangpin_fixture();
-        e.key(shift_k(KEY_LEFTSHIFT)); // 切换到英文模式
-                                       // 英文模式下所有按键 Ignored，所有状态清空
-        assert!(!e.chinese());
-        assert!(e.preedit().is_empty());
-        assert!(e.candidates().is_empty());
-        // 测试字母按键 Ignored
-        assert_eq!(e.key(k('a')), Outcome::Ignored);
-        // 测试数字按键 Ignored
-        assert_eq!(e.key(k('1')), Outcome::Ignored);
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(k('n')), Outcome::Consumed, "双拼音照常累积");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1817,10 +1811,11 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合切英文——
-    /// 输入串随原样上屏结束，词级撤销链随 burst 终止：切回中文（空组合翻转也清栈）
-    /// 后退格放行给应用，不再弹回旧选词的拼音（v0.19.68 前语义是保留，3eb8279
-    /// 的 `shift_flush_keeps_undo_stack` 语义反转）。
+    /// Shift-flush 路径（#83 起不切模式）：letters 非空时 Shift 走
+    /// Commit(**原字母**) + 清组合——输入串随原样上屏结束，词级撤销链
+    /// 随 burst 终止；模式保持中文，退格放行给应用，不再弹回旧选词拼音
+    /// （v0.19.68 前语义是保留，3eb8279 的 `shift_flush_keeps_undo_stack`
+    /// 语义反转；#83 再删掉切英文半边）。
     #[test]
     fn shift_flush_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -1833,21 +1828,19 @@ mod tests {
         }
         assert_eq!(e.letters, "ni", "部分选词剩拼音，撤销链在栈上");
         assert_eq!(e.undo_depth(), 1);
-        // 剩余组合在、直接 Shift：原字母上屏 + 清组合 + 切英文，burst 结束
+        // 剩余组合在、直接 Shift：原字母上屏 + 清组合，模式不变，burst 结束
         match e.key(shift_k(KEY_LEFTSHIFT)) {
             Outcome::Commit(t) => assert_eq!(t, "ni", "shift-flush 上屏的是原字母"),
             other => panic!("expected Commit(ni), got {:?}", other),
         }
-        assert!(!e.chinese());
+        assert!(e.chinese(), "#83 起 Shift 不切模式");
         assert!(e.letters.is_empty());
         assert_eq!(
             e.undo_depth(),
             0,
             "shift-flush 上屏即输入串结束，撤销链终止"
         );
-        // 切回中文（空组合翻转同样清栈）：退格放行，不再弹旧词
-        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(e.chinese());
+        // 退格放行，不再弹旧词
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
@@ -1881,11 +1874,10 @@ mod tests {
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
-    /// 空组合 Shift 翻转（中→英）= 话题切换、输入串结束：部分选词撤销
-    /// 弹栈（#79 起带应用删除）后删净剩余拼音，切英文（翻转清栈）后
-    /// 切回中文，退格放行不弹旧词。
+    /// 弹选词删净剩余拼音后撤销链自净（#80 LIFO）；#83 起空组合
+    /// Shift = 无动作（无翻转、不清栈、不切模式），拼音照常可打。
     #[test]
-    fn english_toggle_clears_undo_stack() {
+    fn backspace_to_empty_no_mode_path() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihaoni".chars() {
             e.key(k(c));
@@ -1902,42 +1894,32 @@ mod tests {
         }
         assert!(e.letters.is_empty());
         assert_eq!(e.undo_depth(), 0, "链已随弹栈净");
-        // 空 letters：Shift 切英文（翻转清栈，硬终结点维持）
+        // 空 letters：Shift 无动作（#83：无持久模式），拼音照常可打
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(!e.chinese());
-        assert_eq!(e.undo_depth(), 0, "切英文即输入串结束，撤销链终止");
-        // 切回中文：退格放行，不再弹旧词
-        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(e.chinese());
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert!(e.chinese(), "无路径能切英文模式");
+        assert_eq!(e.key(k('n')), Outcome::Consumed, "中文模式照常吃拼音");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
+    /// #83：空组合 Shift = 空操作（轻点锁死根子删除）——模式恒中文。
     #[test]
-    fn shift_toggles_to_english() {
+    fn shift_tap_is_noop() {
         let (mut e, db, yaml) = engine_with_fixture();
         assert!(e.chinese());
-        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(!e.chinese());
+        for _ in 0..3 {
+            assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        }
+        assert!(e.chinese(), "轻点 Shift 不切模式");
+        assert_eq!(e.key(k('n')), Outcome::Consumed, "拼音照常");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
+    /// Shift 冲刷（原串上屏）后模式保持中文，后续按键照常进拼音
+    /// （旧断言「切英文后字母 Ignored」已随 #83 删除）。
     #[test]
-    fn english_mode_passes_keys_through() {
-        let (mut e, db, yaml) = engine_with_fixture();
-        e.key(shift_k(KEY_LEFTSHIFT)); // → english
-        assert!(!e.chinese());
-        assert_eq!(e.key(k('a')), Outcome::Ignored);
-        assert!(e.preedit().is_empty());
-        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Ignored);
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn shift_with_active_composition_commits_raw_and_switches() {
+    fn shift_with_active_composition_commits_raw() {
         let (mut e, db, yaml) = engine_with_fixture();
         e.key(k('n'));
         let mut alt_n = k('n');
@@ -1947,9 +1929,9 @@ mod tests {
         e.key(k('h'));
         assert!(e.chinese());
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Commit("nh".into()));
-        assert!(!e.chinese());
+        assert!(e.chinese(), "#83 起冲刷不切模式");
         assert!(e.preedit().is_empty());
-        assert_eq!(e.key(k('a')), Outcome::Ignored);
+        assert_eq!(e.key(k('a')), Outcome::Consumed, "仍是中文拼音");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }

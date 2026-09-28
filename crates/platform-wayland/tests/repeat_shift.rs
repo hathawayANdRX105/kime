@@ -83,18 +83,18 @@ fn clear_drops_pending_repeat() {
     assert_eq!(r.tick(REPEAT_DELAY_MS), None);
 }
 
-// ---------- Shift 手势：tap 切换 vs hold 临时英文 ----------
+// ---------- Shift 手势：tap 无动作 / hold 临时英文（#83 起无持久模式） ----------
 
 fn armed(c: &ShiftComposer) -> bool {
     matches!(c.gesture, ShiftGesture::Armed { .. })
 }
 
 #[test]
-fn shift_tap_resolves_to_toggle() {
+fn shift_tap_is_noop() {
     let mut c = ShiftComposer::default();
     assert!(c.on_shift_press(100));
     assert!(armed(&c));
-    assert_eq!(c.on_shift_release(), ShiftRelease::Toggle);
+    assert_eq!(c.on_shift_release(), ShiftRelease::NoToggle);
     assert_eq!(c.gesture, ShiftGesture::Idle);
 }
 
@@ -125,7 +125,7 @@ fn both_shifts_only_last_release_resolves() {
     assert!(c.on_shift_press(0)); // 左 Shift
     assert!(c.on_shift_press(10)); // 右 Shift（不重置 press_time，不叠 Armed）
     assert_eq!(c.on_shift_release(), ShiftRelease::None); // 左松开：右还按着
-    assert_eq!(c.on_shift_release(), ShiftRelease::Toggle); // 最后松开才裁决
+    assert_eq!(c.on_shift_release(), ShiftRelease::NoToggle); // 最后松开仍无动作
 }
 
 #[test]
@@ -146,11 +146,11 @@ fn key_press_while_idle_is_not_gesture_taken() {
 fn tap_after_tap_rearms() {
     let mut c = ShiftComposer::default();
     c.on_shift_press(0);
-    assert_eq!(c.on_shift_release(), ShiftRelease::Toggle);
+    assert_eq!(c.on_shift_release(), ShiftRelease::NoToggle);
     // 下一轮点击同样成立（手势复位干净）。
     c.on_shift_press(1000);
     assert!(armed(&c));
-    assert_eq!(c.on_shift_release(), ShiftRelease::Toggle);
+    assert_eq!(c.on_shift_release(), ShiftRelease::NoToggle);
 }
 
 #[test]
