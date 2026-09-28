@@ -34,6 +34,14 @@ fn tmp_db(suffix: &str) -> std::path::PathBuf {
     path
 }
 
+/// MockServer 的 drop 在 `#[tokio::test]` 异步上下文里执行 `block_on(verify)` 会 panic
+///（tokio 不允许在 async 上下文 drop 运行时）——挪到裸线程里 drop 出运行时。
+fn drop_server(server: MockServer) {
+    std::thread::spawn(move || {
+        drop(server);
+    });
+}
+
 fn bigram_count(d: &Dict, prev: &str, next: &str) -> i64 {
     d.conn()
         .query_row(
@@ -99,6 +107,7 @@ async fn jev_gate_rejects_low_confidence() {
     assert_eq!(st.jev_skipped, 0, "端点可达，无降级");
     assert_eq!(bigram_count(&d, "项目", "进度"), 0, "被拒对不入 bigram");
     assert_eq!(log_rows_left(&d), 3, "被拒对的日志行保留（C2 无尾行已删）");
+    drop_server(server);
     let _ = fs::remove_file(&db);
 }
 
@@ -178,6 +187,7 @@ async fn phrase_case(conf: &str, expect_learned: bool) {
         assert_eq!(st.jev_gated, 1, "被组词档拒绝");
         assert_eq!(learned, 0, "词库无「项目进度」");
     }
+    drop_server(server);
     let _ = fs::remove_file(&db);
 }
 
