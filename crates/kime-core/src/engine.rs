@@ -1311,10 +1311,10 @@ impl Engine {
         // eff 降序的前 limit 条；双列稳定合并（池内序原样保留，#87 交错）。
         let mut merged: Vec<Candidate> = cands[..head].to_vec();
         let mut main = cands.iter().skip(head).peekable();
-        for e in &extra {
+        for e in extra.iter() {
             while let Some(n) = main.peek() {
                 if n.eff >= e.eff {
-                    merged.push(n.clone());
+                    merged.push((*n).clone());
                     main.next();
                 } else {
                     break;
@@ -1322,7 +1322,7 @@ impl Engine {
             }
             merged.push(e.clone());
         }
-        merged.extend(main.cloned());
+        merged.extend(main.map(|n| n.clone()));
         merged.truncate(limit);
         *cands = merged;
     }
