@@ -57,6 +57,16 @@ fn ch(c: char) -> Key {
     }
 }
 
+fn ctrl_ch(c: char) -> Key {
+    Key {
+        ch: Some(c),
+        code: 0,
+        shift: false,
+        ctrl: true,
+        alt: false,
+    }
+}
+
 fn code(code: u32) -> Key {
     Key {
         ch: None,
@@ -140,17 +150,19 @@ fn punc_state_cleared_by_second_punc() {
 
 #[test]
 fn delete_removes_after_caret() {
-    // "niha" 按 Delete → 删光标后 1 个拼音字符 → "nia"（防「前删错位」bug：
-    // 误删光标前字符会变 "nih"，与退格/C-h 同向）。
+    // 尾部无前删对象（"niha|"）：Delete 消费但不动串（防吞成应用前删）；
+    // C-b 移到 "nih|a" 后 Delete 删 'a'。防「前删错位」bug：误删光标前
+    // 字符则 C-b 一步后 Delete 变 "ni"（同退格/C-h 方向即回归）。
     let db = tmp_db("del");
     let mut e = engine_with(&db, FIX_ROWS, 10);
     type_str(&mut e, "niha");
     assert_eq!(e.preedit(), "niha");
     assert_eq!(e.key(code(KEY_DELETE)), Outcome::Consumed);
-    assert_eq!(e.preedit(), "nia", "Delete 删光标后字符");
-    // 组合内连续前删到光标前不动：再删 'i'。
+    assert_eq!(e.preedit(), "niha", "尾部 Delete 无前删对象");
+    assert_eq!(e.key(ctrl_ch('b')), Outcome::Consumed);
+    assert_eq!(e.cursor(), 3, "C-b 光标左移一位");
     assert_eq!(e.key(code(KEY_DELETE)), Outcome::Consumed);
-    assert_eq!(e.preedit(), "na");
+    assert_eq!(e.preedit(), "nih", "Delete 删光标后字符");
     let _ = fs::remove_file(&db);
 }
 
