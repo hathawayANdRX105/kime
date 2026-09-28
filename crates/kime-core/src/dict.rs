@@ -40,6 +40,11 @@ fn io_to_sqlite(e: std::io::Error) -> SqliteError {
 const USER_BOOST: u64 = 300_000;
 /// 提频半衰期（天）：连续 30 天不再使用，加成减半；60 天降到 1/4，回落语料位。
 const USER_BOOST_HALF_LIFE_DAYS: f64 = 30.0;
+/// 精确命中加分（#87 交错排序）：候选 pinyin 恰等于查询键（层一）时叠加的排序项，
+/// 量级 = USER_BOOST：一次「用户级」优先——精确块整体在组合词前（「我们去」
+/// 不被「我们确信」压住），但裸频真正到用户量级的高频组合词可以插到精确块内部
+/// 前面（「ni 打 你好」的手感），即 fcitx5/libime 单池打分交错的 kime 等价物。
+const EXACT_BONUS: u64 = USER_BOOST;
 
 /// 「今天」= UNIX 纪元以来的天数。衰减窗口按天推进即可（半衰期本身 30 天粒度）。
 fn today_days() -> u64 {
@@ -504,6 +509,22 @@ impl Dict {
         kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
     }
 
+    /// 交错排序键（#87）：`cand_cmp` 之上再叠加「pinyin 恰等于查询键 `joined`」的
+    /// `EXACT_BONUS`——层一精确块候选与层二组合词进同一个池子全局混排，
+    /// 高频组合词可插队到低频精确项之前，精确项整体仍凭加分压在组合词之上。
+    fn interleave_cmp(&self, a: &Candidate, b: &Candidate, joined: &str) -> std::cmp::Ordering {
+        let bonus = |c: &Candidate| -> i64 {
+            if c.pinyin == joined {
+                EXACT_BONUS as i64
+            } else {
+                0
+            }
+        };
+        let ka = a.eff as i64 + self.lm_boost(a) + bonus(a);
+        let kb = b.eff as i64 + self.lm_boost(b) + bonus(b);
+        kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
+    }
+
     /// 语料总词频。见字段注释：为什么在开库时算。
     pub fn total_freq(&self) -> u64 {
         self.total_freq
@@ -799,18 +820,15 @@ impl Dict {
         rows.collect()
     }
 
-    /// 前缀查询（两层合并）：层一 = key 恰等于输入（joined）的词条，层二 = 合法补全。
-    /// 每层内部 `(freq DESC, text ASC)`，拼接时层一整体在前——合并阶段绝不允许
-    /// 对跨层列表做一次性频率排序（那正是「我们去 被 我们确信 压住」的形态）。
-    /// limit 分配：层一不满时层二填满到 limit；
-    /// 层一溢出时——仅当 tail 非空（还在打最后一个音节）——层二至少保留一半名额，
-    /// 「`mi` 仍要够得着 `min`/`ming` 的字」是显式验收，否则 `mi` 这种几百字的精确块
-    /// 会把补全整段挤出列表。tail 为空 = 音节已收口，层一独占到底。
+    /// 前缀查询（#87 交错排序）：层一 = key 恰等于输入（joined）的词条，层二 = 合法
+    /// 补全。两层各自限 `limit` 进**同一个池**，按 [`Self::interleave_cmp`] 全局混排——
+    /// 层一精确候选带 `EXACT_BONUS`（一次用户级优先）：「我们去」仍压住「我们确信」，
+    /// 但裸频到用户量级的高频组合词可插到精确块内部前面（对齐 fcitx5/libime 的词
+    /// 候选与句候选单池打分交错，取代旧的「层一块拼接 + 层二追加尾部」）。
     ///
-    /// FST 路径与纯 SQLite 内存索引路径必须同语义（上一轮 `lookup_exact` 的 bug 就出在
-    /// 两条路径不一致）。用户词 overlay 按层合并：只有 pinyin == joined 的词进层一，
-    /// 不许在层二借高频插队到精确命中之前；用户词与层一基底同文本时频率以用户词为准、
-    /// 层归属沿用原条目（不许跨层跳跃），且任何与层一重复的文本不进层二。
+    /// FST 路径与纯 SQLite 内存索引路径必须同语义。用户词 overlay 按层合并：只有
+    /// pinyin == joined 的词进层一；用户词与层一基底同文本时频率以用户词为准、
+    /// 层归属沿用原条目，且任何与层一重复的文本不进层二。
     pub fn lookup_prefix(
         &self,
         syllables: &[String],
@@ -847,18 +865,18 @@ impl Dict {
             if exact_dirty {
                 base_exact.sort_by(|a, b| self.cand_cmp(a, b));
             }
-            let l1_cap = if tail.is_empty() {
-                limit
-            } else {
-                limit.div_ceil(2)
-            };
-            let mut out = self.merge_overlay(base_exact, user_exact, l1_cap);
+            // #87 交错：层一/层二各限 limit 进同一个池，按 interleave_cmp 全局
+            // 混排（精确候选带 EXACT_BONUS，高频组合词可插队低频精确项之前）；
+            // 层二文本重复层一的仍剔除（overlay 归属规则不变）。
+            let exact_pool = self.merge_overlay(base_exact, user_exact, limit);
             let l1_texts: std::collections::HashSet<&str> =
-                out.iter().map(|c| c.text.as_str()).collect();
+                exact_pool.iter().map(|c| c.text.as_str()).collect();
             base_comps.retain(|c| !l1_texts.contains(c.text.as_str()));
             user_comps.retain(|c| !l1_texts.contains(c.text.as_str()));
-            let rest = limit - out.len().min(limit);
-            out.extend(self.merge_overlay(base_comps, user_comps, rest));
+            let comp_pool = self.merge_overlay(base_comps, user_comps, limit);
+            let mut out = exact_pool;
+            out.extend(comp_pool);
+            out.sort_by(|a, b| self.interleave_cmp(a, b, &joined));
             out.truncate(limit);
             return Ok(out);
         }
@@ -873,25 +891,21 @@ impl Dict {
         // 层一：精确块。块内 eff 重排只在「打的是学到过的拼音」时发生（user_pinyins
         // O(1) 判断）——开库不再整索引重排后，boost 在这里按需生效；此时必须先取
         // 整块再截断，否则被 boost 抬进 top 的词还在 take 之外就被丢了。
-        let cap = if tail.is_empty() {
-            limit
-        } else {
-            limit.div_ceil(2)
-        };
+        // #87：两池各限 limit，末尾 interleave_cmp 全局混排（精确项带加分）。
         let mut out: Vec<Candidate> = if self.user_pinyins.contains(joined.as_str()) {
             let mut block: Vec<Candidate> = self.index[start..start + exact_len]
                 .iter()
                 .map(Self::entry_to_candidate)
                 .collect();
             block.sort_by(|a, b| self.cand_cmp(a, b));
-            block.truncate(cap);
+            block.truncate(limit);
             block
         } else {
             self.index[start..]
                 .iter()
                 .take_while(|e| e.pinyin == joined)
                 .map(Self::entry_to_candidate)
-                .take(cap)
+                .take(limit)
                 .collect()
         };
         let (lo, hi) = if tail.is_empty() {
@@ -910,7 +924,6 @@ impl Dict {
         };
         // 与 FST 路径同语义：用户词（另一读音下学的）与层一同文本时频率以用户词为准、
         // 层归属不变；层二不得重复层一已展示的文本。
-        let mut l1_dirty = false;
         for entry in &self.index[lo..hi] {
             if entry.user != 1 {
                 continue;
@@ -918,12 +931,8 @@ impl Dict {
             if let Some(o) = out.iter_mut().find(|o| o.text == entry.text) {
                 if o.freq != entry.freq.max(0) as u64 {
                     o.freq = entry.freq.max(0) as u64;
-                    l1_dirty = true;
                 }
             }
-        }
-        if l1_dirty {
-            out.sort_by(|a, b| self.cand_cmp(a, b));
         }
         let mut comps: Vec<Candidate> = self.index[lo..hi]
             .iter()
@@ -931,8 +940,11 @@ impl Dict {
             .filter(|c| !out.iter().any(|o| o.text == c.text))
             .collect();
         comps.sort_by(|a, b| self.cand_cmp(a, b));
-        comps.truncate(limit - out.len());
+        comps.truncate(limit);
         out.extend(comps);
+        // #87 交错：两池全局混排（精确项带 EXACT_BONUS，高频组合词可插队）
+        out.sort_by(|a, b| self.interleave_cmp(a, b, &joined));
+        out.truncate(limit);
         Ok(out)
     }
 

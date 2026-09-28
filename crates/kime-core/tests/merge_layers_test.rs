@@ -1,10 +1,10 @@
-//! 层序穿过合并阶段（工单第 4 条的 dict 侧契约）。
+//! 交错语义穿过合并阶段（工单第 4 条的 dict 侧契约，#87 版）。
 //!
-//! `lookup_prefix` 返回的两层结构——层一（精确命中 joined）整体在前、层二（补全）
-//! 在后——必须扛得住用户词 overlay 合并：
-//! 1. 用户词在场会触发合并排序，排序只许发生在**层内**；「层一低频精确词 +
-//!    层二高频补全词」的种子下，精确词必须仍然排第一。把 `merge_overlay` 退回
-//!    跨层整体 `(freq DESC, text ASC)` 的本测试即失败。
+//! `lookup_prefix` 的池子语义——层一（精确命中 joined）与层二（补全）进同一个池、
+//! 按 eff + EXACT_BONUS 全局交错——必须扛得住用户词 overlay 合并：
+//! 1. 用户词在场会触发层内合并排序；「层一低频精确词（学后 eff 60 万级）+ 层二
+//!    语料高频补全词（90 万）」的种子下，补全词合法插到前面（#87 的核心诉求）；
+//!    但同量级的低频精确词仍凭 EXACT_BONUS 压住更弱的补全。
 //! 2. 用户词与层一基底同文本时：频率以用户词为准、层归属沿用原条目，
 //!    不许在层二复制一份。
 //! 3. 用户词本身是精确命中 → 进层一，哪怕层二躺着同文本的高频词库词。
@@ -40,9 +40,10 @@ fn dict(dir: &Path, seed: &str, with_bin: bool) -> Dict {
     }
 }
 
-/// 用户词在场（精确命中被学成用户词）时，层一低频词仍不得被层二高频补全压住。
+/// 交错顺序穿过合并阶段：用户词在场（精确命中被学成用户词）时，语料高频档的
+/// 补全词合法插到学后低频精确词之前（#87 诉求本身），层内合并语义不变。
 #[test]
-fn user_overlay_merge_keeps_exact_layer_ahead_of_completions() {
+fn user_overlay_merge_honors_interleave_order() {
     for with_bin in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let tag = if with_bin { "FST" } else { "SQLite" };
@@ -51,15 +52,17 @@ fn user_overlay_merge_keeps_exact_layer_ahead_of_completions() {
         d.learn(&["ni".into(), "hao".into()], "精确").unwrap();
 
         let hits = d.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
+        // 精确 = 11 + USER_BOOST(300k) + EXACT_BONUS(300k) ≈ 60 万；高频 = 90 万 →
+        // 语料高频补全词插到前面（「ni 打 你好」同量级插队的镜像形态）。
         assert_eq!(
             texts(&hits),
-            vec!["精确", "高频"],
-            "{tag}: 层一低频精确词被跨层频率排序打平了"
+            vec!["高频", "精确"],
+            "{tag}: 交错顺序被破坏：低频精确词带加分(60 万)仍须压住更弱补全"
         );
         assert_eq!(
-            hits[0].pinyin, "ni'hao",
-            "{tag}: 首个候选必须是精确命中，实际 {:?}",
-            hits[0].pinyin
+            hits[1].pinyin, "ni'hao",
+            "{tag}: 精确词必须保持 ni'hao 层归属，实际 {:?}",
+            hits[1].pinyin
         );
     }
 }
