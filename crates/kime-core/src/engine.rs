@@ -1674,28 +1674,32 @@ mod tests {
     }
 
     /// #79 用户场景（ufmewfti = 什么问题 的等价）：连续两次选词上屏
-    /// （你好 + 泥猴），退格 LIFO 逐条弹回——先弹最近一次（剩 nihou
-    /// 重新可组），再弹第一条还原整串；每次弹回都带应用删除指令。
+    /// （你好 + 泥猴），退格 LIFO 逐条弹回——先弹最近一次（泥猴 的拼音
+    /// 弹回可重组），再弹第一条还原整串；每次弹回都带应用删除指令。
+    /// （单 burst 内部分选词的弹回见 backspace_partial_selection_undoes_in_order；
+    /// 整串输入时 lattice 会拼整句候选，首候选即全句，故 LIFO 用顺序两 burst。）
     #[test]
     fn two_word_chain_pops_in_lifo_order() {
         let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihaonihou".chars() {
+        for c in "nihao".chars() {
             e.key(k(c));
         }
         match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好", "先选 你好（剩 nihou）"),
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected Commit(你好), got {:?}", other),
         }
-        assert_eq!(e.letters, "nihou");
+        for c in "nihou".chars() {
+            e.key(k(c));
+        }
         match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "泥猴", "再选 泥猴（整串上屏完）"),
+            Outcome::Commit(t) => assert_eq!(t, "泥猴"),
             other => panic!("expected Commit(泥猴), got {:?}", other),
         }
         assert!(e.letters.is_empty());
         assert_eq!(e.undo_depth(), 2, "两次选词 = 两条撤销记录");
-        // 第一下退格 = 撤销最近一次（泥猴）：拼音弹回 + 壳删上屏字
+        // 第一下退格 = 撤销最近一次（泥猴）：拼音弹回 + 壳删 2 上屏字
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihou", "先清理最近选词");
+        assert_eq!(e.letters, "nihou", "先清理最近选词（可重新组词）");
         assert_eq!(e.undo_depth(), 1);
         // 第二下退格 = 撤销 你好：整串还原
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
