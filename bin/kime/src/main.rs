@@ -191,9 +191,9 @@ fn main() -> ExitCode {
                 Ok(d) => match kime_core::lm::mine(d.conn()) {
                     Ok(st) => {
                         eprintln!(
-                            "mined: log {} rows, admitted {} pairs, evicted {}, purged {}, gen {} in {:?}",
-                            st.log_rows, st.admitted, st.evicted, st.purged_rows, st.generation,
-                            start.elapsed()
+                            "mined: log {} rows, admitted {} pairs, tail_mined {} pairs, evicted {}, purged {}, gen {} in {:?}",
+                            st.log_rows, st.admitted, st.tail_mined, st.evicted, st.purged_rows,
+                            st.generation, start.elapsed()
                         );
                         ExitCode::SUCCESS
                     }
