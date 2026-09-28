@@ -12,6 +12,7 @@
 //!   事务里原子提交，IME 读侧要么旧状态要么新状态，永不见半成品。
 
 use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 
 /// 准入门槛：日志中重复 ≥2 次的对才进 bigram 主表。
 pub const MIN_ADMISSION: i64 = 2;
@@ -27,8 +28,10 @@ pub const LM_BOOST_UNIT: i64 = 300_000;
 pub struct MineStats {
     /// 日志中的 (prev,next) 对数（去重前提交行数见 `log_rows`）
     pub log_rows: i64,
-    /// 本轮新准入的 bigram 对数
+    /// 本轮新准入的 bigram 对数（ctx_id 链路径）
     pub admitted: i64,
+    /// 带尾挖掘准入的对数（tail_ctx 词库前缀切分路径，#89）
+    pub tail_mined: i64,
     /// 老化后低于准入线被淘汰的对数
     pub aged_out: i64,
     /// 超预算淘汰的对数
@@ -74,11 +77,11 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
     );
     conn.execute_batch(&sql)?;
     st.admitted = conn.query_row("SELECT changes()", [], |r| r.get(0))?;
+    // 日志规模快照（本轮输入行数，tail 路径删行之前）
+    st.log_rows = conn.query_row("SELECT count(*) FROM commit_log", [], |r| r.get(0))?;
     // 老化淘汰：减半后只剩 1 的行（即上一轮准入后未被复用的）不删，
     // 留着当低频背景；只有预算压力才触发 LFU 淘汰（见下）。
     st.aged_out = 0;
-
-    st.log_rows = conn.query_row("SELECT count(*) FROM commit_log", [], |r| r.get(0))?;
 
     // 遗忘：超预算按 count ASC, last_seen ASC 淘汰到预算内
     conn.execute(
@@ -94,18 +97,25 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
     // 清日志：**只删已合并进主表的行**（对计数 ≥ MIN_ADMISSION）。
     // 未达门槛的行保留——它们下轮可能凑够准入线；已合并的必须删，
     // 否则下轮 UPSERT 累加会双重计数。
-    // ctx_id IS NULL 的行（每次提交序列的首词）永远进不了 bigram，
-    // 留着纯属无界累积（审查发现 C2 的真实形态）——一并删掉。
+    // ctx_id IS NULL 且**无尾**的行（序列首词，没有前文尾可依）永远进不了
+    // bigram，留着纯属无界累积（审查发现 C2 的真实形态）——照旧删掉（C2 不变式）。
+    // 带尾的行稍后在 mine_tail_pairs 里按 rowid 处理（合并即删、未达标保留）。
     st.purged_rows = conn.execute(
-        "DELETE FROM commit_log WHERE ctx_id IS NULL
-             OR (ctx_id, text_id) IN (
+        "DELETE FROM commit_log WHERE ctx_id IS NULL AND (tail_ctx IS NULL OR tail_ctx = '')
+             OR (ctx_id IS NOT NULL AND (ctx_id, text_id) IN (
                SELECT ctx_id, text_id FROM commit_log
                WHERE ctx_id IS NOT NULL
                GROUP BY ctx_id, text_id
                HAVING count(*) >= 2
-             )",
+             ))",
         [],
     )? as i64;
+    // tail 路径（#89）：tail_ctx 按词库前缀切分出前词，补真实相邻对。
+    // 放在 SQL 清日志之后：带尾行按 rowid 删已合并的，未达标的保留供下轮
+    // 累积（防双重计数语义与 ctx 路径一致）。
+    let (tail_mined, tail_purged) = mine_tail_pairs(conn, today)?;
+    st.tail_mined = tail_mined;
+    st.purged_rows += tail_purged;
     // 主事务提交：bigram 计数/淘汰/清日志原子生效
     conn.execute_batch("COMMIT")?;
 
@@ -129,9 +139,177 @@ pub fn mine(conn: &Connection) -> rusqlite::Result<MineStats> {
         )?
         .parse()
         .unwrap_or(0);
-
-    let _ = today;
     Ok(st)
+}
+
+/// 前缀切分候选词最大长度（按字符）。词库词常规 2–4 字，上限只挡病态长
+/// 词条，实践中不可达（同 mine_phrases 的长度防线思路）。
+const MAX_TAIL_WORD: usize = 16;
+
+/// 带尾挖掘（#89）：`tail_ctx` 行按词库前缀切分出前词，派生 (前词, 本词)
+/// 相邻对，重复 ≥ `MIN_ADMISSION` 次的对合并进 bigram 主表。
+///
+/// 返回 (达标对数, 删掉行数)。被删行 = 派生对已合并的行（按 rowid）：
+/// 合并后留行下轮会二次累加同一相邻对（双重计数），必须删；未达标的
+/// 行保留供下轮累积。ctx_id 是否为 NULL 不影响删除判定——带尾行的
+/// 贡献以 tail 对为准，无尾行不在此路径（mine 的 SQL 已兜底 C2 不变式）。
+fn mine_tail_pairs(conn: &Connection, today: i64) -> rusqlite::Result<(i64, i64)> {
+    // (rowid, 本词 vocab id, 上屏前文尾)
+    let mut stmt = conn.prepare(
+        "SELECT rowid, text_id, tail_ctx
+         FROM commit_log
+         WHERE tail_ctx IS NOT NULL AND tail_ctx != ''",
+    )?;
+    let rows: Vec<(i64, i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .flatten()
+        .collect();
+    if rows.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut word_freq: HashMap<String, Option<i64>> = HashMap::new();
+    let mut pair_counts: HashMap<(i64, i64), i64> = HashMap::new();
+    // 每行派生出的对（切分不可行 = None，该行不参与挖掘）
+    let mut row_pairs: Vec<(i64, Option<(i64, i64)>)> = Vec::with_capacity(rows.len());
+    for (rowid, text_id, tail) in &rows {
+        let pair = match split_tail_by_dict(conn, tail, &mut word_freq)? {
+            Some(words) => {
+                let Some(last) = words.last() else {
+                    row_pairs.push((*rowid, None));
+                    continue;
+                };
+                Some((vocab_id_for_text(conn, last, today)?, *text_id))
+            }
+            None => None,
+        };
+        if let Some(p) = pair {
+            *pair_counts.entry(p).or_default() += 1;
+        }
+        row_pairs.push((*rowid, pair));
+    }
+
+    // 达标对合并进主表（与 ctx 路径同语义的 UPSERT）
+    let merged: HashSet<(i64, i64)> = pair_counts
+        .iter()
+        .filter(|(_, c)| **c >= MIN_ADMISSION)
+        .map(|(k, _)| *k)
+        .collect();
+    for &(prev_id, next_id) in &merged {
+        conn.execute(
+            "INSERT INTO bigram(prev_id, next_id, count, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(prev_id, next_id) DO UPDATE SET
+               count = count + excluded.count,
+               last_seen = excluded.last_seen",
+            params![prev_id, next_id, pair_counts[&(prev_id, next_id)], today],
+        )?;
+    }
+    // 派生对已合并的行按 rowid 删掉（防下轮双重计数）
+    let mut purged = 0i64;
+    for (rowid, pair) in &row_pairs {
+        if let Some(p) = pair {
+            if merged.contains(p) {
+                conn.execute("DELETE FROM commit_log WHERE rowid = ?1", params![rowid])?;
+                purged += 1;
+            }
+        }
+    }
+    Ok((merged.len() as i64, purged))
+}
+
+/// 按词库前缀把 `tail`（落屏句的上屏前文尾）切成词序列（带尾挖掘的私有工具）。
+///
+/// 词判定 = phrase 表有 `text = 词` 的行（等价 `Dict::lookup_prefix` 的 exact
+/// 块——词库有无该词）；词频率 = 该 text 所有行的 MAX(freq)（代表频率，与
+/// 拼音行无关）。「每个词都在词库」的可行切分中取**总频率最高**的方案（DP；
+/// 模型选方案是 #88 的活，本期不做）。无可行完整切分（标点/数字/未收字）
+/// → `None`，该行不参与挖掘。
+/// `cache` 跨行共享：同一词在不同尾里只查一次 phrase 表。
+fn split_tail_by_dict(
+    conn: &Connection,
+    tail: &str,
+    cache: &mut HashMap<String, Option<i64>>,
+) -> rusqlite::Result<Option<Vec<String>>> {
+    let chars: Vec<char> = tail.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT MAX(freq) FROM phrase WHERE text = ?1")?;
+    let mut dp: Vec<Option<i64>> = vec![None; n + 1];
+    let mut choice: Vec<Option<usize>> = vec![None; n + 1];
+    dp[0] = Some(0);
+    for i in 1..=n {
+        let mut best: Option<(i64, usize)> = None;
+        for j in (i.saturating_sub(MAX_TAIL_WORD))..i {
+            let Some(base) = dp[j] else {
+                continue;
+            };
+            let word: String = chars[j..i].iter().collect();
+            let freq: Option<i64> = match cache.get(&word) {
+                Some(f) => *f,
+                None => {
+                    let f: Option<i64> = stmt
+                        .query_row(params![word.as_str()], |r| r.get(0))
+                        .unwrap_or(None);
+                    cache.insert(word.clone(), f);
+                    f
+                }
+            };
+            let Some(f) = freq else {
+                continue;
+            };
+            let cand = base + f;
+            if best.map_or(true, |(b, _)| cand > b) {
+                best = Some((cand, j));
+            }
+        }
+        if let Some((cand, j)) = best {
+            dp[i] = Some(cand);
+            choice[i] = Some(j);
+        }
+    }
+    if dp[n].is_none() {
+        return Ok(None);
+    }
+    // 回溯恢复词序列；末词 = 本行 text 的前词（真实落屏句的词边界）
+    let mut words: Vec<String> = Vec::new();
+    let mut i = n;
+    while i > 0 {
+        let Some(j) = choice[i] else {
+            return Ok(None);
+        };
+        words.push(chars[j..i].iter().collect());
+        i = j;
+    }
+    words.reverse();
+    Ok(Some(words))
+}
+
+/// 纯词库词（带尾挖掘的前词）取（必要时建）vocab 行 id。
+///
+/// bigram.prev_id 必须引用 vocab 行；词库词没有 kime 读音，reading 取 phrase
+/// 表最高频拼音行（词在词库 = 行必存在，故非空）。优先复用既有
+/// (text, 该拼音) 行：IME 侧 set_lm_context 按 kime 读音查，命中率最高。
+fn vocab_id_for_text(conn: &Connection, text: &str, today: i64) -> rusqlite::Result<i64> {
+    let reading: String = conn
+        .query_row(
+            "SELECT pinyin FROM phrase WHERE text = ?1 ORDER BY freq DESC LIMIT 1",
+            params![text],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    conn.execute(
+        "INSERT INTO vocab(text, reading, last_seen) VALUES (?1, ?2, ?3)
+         ON CONFLICT(text, reading) DO UPDATE SET last_seen = excluded.last_seen",
+        params![text, reading, today],
+    )?;
+    conn.query_row(
+        "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+        params![text, reading],
+        |r| r.get(0),
+    )
 }
 
 use rusqlite::params;

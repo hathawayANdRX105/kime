@@ -151,3 +151,8 @@
 - [ ] 候选词优化续篇：比较器全路径统一 effective_freq（`place_sentences` / top_user）、PATHS_PER_NODE 增大下的碎切抑制、衰减函数长期稳定性
 
 ## M18 — 智能标点撤销 + Delete 前删（#85）
+
+## M19 — 挖掘数据源：commit_log 落屏句前文尾 tail_ctx（#89）
+
+- [x] 上屏时把引擎 context（落屏句上屏前文尾）落 `commit_log.tail_ctx`；离线挖掘按词库前缀切成前词、取总频最高切分补 (前词, 本词) 真实相邻对；`ctx_id IS NULL` 且有尾的行也参与挖掘（C2 不变式保留），旧库缺列 `Dict::open` 自动 ALTER 补列
+
