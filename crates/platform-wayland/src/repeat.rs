@@ -78,7 +78,8 @@ impl KeyRepeat {
 pub enum ShiftGesture {
     #[default]
     Idle,
-    /// Shift 已按下、还没打过别的键：松开最后一次 Shift 即「点击切换」。
+    /// Shift 已按下、还没打过别的键：松开 = 轻点，无动作（#83 起不再有
+    /// 持久模式——英文字母靠「按住 Shift 打字」临时透传表达）。
     Armed { press_time: u64 },
     /// Shift 按住期间打过别的键：临时英文已发生，松开不许切模式。
     HoldActive { keys_typed: u32 },
@@ -89,15 +90,14 @@ pub enum ShiftGesture {
 pub enum ShiftRelease {
     /// 还有另一个 Shift 按着，或手势根本没进过 Armed（组合内走老路径）——什么也别做。
     None,
-    /// 点击（Armed 且无其他键）→ 把这次 Shift 补交给引擎切中英。
-    Toggle,
-    /// 按住打过键 → 模式不变，手势复位。
+    /// 轻点（Armed）或按住打过键（HoldActive）→ 模式不动，手势复位。
+    /// #83 起轻点不再补交 Shift 切中英（持久英文模式删除，锁死根子）。
     NoToggle,
 }
 
-/// rime `ascii_composer` 语义裁决器：
-/// 点击 Shift=切换中英；按住 Shift 期间打字=临时英文透传且不改模式。
-/// 判定全在这里，引擎只在 Toggle 裁决时收到那一次 Shift「press」。
+/// Shift 手势裁决器（#83 起无持久模式）：
+/// 轻点 Shift=无动作；按住 Shift 期间打字=临时英文透传且不改模式。
+/// 引擎只在「有组合时按 Shift」的冲刷路径收到 Shift（切模式补交已删除）。
 #[derive(Default)]
 pub struct ShiftComposer {
     pub gesture: ShiftGesture,
@@ -141,8 +141,7 @@ impl ShiftComposer {
             return ShiftRelease::None;
         }
         let verdict = match self.gesture {
-            ShiftGesture::Armed { .. } => ShiftRelease::Toggle,
-            ShiftGesture::HoldActive { .. } => ShiftRelease::NoToggle,
+            ShiftGesture::Armed { .. } | ShiftGesture::HoldActive { .. } => ShiftRelease::NoToggle,
             ShiftGesture::Idle => ShiftRelease::None,
         };
         self.gesture = ShiftGesture::Idle;

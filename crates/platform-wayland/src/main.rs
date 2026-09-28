@@ -18,7 +18,7 @@ use platform_wayland::clipboard_watch::spawn as spawn_clipboard_watcher;
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::mode_badge::{badge_enabled, BadgeFrame, BadgeSlot, ModeBadge};
-use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
+use platform_wayland::repeat::{KeyRepeat, ShiftComposer};
 use platform_wayland::route::{
     clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
     ClipAction, PressAction,
@@ -1661,10 +1661,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 let is_shift = matches!(key, 42 | 54);
 
                 if released {
-                    if is_shift && state.shift_gesture.on_shift_release() == ShiftRelease::Toggle {
-                        // 手势裁决：只有点击（其间没打过别的键）才把这一次 Shift 补交
-                        // 给引擎切中英；按住打过键 → 模式不动（rime ascii_composer）。
-                        state.engine_press(key, time, false, qh);
+                    // Shift release：只推进行姿态状态机（#83 起裁决无动作，
+                    // 轻点/按住都不再切模式）；有组合时按 Shift 的冲刷在 press
+                    // 路径（下方 1696 附近）直喂引擎。
+                    if is_shift {
+                        state.shift_gesture.on_shift_release();
                     }
                     // 撤表只认自己（Shift/Ctrl 的 release 停不了 F 的重复），随后按
                     // press 记账决定 release 吞放。route_release 见 route.rs。
