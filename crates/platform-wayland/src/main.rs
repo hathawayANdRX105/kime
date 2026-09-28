@@ -979,15 +979,18 @@ impl AppState {
         // 引擎状态 {letters, preedit, cursor, undo_depth, undo_top}，供远端诊断
         // 逐键还原状态转移。
         if let Some(engine) = self.engine.as_ref() {
-            let undo_top = engine.undo_top().unwrap_or("-");
             debug_log(|| {
+                let top = engine
+                    .undo_top()
+                    .map(|(k, c)| format!("{k}×{c}"))
+                    .unwrap_or_else(|| "-".into());
                 format!(
                     "key code={code} ch={ch:?} -> {outcome:?} | letters={:?} preedit={:?} cursor={} undo=[{}, {}]",
                     engine.letters(),
                     engine.preedit(),
                     engine.cursor(),
                     engine.undo_depth(),
-                    undo_top,
+                    top,
                 )
             });
         }
@@ -1021,6 +1024,19 @@ impl AppState {
                 // 组合恰在中途被删空：给应用一对完整 press+release（等效一次
                 // 点击，继续删应用字符），表不撤；物理 release 到达才停。
                 self.tap_pair(code);
+            }
+            PressAction::Undo(extra) => {
+                // #79 撤销选词：引擎已把消耗拼音弹回组合；应用里该次选词上屏的
+                // 字符逐个删掉——物理退格 press 直接转发（release 走记账随后
+                // 放行 = 第 1 次点击），再补 extra 对合成退格（每对 = 一次点击）。
+                self.swallowed.forward(code);
+                self.forward_key(time, code, true);
+                for _ in 0..extra {
+                    let t = now_ms() as u32;
+                    self.forward_key(t, code, true);
+                    self.forward_key(t, code, false);
+                }
+                self.apply_consumed(qh);
             }
         }
         // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
