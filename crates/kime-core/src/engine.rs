@@ -596,8 +596,9 @@ impl Engine {
         }
 
         // 空格 — 有候选 = 选当前页首候选入 pending（#81：不再写死第一页，
-        // 翻页 page_index 参与提交）；无候选且有 pending = 整段释放上屏；
-        // 双空 = 放行。
+        // 翻页 page_index 参与提交）；无候选且有 pending = 整段释放上屏
+        // （#81/#79：只释放 pending，残留字母留组合继续输入）；无候选无
+        // pending 但残留拼音 = 原样上屏收尾（= 输入串结束）；全空 = 放行。
         if k.ch.is_none() && k.code == KEY_SPACE {
             if !self.candidates.is_empty() {
                 let top = self.candidates[self.highlight()].clone();
@@ -609,6 +610,14 @@ impl Engine {
                 let text = self.pending_words.join("");
                 self.pending_words.clear();
                 self.preedit_display.clear();
+                return Outcome::Commit(text);
+            }
+            if !self.letters.is_empty() {
+                // 选完全部候选后残留拼音无候选可组：空格原样上屏收尾
+                // （= 输入串结束，与「letters + 标点原样上屏」情况 C 同语义；
+                // 修前此处 Ignored 放行、残串挂 preedit 里不输出）。
+                let text = self.letters.clone();
+                self.clear_composition();
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
@@ -995,8 +1004,11 @@ impl Engine {
                             self.rebuild_preedit_display();
                             self.last_joined = sp_joined.clone();
                         }
-                        // pending（半截键对）非空时句子没有消耗全部输入 → 不抢层一名次。
-                        Self::place_sentences(&mut self.candidates, sentences, &sp_joined);
+                        // 句候选覆盖的 pinyin = 完整音节（不含 pending 半截键），
+                        // 用整音节 join 做落位 key：奇数 pending 时句仍按 freq
+                        // 落进补全区头部，不会被误判「未覆盖全输入」而挂到尾部。
+                        let full_joined = joined_key(&syllables, "");
+                        Self::place_sentences(&mut self.candidates, sentences, &full_joined);
                     }
                     // 缺陷 A 回退：以上全部落空（整串无词条、Viterbi 拼不出全覆盖句）
                     // 时，砍末音节逐档重查，让候选列表非空——用户至少能选到首音节的字。
@@ -2609,6 +2621,105 @@ mod tests {
             alt: false,
         });
         assert_eq!(outcome, Outcome::Commit(",".to_string()));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    fn engine_with_sp_sentence_fixture() -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+        let db = tmp_db("sp_sentence");
+        let yaml = fixture_yaml_path();
+        let _dict = Dict::open(&db).expect("open dict");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES
+               ('ni', '你', 5000, 'n', 0),
+               ('ni''qu', '你骑', 3000, 'nq', 0),
+               ('qu', '裙', 2000, 'q', 0),
+               ('que', '却', 1500, 'qu', 0),
+               ('quan', '全', 300, 'q', 0),
+               ('ni''quan', '你全', 50, 'nq', 0),
+               ('quan''que', '全却', 200000, 'qq', 0),
+               ('ni''quan''que''ne', '你全却呢', 3000, 'nq', 0),
+               ('ni''quan''que''neng', '你全却能', 1, 'nq', 0),
+               ('a', '安', 8000, 'a', 0);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let dict = Dict::open(&db).expect("reopen dict for lookups");
+        let config = Config {
+            dict_path: db.to_string_lossy().to_string(),
+            shuangpin: Some(Scheme::Xiaohe),
+            ..Config::default()
+        };
+        let engine = Engine::new(dict, config);
+        (engine, db, yaml)
+    }
+
+    #[test]
+    fn sp_odd_pending_keeps_sentence_in_pool() {
+        // 双拼 niqrqtn = 键对 n+i=ni, q+r=quan, q+t=que, 半截 n（奇数 pending）。
+        // 主查补开区间 [ni'quan'que'n, ...) = 你全却呢(3000)/你全却能(1)；
+        // 全覆盖 Viterbi 句 = 你 + 全却 → 「你全却」（文本与 L1/L2 词互异）。
+        // 修前句 pinyin（完整音节 join）匹配不到含 pending 的 sp_joined 被挂尾；
+        // 修后按整音节 join 落位，句按自身分数插进补全区（你全却呢 3000 之后、
+        // 你全却能 1 之前）。
+        let (mut e, db, yaml) = engine_with_sp_sentence_fixture();
+        for c in "niqrqtn".chars() {
+            e.key(k(c));
+        }
+        let cands = e.candidates();
+        assert!(!cands.is_empty(), "niqrqtn 应出候选");
+        let idx = |t: &str| cands.iter().position(|c| c.text == t).unwrap_or(usize::MAX);
+        assert!(
+            idx("你全却") != usize::MAX,
+            "全覆盖句候选「你全却」必须在列表内：{cands:?}"
+        );
+        assert!(
+            idx("你全却呢") < idx("你全却") && idx("你全却") < idx("你全却能"),
+            "句须按分数插进补全区（3000 的你全却呢 之后、1 的你全却能 之前），\
+             不许挂尾：{cands:?}"
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn space_flushes_leftover_letters_after_all_selected() {
+        // 双拼 aaj = [a] + 半截 j（xiaohe aa=a）：选「安」后残留字母 j
+        // （sp 选词按键位消耗 2 键/音节，残 1 键）。#81 语义：第一下空格只释放
+        // pending（安），残留 j 留在组合；第二下空格（无候选、pending 已空、
+        // letters 非空）原样上屏 j 收尾——修前第二下走 Ignored，残串永远挂
+        // preedit 不输出（用户反馈「全部候选选完时选中没有上屏」）。
+        let (mut e, db, yaml) = engine_with_sp_sentence_fixture();
+        for c in "aaj".chars() {
+            e.key(k(c));
+        }
+        let texts: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"安"), "aaj 须可选到安，实际 {texts:?}");
+        // 选到列表为空（#81：选词入 pending，不上屏）
+        while !e.candidates().is_empty() {
+            assert_eq!(
+                e.key(code_k(KEY_SPACE)),
+                Outcome::Consumed,
+                "选词入 pending"
+            );
+        }
+        // 释放 pending（#81：只提 pending，残留 j 留组合）
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "安", "释放只上屏 pending，实际 {t:?}"),
+            other => panic!("释放 pending 应上屏 安，实际 {other:?}"),
+        }
+        assert_eq!(e.letters(), "j", "残留字母须留在组合");
+        // 收尾：无候选无 pending 残留拼音 → 原样上屏、组合结束
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "j", "残串须原样上屏，实际 {t:?}"),
+            other => panic!("残留拼音应原样上屏，实际 {other:?}"),
+        }
+        assert!(
+            e.letters().is_empty() && e.preedit().is_empty(),
+            "组合须结束"
+        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
