@@ -48,6 +48,10 @@ pub enum Outcome {
     Ignored,
     /// 上屏该文本
     Commit(String),
+    /// 撤销选词（#79）：被弹条目消耗的拼音已还原进组合；壳须把这次物理退格
+    /// 转发给应用，并再补发 `usize` 对合成退格点击——把该次选词上屏的字符
+    /// 从应用文本里逐个删掉（物理退格删第 1 个，合成点击删其余）。
+    UndoApp(usize),
 }
 
 pub struct Engine {
@@ -97,15 +101,15 @@ pub struct Engine {
     /// 上一次 kime 上屏的 (text, reading)，bigram 挖掘的「上文」。
     /// 比 surrounding_text 可靠：恒为 kime 自己的提交，不含粘贴/启动前的文本。
     last_commit: Option<(String, String)>,
-    /// fcitx5 式词级撤销：最近若干次「选词」各自消耗的拼音键串（LIFO，
-    /// 全拼 = 消耗字母、双拼 = 消耗键位）。
-    /// 生命周期 = 组合（letters）生命周期，不变式「letters 空 ⟹ 栈空」（#77，
-    /// fcitx5 clear() 语义：选择栈与编辑缓冲同生死）：选词 push（cap 64）；
-    /// 任何清组合路径（Esc / 焦点抖动 / 全量选词 / 标点 / Enter / Shift-flush /
-    /// 删字删空 / 切应用）整栈清空。退格：栈非空先撤销最近选词（弹回拼音重新
-    /// 组词，fcitx5 useBackSpaceToUnselect），栈净后才逐字删拼音，双空放行应用。
-    /// （#70「抖动保留栈」旧契约由 #77 推翻：面板关 = 输入串结束。）
-    undo_consumed: Vec<String>,
+    /// fcitx5 式词级撤销（#79 统一 undo）：最近若干次「选词」各自消耗的
+    /// 拼音键串 + 上屏字符数（LIFO；全拼 = 消耗字母、双拼 = 消耗键位）。
+    /// 生命周期 = 一条输入串（用户 09-28 裁定）：选词 push（cap 64），
+    /// 只死在硬终结点——标点上屏 / Enter 原样 / Shift-flush / 切应用 / Esc。
+    /// **全量选词上屏与 C-h 删空都不清链**（#76「面板关=链死」与 #77「删空
+    /// 清栈」作废）：上屏的字必须能靠退格弹回（弹栈 + 壳补发应用退格删除）。
+    /// 退格：栈非空 = 撤销最近选词（拼音还原 + UndoApp(n) 让壳删上屏字）；
+    /// 栈净 = 逐字删拼音；双空 = 放行应用。
+    undo_consumed: Vec<(String, usize)>,
 }
 
 impl Engine {
@@ -129,9 +133,9 @@ impl Engine {
         self.undo_consumed.len()
     }
 
-    /// 诊断/测试用：词级撤销栈顶（最近一次选词消耗的拼音键串）。
-    pub fn undo_top(&self) -> Option<&str> {
-        self.undo_consumed.last().map(String::as_str)
+    /// 诊断/测试用：词级撤销栈顶（(消耗键串, 上屏字符数)，KIME_DEBUG 状态日志用）。
+    pub fn undo_top(&self) -> Option<&(String, usize)> {
+        self.undo_consumed.last()
     }
 
     /// 清空词级撤销栈。
@@ -251,10 +255,10 @@ impl Engine {
     }
     /// 全量清空组合：候选/读音/preedit/页码/光标一并归位。所有上屏与 Esc 路径共用。
     ///
-    /// #77 不变式「letters 空 ⟹ 栈空」：组合清空 = 撤销链终结（fcitx5 clear()
-    /// 语义：选择标记与编辑缓冲一起死）。含壳层焦点抖动路径（DEACTIVATE 喂
-    /// 合成 Esc 走这里）——#70「抖动保留栈」旧契约就此推翻：面板关着，
-    /// 退格只放行删应用字符，不弹旧拼音。
+    /// #79 起清组合 = 硬终结点：撤销链随之清空（Esc / 壳层焦点抖动的合成
+    /// Esc 都走这里）。注意全量选词上屏**不走**此路（commit_candidate 只截
+    /// 串不清组合）——链跨上屏存活，退格可弹上屏字，回退统一。
+    /// （#70「抖动保留栈」旧契约由 #77 作废；#79 再改链生命周期。）
     fn clear_composition(&mut self) {
         self.letters.clear();
         self.candidates.clear();
@@ -307,21 +311,15 @@ impl Engine {
         self.last_joined.clear();
         self.preedit.clear();
         self.last_reading.clear();
-        // 词级撤销：记下本次选词消耗的拼音键串（原串前段），组合空时 Backspace
-        // 弹栈顶可退回该拼音（重新选词或继续组词，fcitx5 同族行为）。
+        // 词级撤销：记下本次选词消耗的拼音键串（原串前段）+ 上屏字符数。
+        // 退格弹栈时拼音还原进组合，壳按字符数补发应用退格删掉上屏字（#79）。
         let undo_entry = self.letters[..old_len - remaining.len()].to_string();
         self.letters = remaining;
         if !undo_entry.is_empty() {
-            self.undo_consumed.push(undo_entry);
+            self.undo_consumed.push((undo_entry, text.chars().count()));
             if self.undo_consumed.len() > 64 {
                 self.undo_consumed.remove(0);
             }
-        }
-        // 面板关闭（全量选词无剩余拼音）= 输入串结束：撤销链终止（fcitx5 空闲态
-        // 语义：退格放行删应用字符，不弹旧拼音）；部分选词 remaining 非空 → 面板
-        // 仍挂着，撤销链延续，退格可弹。
-        if self.letters.is_empty() {
-            self.undo_consumed.clear();
         }
         // 光标落在剩余拼音末尾：caret 在「最后」，后续打字续在尾部；
         // 此前复位 0 导致剩余 preedit 前移、新字符插到头部（「光标不是最后」根因）。
@@ -385,21 +383,22 @@ impl Engine {
         // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态，Ignored
         // 放行给应用删字符。长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
-            if !self.letters.is_empty() || !self.undo_consumed.is_empty() {
-                if let Some(consumed) = self.undo_consumed.pop() {
-                    let remaining = std::mem::take(&mut self.letters);
-                    self.letters = format!("{consumed}{remaining}");
-                    self.cursor = self.letters.len();
-                    self.page_index = 0;
-                    self.refresh_candidates();
-                    return Outcome::Consumed;
-                }
+            // 撤销优先（#77 起）+ #79 统一 undo：栈非空（无论 letters 空否）
+            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余），壳转发这次物理
+            // 退格并补发 app_chars-1 对合成退格删掉上屏字。栈净才删拼音；
+            // 双空 = 空闲态，Ignored 放行给应用删字符。
+            if let Some((consumed, app_chars)) = self.undo_consumed.pop() {
+                let remaining = std::mem::take(&mut self.letters);
+                self.letters = format!("{consumed}{remaining}");
+                self.cursor = self.letters.len();
+                self.page_index = 0;
+                self.refresh_candidates();
+                return Outcome::UndoApp(app_chars.saturating_sub(1));
+            }
+            if !self.letters.is_empty() {
                 if self.cursor > 0 {
                     self.letters.remove(self.cursor - 1);
                     self.cursor -= 1;
-                }
-                if self.letters.is_empty() {
-                    self.undo_consumed.clear();
                 }
                 self.refresh_candidates();
                 self.page_index = 0;
@@ -474,15 +473,11 @@ impl Engine {
                     return Outcome::Consumed;
                 }
                 Some('h') => {
-                    // 删空 = 输入串放弃，撤销链随组合消亡（#77 不变式：
-                    // letters 空 ⟹ 栈空）——部分选词后 C-h 删净剩余拼音，
-                    // 面板关着退格不得再弹旧拼音。
+                    // #79：删空不清撤销链（#77 不变式作废）——部分选词后 C-h
+                    // 删净剩余拼音，退格仍可逐条弹上屏字，回退统一。
                     if self.cursor > 0 {
                         self.letters.remove(self.cursor - 1);
                         self.cursor -= 1;
-                        if self.letters.is_empty() {
-                            self.undo_consumed.clear();
-                        }
                         self.refresh_candidates();
                         self.page_index = 0;
                     }
@@ -1653,12 +1648,10 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// 全量选词（无剩余拼音、面板关闭）= 输入串结束：撤销链终止，空闲态
-    /// 退格放行删应用字符，不弹旧拼音（fcitx5 空闲态语义；09-28 投诉 3）。
-    /// 部分选词（面板还挂着剩余拼音）的弹词路径见
-    /// backspace_partial_selection_undoes_in_order。
+    /// #79：全量选词上屏后撤销链**保留**（#76 规则作废）——退格弹整词：
+    /// 拼音还原进组合 + UndoApp(n-1) 让壳删掉上屏的 n 个字，回退统一。
     #[test]
-    fn full_selection_terminates_undo_chain() {
+    fn full_selection_keeps_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1668,22 +1661,53 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 0, "全量选词面板关闭，撤销链必须终止");
-        // 空闲态退格 = 放行删应用字符，不弹旧拼音
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
-        // 再来一串全量选词，退格依旧放行（链路不复活）
-        for c in "nihao".chars() {
-            e.key(k(c));
-        }
-        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert_eq!(e.undo_depth(), 1, "全量选词上屏，撤销链跨上屏存活");
+        // 退格 = 弹整词：拼音还原 + 壳删 2 个上屏字（物理 1 + 合成 1）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
+        assert_eq!(e.letters, "nihao", "整词弹回组合，可重新选词/组词");
+        assert_eq!(e.undo_depth(), 0);
+        // 栈净后逐字删拼音
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "niha");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #77 撤销优先（fcitx5 useBackSpaceToUnselect）：部分选词后第一下退格
-    /// = 撤销最近选词（消耗拼音 + 剩余整串还原重新组词，不删拼音）；
-    /// 栈净后逐字删拼音；删空触发不变式清栈，再退格放行应用。
+    /// #79 用户场景（ufmewfti = 什么问题 的等价）：连续两次选词上屏
+    /// （你好 + 泥猴），退格 LIFO 逐条弹回——先弹最近一次（剩 nihou
+    /// 重新可组），再弹第一条还原整串；每次弹回都带应用删除指令。
+    #[test]
+    fn two_word_chain_pops_in_lifo_order() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihaonihou".chars() {
+            e.key(k(c));
+        }
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好", "先选 你好（剩 nihou）"),
+            other => panic!("expected Commit(你好), got {:?}", other),
+        }
+        assert_eq!(e.letters, "nihou");
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "泥猴", "再选 泥猴（整串上屏完）"),
+            other => panic!("expected Commit(泥猴), got {:?}", other),
+        }
+        assert!(e.letters.is_empty());
+        assert_eq!(e.undo_depth(), 2, "两次选词 = 两条撤销记录");
+        // 第一下退格 = 撤销最近一次（泥猴）：拼音弹回 + 壳删上屏字
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
+        assert_eq!(e.letters, "nihou", "先清理最近选词");
+        assert_eq!(e.undo_depth(), 1);
+        // 第二下退格 = 撤销 你好：整串还原
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
+        assert_eq!(e.letters, "nihaonihou", "回退到整串可重新组词");
+        assert_eq!(e.undo_depth(), 0);
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// #77 撤销优先 + #79 统一 undo：部分选词后第一下退格 = 撤销最近
+    /// 选词（消耗拼音 + 剩余整串还原，UndoApp 删上屏字），不删拼音；
+    /// 栈净后逐字删拼音，双空放行应用。
     #[test]
     fn backspace_partial_selection_undoes_in_order() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -1692,14 +1716,14 @@ mod tests {
         }
         assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
         assert_eq!(e.letters, "ni");
-        // 第一下退格 = 撤销选词（弹栈还原整串），不是删拼音
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        // 第一下退格 = 撤销选词（弹栈还原整串 + 删上屏字），不是删拼音
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
         assert_eq!(e.letters, "nihaoni", "撤销选词：消耗段 + 剩余 = 原串");
         assert_eq!(e.undo_depth(), 0, "弹出后栈净");
         // 栈净 → 删拼音逐字
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "nihaon");
-        // 删空（6 字删净）= 输入串放弃
+        // 删净剩余（6 字）
         for _ in 0..6 {
             assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         }
@@ -1710,9 +1734,9 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #77 撤销优先 + 双拼：撤销弹回的是**键位串**（非拼音），后续退格
-    /// 逐键删除；删到键位串（nihc）后双拼解码重建 preedit。
-    /// 尾段 zz 不匹配任何 fixture 词 → 唯一候选 你好（nihc 消耗 4 键）。
+    /// #77 撤销优先 + #79：双拼部分选词，撤销弹回的是**键位串**（非拼音），
+    /// 壳按上屏字数（你好 = 2）补发合成退格；栈净后逐键删除，删到键位串
+    /// （nihc）后双拼解码重建 preedit。尾段 zz 无 fixture 词 → 候选只有你好。
     #[test]
     fn shuangpin_backspace_undo_restores_keys() {
         let (mut e, db, yaml) = engine_with_shuangpin_fixture();
@@ -1724,8 +1748,8 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.letters, "zz", "部分选词剩键位串");
-        // 第一下退格 = 撤销选词（弹回键位串），不是删键
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        // 第一下退格 = 撤销选词（弹回键位串 + 删 2 个上屏字）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
         assert_eq!(e.letters, "nihczz", "双拼撤销弹回键位串");
         assert_eq!(e.undo_depth(), 0);
         // 栈净 → 逐键删到 nihc，双拼解码重建 preedit
@@ -1762,10 +1786,10 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #77 不变式补漏：部分选词后 C-h 把剩余拼音删空 → 撤销链随组合消亡，
-    /// 退格放行不弹旧拼音（C-h 路径原本不碰栈，旧语义下链泄漏）。
+    /// #79：C-h 把剩余拼音删空**不清**撤销链（#77 不变式作废）——
+    /// 删空后链仍在，退格照样弹上屏字，回退统一。
     #[test]
-    fn ctrl_h_delete_to_empty_clears_undo_stack() {
+    fn ctrl_h_delete_to_empty_keeps_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihaoni".chars() {
             e.key(k(c));
@@ -1776,17 +1800,15 @@ mod tests {
         }
         assert_eq!(e.letters, "ni");
         assert_eq!(e.undo_depth(), 1);
-        // C-h 逐字删（光标在尾）：删空即清栈
+        // C-h 逐字删（光标在尾）：删空也不清链
         assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
         assert_eq!(e.letters, "n");
         assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 0, "删空清栈（#77 不变式）");
-        assert_eq!(
-            e.key(code_k(KEY_BACKSPACE)),
-            Outcome::Ignored,
-            "面板关、链死，退格放行应用"
-        );
+        assert_eq!(e.undo_depth(), 1, "删空不清链（#79）");
+        // 退格 = 弹上屏词：拼音还原 + 壳删 2 字
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
+        assert_eq!(e.letters, "nihao");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1856,7 +1878,7 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
     /// 空组合 Shift 翻转（中→英）= 话题切换、输入串结束：部分选词撤销
-    /// 弹栈后删净剩余拼音，撤销链随删空终止；切英文（翻转清栈）后
+    /// 弹栈（#79 起带应用删除）后删净剩余拼音，切英文（翻转清栈）后
     /// 切回中文，退格放行不弹旧词。
     #[test]
     fn english_toggle_clears_undo_stack() {
@@ -1868,15 +1890,15 @@ mod tests {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        // #77 撤销优先：第一下退格弹选词（还原原串、栈净），再逐字删空
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        // #77 撤销优先 + #79：第一下退格弹选词（还原原串、栈净、删上屏字）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
         assert_eq!(e.letters, "nihaoni", "弹选词还原原串");
         for _ in 0..7 {
             assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         }
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 0, "链已随弹栈/删空终止");
-        // 空 letters：Shift 切英文（翻转同样清栈）
+        assert_eq!(e.undo_depth(), 0, "链已随弹栈净");
+        // 空 letters：Shift 切英文（翻转清栈，硬终结点维持）
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
         assert!(!e.chinese());
         assert_eq!(e.undo_depth(), 0, "切英文即输入串结束，撤销链终止");

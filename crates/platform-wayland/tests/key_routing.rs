@@ -29,6 +29,7 @@ const KEY_BACKSPACE: u32 = 14;
 const KEY_B: u32 = 48;
 const KEY_F: u32 = 33;
 const KEY_H: u32 = 35;
+const KEY_SPACE: u32 = 57;
 const KEY_N: u32 = 49;
 const KEY_PERIOD: u32 = 52;
 const KEY_2: u32 = 3;
@@ -179,6 +180,16 @@ impl Shell {
                 self.forwarded.push((code, true));
                 self.forwarded.push((code, false));
                 self.swallowed.consume(code);
+            }
+            // #79 撤销选词：物理退格 press 转发（release 走记账放行 = 第 1 击），
+            // 再补 extra 对合成退格（每对 = 1 击），删掉上屏字数。
+            PressAction::Undo(extra) => {
+                self.swallowed.forward(code);
+                self.forwarded.push((code, true));
+                for _ in 0..extra {
+                    self.forwarded.push((code, true));
+                    self.forwarded.push((code, false));
+                }
             }
         }
         outcome
@@ -571,4 +582,61 @@ fn modifiers_only_ctrl_reaches_engine_without_key_events() {
     assert_eq!(sh.press(KEY_A), Outcome::Consumed, "无 Ctrl 回到拼音路径");
     sh.release(KEY_A);
     fs::remove_dir_all(dir).unwrap();
+}
+/// #79 统一 undo（全量选词）：退格弹整词 = 物理退格转发 + 1 对合成退格
+/// （你好 = 2 上屏字 = 2 击），拼音还原进组合。
+#[test]
+fn backspace_full_selection_undoes_with_app_deletes() {
+    let (mut sh, dir) = Shell::new("undo_full");
+    sh.type_str("nihao");
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
+    assert!(sh.engine.letters().is_empty());
+    // 第一下退格 = 撤销整词：拼音还原 + 删 2 个上屏字
+    assert_eq!(
+        sh.press(KEY_BACKSPACE),
+        Outcome::UndoApp(1),
+        "弹整词：物理 1 击 + 合成 1 击"
+    );
+    assert_eq!(sh.engine.letters(), "nihao", "整词拼音弹回组合");
+    // 物理 press 已转发 + 合成 1 对；release 放行 = 第 2 击
+    assert_eq!(
+        sh.forwarded,
+        vec![
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, false)
+        ]
+    );
+    sh.release(KEY_BACKSPACE);
+    assert_eq!(
+        sh.forwarded,
+        vec![
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, false),
+            (KEY_BACKSPACE, false)
+        ],
+        "共 2 击 = 删 2 个上屏字"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// #79 LIFO：连续选词（你好 + 安）后退格逐条弹——先弹最近的安
+/// （1 上屏字 = 只转发物理退格、无合成），再弹你好（2 字 = 物理 + 1 合成）。
+#[test]
+fn backspace_chains_pop_in_lifo_order() {
+    let (mut sh, dir) = Shell::new("undo_lifo");
+    sh.type_str("nihao");
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
+    sh.type_str("an");
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("安".into()));
+    // 退格 #1 = 弹「安」：拼音 an 还原，无合成（1 字 = 物理退格自己删）
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(0));
+    assert_eq!(sh.engine.letters(), "an");
+    sh.release(KEY_BACKSPACE);
+    // 退格 #2 = 弹「你好」：拼音弹回，1 对合成退格删第 2 字
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(1));
+    assert_eq!(sh.engine.letters(), "nihaonan", "整串还原可重新组词");
+    sh.release(KEY_BACKSPACE);
+    let _ = fs::remove_dir_all(&dir);
 }
