@@ -246,12 +246,15 @@ impl Dict {
                key   TEXT    NOT NULL PRIMARY KEY,
                value TEXT    NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS commit_log (
-               ts      INTEGER NOT NULL,
-               ctx_id  INTEGER,
-               text_id INTEGER NOT NULL,
-               reading TEXT    NOT NULL
-             );
+            CREATE TABLE IF NOT EXISTS commit_log (
+              ts       INTEGER NOT NULL,
+              ctx_id   INTEGER,
+              text_id  INTEGER NOT NULL,
+              reading  TEXT    NOT NULL,
+              -- 落屏句的上屏前文尾（引擎 context，光标前上下文，见 engine.rs）：
+              -- 离线挖掘按词库前缀把它切成前词，补出 (前词, 本词) 真实相邻对。
+              tail_ctx TEXT
+            );
              -- vocab = 词表：text/reading 只存一次，bigram 用整数 ID 引用
              -- （压缩 + 整数比较比文本排序快，见设计文档第四节）。
              CREATE TABLE IF NOT EXISTS vocab (
@@ -275,6 +278,19 @@ impl Dict {
              CREATE INDEX IF NOT EXISTS idx_bigram_last ON bigram(count, last_seen);
              ",
         )?;
+        // 既有库缺列迁移（世代兼容）：旧 dict.sqlite3 的 commit_log 没有 tail_ctx，
+        // CREATE TABLE IF NOT EXISTS 对既有表不补列，这里显式查列缺失则 ALTER；
+        // 新建库已带列，整段 no-op。开库一次，无热路径开销。
+        {
+            let has_tail_ctx: bool = conn
+                .prepare("PRAGMA table_info(commit_log)")?
+                .query_map(params![], |row| row.get::<_, String>(1))
+                .map(|cols| cols.flatten().any(|name| name == "tail_ctx"))
+                .unwrap_or(false);
+            if !has_tail_ctx {
+                conn.execute_batch("ALTER TABLE commit_log ADD COLUMN tail_ctx TEXT")?;
+            }
+        }
         // 用户提频计数先加载：下面内存索引的排序按「有效频率」（裸 freq + 加成）走。
         let user_stats = Self::load_user_stats(&conn)?;
         let today = today_days();
@@ -1112,9 +1128,17 @@ impl Dict {
     /// `ctx` = 上一次 kime 上屏的词 `(text, reading)`，用来挖掘 bigram。
     /// 用引擎自记的上次提交而非解析 surrounding_text：后者混着非 kime 输入的文本
     /// （粘贴、kime 启动前打的字），bigram 会被污染；前者恒为 kime 自己的提交。
+    /// `tail` = 落屏句的上屏前文尾（引擎 context），落 `tail_ctx` 列；
+    /// 离线挖掘按词库前缀把它切成前词，补出真实相邻对（#89）。None = 无。
     ///
     /// 失败**不阻塞上屏**：commit_log 缺失只影响离线排序质量，本次输入照常完成。
-    pub fn log_commit(&mut self, ctx: Option<(&str, &str)>, reading: &[String], text: &str) {
+    pub fn log_commit(
+        &mut self,
+        ctx: Option<(&str, &str)>,
+        reading: &[String],
+        text: &str,
+        tail: Option<&str>,
+    ) {
         if reading.is_empty() || text.is_empty() {
             return;
         }
@@ -1129,8 +1153,9 @@ impl Dict {
         // 原材料，连失败会掏空排序质量。一次性告警（ lm_warned 哨兵防刷屏
         // ——每键都打印会淹掉终端）。
         if let Err(e) = self.conn.execute(
-            "INSERT INTO commit_log(ts, ctx_id, text_id, reading) VALUES (?1, ?2, ?3, ?4)",
-            params![today as i64, ctx_id, text_id, joined],
+            "INSERT INTO commit_log(ts, ctx_id, text_id, reading, tail_ctx)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![today as i64, ctx_id, text_id, joined, tail],
         ) {
             if !self.lm_warned {
                 self.lm_warned = true;

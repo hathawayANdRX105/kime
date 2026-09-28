@@ -29,11 +29,12 @@ fn log_commit_chains_context_and_normalizes_vocab() {
     {
         let mut d = Dict::open(&db).unwrap();
         // 连续两次提交：你好 → 世界。第二次带「上文」。
-        d.log_commit(None, &["ni".into(), "hao".into()], "你好");
+        d.log_commit(None, &["ni".into(), "hao".into()], "你好", None);
         d.log_commit(
             Some(("你好", "ni'hao")),
             &["shi".into(), "jie".into()],
             "世界",
+            None,
         );
     }
     // 重开库：挖掘工具是独立进程，必须看到 IME 写下的行。
@@ -63,8 +64,8 @@ fn log_commit_chains_context_and_normalizes_vocab() {
 fn log_commit_ignores_empty_input() {
     let db = tmp_db("empty");
     let mut d = Dict::open(&db).unwrap();
-    d.log_commit(None, &[], "你好");
-    d.log_commit(None, &["ni".into()], "");
+    d.log_commit(None, &[], "你好", None);
+    d.log_commit(None, &["ni".into()], "", None);
     let n: i64 = d
         .conn()
         .query_row("SELECT count(*) FROM commit_log", [], |r| r.get(0))

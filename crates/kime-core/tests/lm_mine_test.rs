@@ -50,18 +50,20 @@ fn mine_admits_repeated_pairs_and_blocks_oneoffs() {
     let mut d = Dict::open(&db).unwrap();
     // 项目 → 进度 提交 3 次；项目 → 一次性 只 1 次（低于准入线）
     for _ in 0..3 {
-        d.log_commit(None, &["xiang".into(), "mu".into()], "项目");
+        d.log_commit(None, &["xiang".into(), "mu".into()], "项目", None);
         d.log_commit(
             Some(("项目", "xiang'mu")),
             &["jin".into(), "du".into()],
             "进度",
+            None,
         );
     }
-    d.log_commit(None, &["xiang".into(), "mu".into()], "项目");
+    d.log_commit(None, &["xiang".into(), "mu".into()], "项目", None);
     d.log_commit(
         Some(("项目", "xiang'mu")),
         &["yi".into(), "ci".into()],
         "一次性",
+        None,
     );
 
     let st = lm::mine(d.conn()).unwrap();
@@ -82,11 +84,12 @@ fn mine_ages_counts_and_purges_log() {
     let db = tmp_db("age");
     let mut d = Dict::open(&db).unwrap();
     for _ in 0..4 {
-        d.log_commit(None, &["ni".into(), "hao".into()], "你好");
+        d.log_commit(None, &["ni".into(), "hao".into()], "你好", None);
         d.log_commit(
             Some(("你好", "ni'hao")),
             &["shi".into(), "jie".into()],
             "世界",
+            None,
         );
     }
     lm::mine(d.conn()).unwrap();
@@ -94,11 +97,12 @@ fn mine_ages_counts_and_purges_log() {
 
     // 第二轮挖掘：全体减半（老化），再合并本轮 4 次 → 2 + 4 = 6
     for _ in 0..4 {
-        d.log_commit(None, &["ni".into(), "hao".into()], "你好");
+        d.log_commit(None, &["ni".into(), "hao".into()], "你好", None);
         d.log_commit(
             Some(("你好", "ni'hao")),
             &["shi".into(), "jie".into()],
             "世界",
+            None,
         );
     }
     lm::mine(d.conn()).unwrap();
@@ -122,7 +126,7 @@ fn mine_ages_counts_and_purges_log() {
 fn mine_bumps_generation_and_single_transaction() {
     let db = tmp_db("gen");
     let mut d = Dict::open(&db).unwrap();
-    d.log_commit(None, &["a".into()], "安");
+    d.log_commit(None, &["a".into()], "安", None);
     lm::mine(d.conn()).unwrap();
     lm::mine(d.conn()).unwrap();
     let gen: i64 = d
@@ -143,14 +147,14 @@ fn mine_evicts_over_budget_lfu_first() {
     let mut d = Dict::open(&db).unwrap();
     // 造 3 对：高频对 5 次、低频对 2 次（准入线）、极低频 2 次
     for _ in 0..5 {
-        d.log_commit(None, &["gao".into()], "高");
-        d.log_commit(Some(("高", "gao")), &["pin".into()], "频");
+        d.log_commit(None, &["gao".into()], "高", None);
+        d.log_commit(Some(("高", "gao")), &["pin".into()], "频", None);
     }
     for _ in 0..2 {
-        d.log_commit(None, &["di".into()], "低");
-        d.log_commit(Some(("低", "di")), &["pin".into()], "频");
-        d.log_commit(None, &["leng".into()], "冷");
-        d.log_commit(Some(("冷", "leng")), &["men".into()], "门");
+        d.log_commit(None, &["di".into()], "低", None);
+        d.log_commit(Some(("低", "di")), &["pin".into()], "频", None);
+        d.log_commit(None, &["leng".into()], "冷", None);
+        d.log_commit(Some(("冷", "leng")), &["men".into()], "门", None);
     }
     lm::mine(d.conn()).unwrap();
     assert_eq!(bigram_count(&d, "高", "频"), 5);
@@ -176,8 +180,8 @@ fn lm_context_reorders_candidates() {
 
     // 用户习惯：打完「高」总接「频」（5 次），「果」从没接过
     for _ in 0..5 {
-        d.log_commit(None, &["gao".into()], "高");
-        d.log_commit(Some(("高", "gao")), &["pin".into()], "频");
+        d.log_commit(None, &["gao".into()], "高", None);
+        d.log_commit(Some(("高", "gao")), &["pin".into()], "频", None);
     }
     lm::mine(d.conn()).unwrap();
 
@@ -202,11 +206,12 @@ fn mine_learns_phrases_from_repeated_adjacent_commits() {
     let db = tmp_db("phrase");
     let mut d = Dict::open(&db).unwrap();
     for _ in 0..lm::PHRASE_ADMISSION {
-        d.log_commit(None, &["xiang".into(), "mu".into()], "项目");
+        d.log_commit(None, &["xiang".into(), "mu".into()], "项目", None);
         d.log_commit(
             Some(("项目", "xiang'mu")),
             &["jin".into(), "du".into()],
             "进度",
+            None,
         );
     }
     let st = lm::mine(d.conn()).unwrap();
@@ -239,15 +244,15 @@ fn mine_ages_out_unused_pairs() {
     let mut d = Dict::open(&db).unwrap();
     // 对 A 用 4 次后停手；对 B 每轮都续用
     for _ in 0..4 {
-        d.log_commit(None, &["ting".into()], "停");
-        d.log_commit(Some(("停", "ting")), &["yong".into()], "用");
+        d.log_commit(None, &["ting".into()], "停", None);
+        d.log_commit(Some(("停", "ting")), &["yong".into()], "用", None);
     }
     lm::mine(d.conn()).unwrap(); // A=4, B 未造
     assert_eq!(bigram_count(&d, "停", "用"), 4);
     // 5 轮不再使用：4→2→1→0(清)
     for round in 0..3 {
-        d.log_commit(None, &["yong".into()], "用");
-        d.log_commit(Some(("用", "yong")), &["xin".into()], "新");
+        d.log_commit(None, &["yong".into()], "用", None);
+        d.log_commit(Some(("用", "yong")), &["xin".into()], "新", None);
         lm::mine(d.conn()).unwrap();
         let a = bigram_count(&d, "停", "用");
         if a == 0 {
@@ -268,8 +273,8 @@ fn generation_bump_invalidates_stale_vocab_cache() {
     // 旧词「旧」与「词」建立 bigram。vocab 的 reading = 单次提交的读音串，
     // 候选 pinyin 键必须与之完全一致（Candidate.pinyin 同格式）。
     for _ in 0..3 {
-        d.log_commit(None, &["jiu".into()], "旧");
-        d.log_commit(Some(("旧", "jiu")), &["ci".into()], "词");
+        d.log_commit(None, &["jiu".into()], "旧", None);
+        d.log_commit(Some(("旧", "jiu")), &["ci".into()], "词", None);
     }
     lm::mine(d.conn()).unwrap(); // gen=1，此时 vocab_ids 已缓存
     d.set_lm_context(Some(("旧", "jiu")));

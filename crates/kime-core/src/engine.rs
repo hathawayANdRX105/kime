@@ -818,11 +818,14 @@ impl Engine {
         };
         // 离线 LM 原材料：记录 (上次提交词, 本词) 供挖掘 bigram。
         // 失败不阻塞上屏（log_commit 内部已吞错）。
+        // tail = 引擎自持的上屏前文尾（surrounding_text 末段），随 commit 落
+        // tail_ctx 列，离线挖掘按词库前缀切出真实相邻对（#89）。壳层零改动。
         let prev = self.last_commit.take();
         self.dict.log_commit(
             prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
             &reading,
             &cand.text,
+            self.context.as_deref(),
         );
         self.last_commit = Some((cand.text.clone(), reading.join("'")));
         // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
