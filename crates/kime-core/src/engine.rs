@@ -1015,7 +1015,7 @@ impl Engine {
                     // 不是被锁在「你们」整句里。末键半截（has_pending）时同样强制。
                     // 此分支只在双拼模式内，全拼的 context_seed 契约不受影响。
                     if !self.candidates.is_empty() && (has_pending || syllables.len() >= 2) {
-                        Self::append_first_syllable_candidates(
+                        Self::merge_first_syllable_candidates(
                             &mut self.candidates,
                             &self.dict,
                             &syllables,
@@ -1235,7 +1235,7 @@ impl Engine {
         // place_sentences 落好的整句名次零影响，空格首选永远是层一最优候选。
         if !cands.is_empty() {
             if let Some(full) = segs.first() {
-                Self::append_first_syllable_candidates(
+                Self::merge_first_syllable_candidates(
                     &mut cands,
                     &self.dict,
                     full,
@@ -1271,23 +1271,22 @@ impl Engine {
         None
     }
 
-    /// 长串降级（用户诉求）：**长串**（≥3 音节）拼音的候选被整句/长组合词占满但
-    /// 不足一页时，把首音节的单字候选追加到列表末尾（整句在前、单字在后，与
-    /// 「中文在前英文在后」的落位约定一致——英文块由 `merge_english` 之后统一
-    /// 追加，仍垫底）。用户翻页翻得到「我」这类首音节的字，选它继续组词。
+    /// 长串降级 + #87 交错：**长串**（≥3 音节）拼音的候选被整句/长组合词占满但
+    /// 不足一页时，把首音节的单字候选进同一列表——用户翻页翻得到「我」这类
+    /// 首音节的字，选它继续组词。
+    ///
+    /// #87 交错：单字不再一律追加垫底——**保护首段 + 双列稳定合并**：整串
+    /// 全覆盖的候选（整句 / 精确词，pinyin == 整串读音）构成的首段原样置顶
+    /// （「你好世界」不被低效单字越过），首段之后的池内按 eff 双列稳定合并——
+    /// 高频单字（「zhongguoren」的「中」90 万）顶到低效补全前，低频单字仍沉底；
+    /// 池内相对名次零扰动。按文本去重、总量截到 limit。
     ///
     /// 长度门控是硬契约：1–2 音节输入（`wo` / `zaishuo` 这类「一个词」）的候选
     /// 列表逐字不变——精确命中 + 补全本就够用，单字塞进来只会污染短串行为
     /// （`tests/context_seed_test.rs` 钉死了两音节输入的完整候选列表）。
-    ///
-    /// #87 交错：首音节单字不再无条件垫底——与主列表做**两列表稳定合并**：
-    /// 主列表名次零变化（层一加分名次 / 整句名次 / 块内序原样保留），单字
-    /// （`extra`，lookup 返回即 eff 降序）按自身 eff 插进主列表 item 之间
-    /// （`n.eff >= e.eff` 的主列表项先出，单字插到第一个更弱的主列表项之前）——
-    /// 高频单字（「ni」的「你」）顶到低频组合词前，低频单字仍沉底。
-    /// 总量截到 limit（翻页在平台层）；`syllables` = 整串首切分读音。
+    /// `syllables` = 整串首切分读音（与 `longest_prefix_candidates` 同源）；
     /// 音节不足 3 个、无完整切分 → 不动作（`force` = 双拼半截键强制）。
-    fn append_first_syllable_candidates(
+    fn merge_first_syllable_candidates(
         cands: &mut Vec<Candidate>,
         dict: &Dict,
         syllables: &[String],
@@ -1304,26 +1303,26 @@ impl Engine {
         if extra.is_empty() {
             return;
         }
-        // 预算独立于主查询：候选总量可远超一页，首音节单字全量进同一列表。
-        // 主列表相对序零扰动（稳定双列合并：extra 已 eff 降序，主列表 item
-        // eff >= 单字 eff 时先出，单字插在第一个更弱 item 前）。
-        let mut merged: Vec<Candidate> = Vec::with_capacity(cands.len() + extra.len());
-        let mut main_iter = cands.iter();
-        for e in extra.iter() {
-            while let Some(n) = main_iter.next() {
+        // 保护首段：整串全覆盖的候选（整句 / 精确词）置顶，单字不得越过。
+        let full_joined = syllables.join("'-");
+        let head = cands.iter().take_while(|c| c.pinyin == full_joined).count();
+        // 预算独立于主查询的 candidate_limit：候选总量可远超一页，首音节单字
+        // 全量进同一列表，翻页在平台层做。extra 已被 lookup 的 limit 约束为
+        // eff 降序的前 limit 条；双列稳定合并（池内序原样保留，#87 交错）。
+        let mut merged: Vec<Candidate> = cands[..head].to_vec();
+        let mut main = cands.iter().skip(head).peekable();
+        for e in &extra {
+            while let Some(n) = main.peek() {
                 if n.eff >= e.eff {
                     merged.push(n.clone());
+                    main.next();
                 } else {
-                    merged.push(e.clone());
                     break;
                 }
             }
-            if merged.last() != Some(e) {
-                // 主列表已耗尽（循环正常出）：单字在尾
-                merged.push(e.clone());
-            }
+            merged.push(e.clone());
         }
-        merged.extend(main_iter.cloned());
+        merged.extend(main.cloned());
         merged.truncate(limit);
         *cands = merged;
     }
@@ -1368,24 +1367,24 @@ impl Engine {
         best.map(|(reading, freq)| Seed { reading, freq })
     }
 
-    /// 整句候选名次（#87 版）：覆盖全部输入音节的句子按自身频率
-    /// （`lattice::sentence_score` 的联合概率折算值）在**统一分数池**里落位——
-    /// 池内第一个 freq 更弱的候选之前（旧的「层一永不被越过」不变式随 #87
-    /// 交错池废止：精确项已可被语料高频补全项插队，句子同池同理）。
+    /// 整句候选名次（工单第 4 条）：覆盖全部输入音节的句子属层一——
+    /// **永不压过层一的精确命中词**（ln(freq) 可加的代价模型里「两个超高频单字」
+    /// 永远比一个真词便宜，`ufme`→神么 压过 什么 是实测过的回归），
+    /// 但在补全区里按自身频率（`lattice::sentence_score` 的联合概率折算值）落位：
+    /// 精确块为空时，覆盖句因此排进 `我们确信`/`最近好吗` 这类
+    /// 「还要继续敲」的补全之前，而不是无条件钉死在列表末尾。
     /// 没覆盖全输入的句子（双拼半截键 pending）不参与落位，挂末尾。
-    /// #87：主列表是 dict 层的交错池（精确项带加分、可与补全项互越），L1 不再
-    /// 连续置顶——句子插入点 = 池内第一个 freq 更弱的候选之前（统一分数池语义）。
-    /// k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，否则频率折算
-    /// 会把更优的切分反-sort 到后面。
     fn place_sentences(cands: &mut Vec<Candidate>, sentences: Vec<Candidate>, joined: &str) {
-        let mut cursor = 0;
+        let l1_end = cands.iter().take_while(|c| c.pinyin == joined).count();
+        // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
+        // 否则频率折算会把更优的切分反-sort 到后面。
+        let mut cursor = l1_end;
         for sentence in sentences {
             if cands.iter().any(|c| c.text == sentence.text) {
                 continue;
             }
             let pos = if sentence.pinyin == joined {
-                // 池内 freq 降序近似：落在第一个比它弱的候选之前（#87 后 L1 互越，
-                // 「层一永不越过」不变式已废止）。
+                // 补全区是 freq 降序的：落在第一个比它弱的候选之前；层一永不被越过。
                 cursor
                     + cands[cursor..]
                         .iter()

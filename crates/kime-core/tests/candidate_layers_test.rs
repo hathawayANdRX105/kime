@@ -75,17 +75,14 @@ fn open_tail_still_reaches_longer_syllables(d: &Dict) {
     );
 }
 
-/// #87 交错排序（替代旧的「块拼接」验收）：`min` 输入时，裸频到达语料高频档的
-/// 补全字（明 286 万 / 名 180 万 / 命 136 万）凭 eff 自然插到精确字（民 90 万
-/// +EXACT_BONUS≈120 万）之前；精确加分（USER_BOOST 量级）仍保证 min 块整体
-/// 压住迷你（13 万）等更弱的补全。补全字可达性由 contains 检查保持。
-fn exact_layer_interleaves_with_high_freq_completions(d: &Dict) {
+/// 打 `min` 首屏必须是 min 自己的字（民/敏/…），明/名/命不得出现在前五，
+/// 但在 50 条列表里仍可达（tail 未打完 = 还允许继续补全）。
+fn exact_layer_leads_despite_lower_freq(d: &Dict) {
     let hits = d.lookup_prefix(&[], "min", 50).unwrap();
     assert_eq!(
         texts(&hits[..5]),
-        vec!["明", "名", "命", "民", "敏"],
-        "交错：补全字 eff 到语料高频档时插到精确字前，精确字带加分压住弱补全：{:?}",
-        texts(&hits)
+        vec!["民", "敏", "抿", "悯", "闵"],
+        "层一（key=min）必须先占住前五，哪怕明/名频率高一个数量级"
     );
     assert!(
         hits.iter().any(|c| c.text == "明"),
@@ -106,7 +103,7 @@ fn fst_paths_honor_the_layering_contract() {
     );
     completed_syllable_never_completes_into_longer_syllable(&d);
     open_tail_still_reaches_longer_syllables(&d);
-    exact_layer_interleaves_with_high_freq_completions(&d);
+    exact_layer_leads_despite_lower_freq(&d);
 }
 
 #[test]
@@ -115,7 +112,7 @@ fn sqlite_fallback_paths_honor_the_same_contract() {
     // 不 build dict.bin：store = None，走纯内存 index 回退路径
     let d = sqlite_dict(dir.path());
     open_tail_still_reaches_longer_syllables(&d);
-    exact_layer_interleaves_with_high_freq_completions(&d);
+    exact_layer_leads_despite_lower_freq(&d);
     let hits = d.lookup_prefix(&["min".into()], "", 20).unwrap();
     let got = texts(&hits);
     assert!(got.contains(&"民") && got.contains(&"迷你"), "{got:?}");
@@ -125,23 +122,22 @@ fn sqlite_fallback_paths_honor_the_same_contract() {
     );
 }
 
-/// 用户词不破层（#87 版）：把 `ming` 的明学成用户词后，它凭学后 eff（语料 286 万
-/// + USER_BOOST 30 万）合法地排到交错队列首位（`min` 的补全字本来就够格插进精确
-/// 字之间），但层归属不变：不得复制进层一、学后频率语义保留。
+/// 用户词不许破层：把 `ming` 的明学成用户词（freq 再高），打 min 的前五仍是 min 的字。
 #[test]
 fn user_word_cannot_jump_layers() {
     let dir = tempfile::tempdir().unwrap();
     let mut d = fst_dict(dir.path());
     d.learn(&["ming".into()], "明").unwrap();
     let hits = d.lookup_prefix(&[], "min", 50).unwrap();
+    assert_eq!(
+        texts(&hits[..5]),
+        vec!["民", "敏", "抿", "悯", "闵"],
+        "用户词明（层二成员）不得插队进层一"
+    );
+    // 但它在层二里以学后频率出现
     assert!(
         hits.iter().any(|c| c.text == "明" && c.freq == 2864493),
-        "学后频率语义必须保留：{:?}",
-        texts(&hits)
-    );
-    assert!(
-        hits.iter().filter(|c| c.text == "明").count() == 1,
-        "用户词明不得跨层复制成两条：{:?}",
+        "{:?}",
         texts(&hits)
     );
 }

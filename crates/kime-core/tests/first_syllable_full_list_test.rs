@@ -77,12 +77,22 @@ fn first_syllable_chars_survive_full_candidate_list() {
             "首音节单字「{ch}」应出现在候选列表，实际 {texts:?}"
         );
     }
-    // #87 落位契约（替代旧的「单字一律垫底」）：高频单字「中」（eff 90 万）按分数
-    // 插到主列表（词条 9000 量级）之前，成为首选；低频单字（钟 100 以下）仍沉底。
+    // 落位契约：整句/词条在前，单字在后（「中」不应抢「中国人」的首选位）
     let first = texts.first().expect("候选非空");
-    assert_eq!(
-        first, "中",
-        "高频单字应凭分数升顶（#87 核心诉求），实际 {first:?}"
+    assert!(
+        first.chars().count() > 1,
+        "首选应仍是整句/词条，实际 {first:?}"
+    );
+    // #87 升位契约：高频单字「中」（eff 90 万）须越过 L2 弱补全（9000 量级）
+    // 进入首屏——排在受保护的首段（整串全覆盖精确块 / 整句）之后、L2 之前，
+    let mid_pos = texts
+        .iter()
+        .position(|t| t == "中")
+        .expect("中必须在列表内");
+    assert!(
+        mid_pos < texts.len() / 3,
+        "中（eff 90 万）须升进列表前段（越过 9000 量级 L2，只让位于全覆盖精确块），\
+         实际位置 {mid_pos}：{texts:?}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
