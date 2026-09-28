@@ -199,7 +199,6 @@ impl Engine {
             after_digit: false,
             context: None,
             last_commit: None,
-            undo_consumed: Vec::new(),
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
