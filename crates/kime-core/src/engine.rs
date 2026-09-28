@@ -17,6 +17,8 @@ use kime_pinyin::segment;
 // evdev keycodes — wayland 原生即此值，平台壳无需翻译。
 const KEY_ESC: u32 = 1;
 const KEY_BACKSPACE: u32 = 14;
+/// evdev KEY_DELETE（11）：组合内前删（#85）
+const KEY_DELETE: u32 = 11;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_SPACE: u32 = 57;
@@ -52,6 +54,15 @@ pub enum Outcome {
     /// 转发给应用，并再补发 `usize` 对合成退格点击——把该次选词上屏的字符
     /// 从应用文本里逐个删掉（物理退格删第 1 个，合成点击删其余）。
     UndoApp(usize),
+    /// 智能标点撤销（#85，对齐 fcitx5 cancelLast）：空闲态退格撤销刚上屏的智能标点——
+    /// 壳删除应用文本里的 `fullwidth`（已上屏全角字符）并上屏 `original`（原半角按键串）。
+    /// 一次性：引擎发出后即清撤销状态，紧接着的第二次退格落 `Ignored`，不连环撤销。
+    PuncCancel {
+        /// 原半角按键串（如 "."）
+        original: String,
+        /// 已上屏的全角字符（如 "。"）
+        fullwidth: String,
+    },
 }
 
 pub struct Engine {
@@ -118,6 +129,12 @@ pub struct Engine {
     /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
     /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
     preedit_display: String,
+    /// 智能标点撤销状态（#85）：`Some((原半角按键串, 上屏全角字符))`。智能标点
+    /// 上屏（中文模式 `map_punct` 命中转换，如 "."→"。"）后置位；下一键为
+    /// 退格且空闲态（letters / pending / 候选全空）→ [`Outcome::PuncCancel`]，
+    /// 发出即清。turn 化（对齐 fcitx5 lastIsPunc 的 3s 窗）：除退格外任何键
+    /// 进 [`Self::key`] 入口即清除，过期态不会漏进删拼音 / 删词路径。
+    last_punc: Option<(String, String)>,
 }
 
 impl Engine {
@@ -144,6 +161,11 @@ impl Engine {
     /// 诊断/测试用：词级撤销栈顶（(消耗键串, 上屏字符数)，KIME_DEBUG 状态日志用）。
     pub fn undo_top(&self) -> Option<&(String, usize)> {
         self.undo_consumed.last()
+    }
+
+    /// 诊断/测试用：最近一次智能标点撤销状态（#85，(原半角按键串, 上屏全角字符)）。
+    pub fn last_punc(&self) -> Option<&(String, String)> {
+        self.last_punc.as_ref()
     }
 
     /// 清空词级撤销栈。
@@ -200,6 +222,7 @@ impl Engine {
             after_digit: false,
             context: None,
             last_commit: None,
+            last_punc: None,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
@@ -355,6 +378,12 @@ impl Engine {
     /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
     /// / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
+        // #85 标点撤销 turn 化：除退格外任何键进入口即清 last_punc（字母入组合 /
+        // 数字选词 / 空格释放 / 再标点 / Esc / Shift-flush / 翻页…全覆盖），
+        // 过期撤销态不会漏进后续删除路径。
+        if k.code != KEY_BACKSPACE {
+            self.last_punc = None;
+        }
         // 数字标志：数字键无论 outcome（选词命中/放行）都置位，其余任何键清零。
         let after_digit = std::mem::replace(
             &mut self.after_digit,
@@ -402,13 +431,17 @@ impl Engine {
         // （fcitx5 useBackSpaceToUnselect 对齐）：撤销栈非空（无论 letters 空否）
         // → 弹栈顶还原最近选词消耗的拼音（letters = 消耗段 + 剩余，光标归尾，
         // 候选重建，可再选词、也可继续组词）；栈净后才删光标**前**一个字符
-        // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态，Ignored
-        // 放行给应用删字符。长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
+        // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态：#85
+        // 标点撤销（last_punc 在 → PuncCancel，一次性）否则 Ignored 放行给应用。
+        // 长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
             // #81 pending 弹词最优先：释放前退格 = 弹最近预选词（纯内部，
             // 应用零删除），并成对弹出该词在 undo_consumed 里的无效条目；
             // pending 弹空后才进 #80 释放后 LIFO（undo_consumed / UndoApp）。
+            // 非空闲退格是消费键：清掉过期标点撤销态（#85）；双空（空闲态）
+            // 不在此清，留给下面的 PuncCancel 消费。
             if !self.pending_words.is_empty() {
+                self.last_punc = None;
                 self.pending_words.pop();
                 // 该词消耗的拼音弹回组合（可重新选词/组词），成对弹出
                 // undo_consumed 里该词的无效条目
@@ -422,9 +455,9 @@ impl Engine {
                 return Outcome::Consumed;
             }
             // 撤销优先（#77 起）+ #79 统一 undo：栈非空（无论 letters 空否）
-            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余），壳转发这次物理
-            // 双空 = 空闲态，Ignored 放行给应用删字符。
+            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余）
             if let Some((consumed, app_chars)) = self.undo_consumed.pop() {
+                self.last_punc = None;
                 let remaining = std::mem::take(&mut self.letters);
                 self.letters = format!("{consumed}{remaining}");
                 self.cursor = self.letters.len();
@@ -433,6 +466,7 @@ impl Engine {
                 return Outcome::UndoApp(app_chars.saturating_sub(1));
             }
             if !self.letters.is_empty() {
+                self.last_punc = None;
                 if self.cursor > 0 {
                     self.letters.remove(self.cursor - 1);
                     self.cursor -= 1;
@@ -441,7 +475,15 @@ impl Engine {
                 self.page_index = 0;
                 return Outcome::Consumed;
             }
-            return Outcome::Ignored;
+            // 双空 = 空闲态：#85 智能标点撤销（对齐 fcitx5 cancelLast，一次性）——
+            // 最近一次智能标点上屏记录在 last_punc → 发 PuncCancel（壳删全角
+            // 上屏 original），发出即清；无记录 → Ignored 放行给应用删字符。
+            if let Some((original, fullwidth)) = self.last_punc.take() {
+                return Outcome::PuncCancel {
+                    original,
+                    fullwidth,
+                };
+            }
         }
 
         // Esc — 有组合时清空并消费；无组合时放行给应用（退出全屏 vim、
@@ -526,6 +568,17 @@ impl Engine {
                 _ => {}
             }
         }
+        // #85 Delete 前删：组合内（letters 有拼音字符）按 KEY_DELETE（11）删光标
+        // 后 1 个拼音字符（对照 C-h 的后删，方向反转）；组合空 → Ignored 放行
+        // 应用前删。pending 预选词是已选词不是拼音，不参与前删。
+        if k.ch.is_none() && k.code == KEY_DELETE && !self.letters.is_empty() {
+            if self.cursor < self.letters.len() {
+                self.letters.remove(self.cursor);
+                self.refresh_candidates();
+                self.page_index = 0;
+            }
+            return Outcome::Consumed;
+        }
         // Ctrl+n / Ctrl+p 翻页（Emacs 风格，无候选 Ignored，越界钳位）
         if k.ctrl && !k.alt && !k.shift && !self.candidates.is_empty() {
             let total_pages = self.candidates.len().div_ceil(self.page_size());
@@ -590,10 +643,17 @@ impl Engine {
                     ('\'', true) => "’",
                     _ => mapped,
                 };
+                // #85 标点撤销：实际转换（上屏 "。" 等全角字符）时置撤销状态——
+                // 空闲态退格发 PuncCancel，壳删 `mapped` 上屏原 `c`。自映射
+                // 条目（mapped == c，无转换）不置。
+                let converted = *mapped != c.to_string();
                 if self.letters.is_empty() {
                     // 情况 A：无预编辑串。有 pending = 释放 pending + 标点；
                     // 无 pending = 直接上屏标点（#77 不变式：letters 空 ⟹ 链空）。
                     if self.pending_words.is_empty() {
+                        if converted {
+                            self.last_punc = Some((c.to_string(), mapped.to_string()));
+                        }
                         return Outcome::Commit(mapped.to_string());
                     }
                     let text = self.pending_words.join("");
@@ -601,6 +661,9 @@ impl Engine {
                     self.preedit_display.clear();
                     // 标点上屏 = 输入串结束：清空撤销栈
                     self.undo_consumed.clear();
+                    if converted {
+                        self.last_punc = Some((c.to_string(), mapped.to_string()));
+                    }
                     return Outcome::Commit(format!("{text}{mapped}"));
                 } else if !self.candidates.is_empty() {
                     // 情况 B（#81）：选当前页首候选入 pending，整段释放
@@ -611,6 +674,9 @@ impl Engine {
                     self.pending_words.clear();
                     self.preedit_display.clear();
                     self.undo_consumed.clear();
+                    if converted {
+                        self.last_punc = Some((c.to_string(), mapped.to_string()));
+                    }
                     return Outcome::Commit(format!("{text}{mapped}"));
                 } else {
                     // 情况 C：无候选词，字母串（连同 pending 整段）+ 标点
@@ -618,6 +684,9 @@ impl Engine {
                     let pending_text = self.pending_words.join("");
                     let text = format!("{pending_text}{}", self.letters);
                     self.clear_composition();
+                    if converted {
+                        self.last_punc = Some((c.to_string(), mapped.to_string()));
+                    }
                     return Outcome::Commit(format!("{text}{mapped}"));
                 }
             }
@@ -1947,7 +2016,7 @@ mod tests {
     }
 
     /// 标点上屏 = 输入串结束：部分选词剩组合时接标点（情况 B 顶字+标点），
-    /// 撤销链随 burst 终止，退格放行给应用、不再弹回旧选词的拼音。
+    /// 撤销链随 burst 终止；#85：智能标点转换后退格 = PuncCancel 还原原键。
     #[test]
     fn punct_commit_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -1966,10 +2035,19 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
+        // #85：空闲退格先消费「末次标点撤销」，不直接放行应用
+        assert_eq!(
+            e.key(code_k(KEY_BACKSPACE)),
+            Outcome::PuncCancel {
+                original: ".".into(),
+                fullwidth: "。".into()
+            },
+            "栈已清，退格先撤销智能标点转换"
+        );
         assert_eq!(
             e.key(code_k(KEY_BACKSPACE)),
             Outcome::Ignored,
-            "栈已清，退格放行"
+            "撤销已消费，再退格放行"
         );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
