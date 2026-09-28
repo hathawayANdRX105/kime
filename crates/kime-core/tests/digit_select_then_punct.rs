@@ -61,15 +61,15 @@ fn digit_select_then_comma_is_full_width() {
         Some("你好".to_string()),
         "fixture 下「你好」应为首候选"
     );
-    // 1 选首候选「你好」
+    // #81：1 选首候选「你好」入 pending（不上屏）
     match e.key(k('1')) {
-        Outcome::Commit(t) => assert_eq!(t, "你好"),
-        other => panic!("expected Commit(你好), got {:?}", other),
+        Outcome::Consumed => {}
+        other => panic!("expected pending Consumed, got {:?}", other),
     }
-    // 紧接着按逗号：必须是中文全角「，」
+    // 紧接着按逗号：释放 pending + 全角标点
     match e.key(k(',')) {
-        Outcome::Commit(t) => assert_eq!(t, "，", "digit 选词后逗号应为全角"),
-        other => panic!("expected Commit(，), got {:?}", other),
+        Outcome::Commit(t) => assert_eq!(t, "你好，", "pending 释放 + 逗号全角"),
+        other => panic!("expected Commit(你好，), got {:?}", other),
     }
 }
 
