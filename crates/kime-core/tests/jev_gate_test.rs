@@ -18,7 +18,7 @@ use kime_core::dict::Dict;
 use kime_core::lm::{self, gate_pairs, Jeving};
 use std::fs;
 use wiremock::matchers::{body_string_contains, method};
-use wiremock::{Mock, MockGuard, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn tmp_db(suffix: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -72,28 +72,26 @@ fn log_pair_3x(d: &mut Dict) {
 }
 
 /// 端点 mock：对 prompt（含「项目」）返回置信度 JSON 数组响应。
-async fn mock_confidence(scores: &str, expect_calls: u64) -> (MockServer, MockGuard) {
+/// 全局 mock（wiremock 官方 tokio 测试同款：mount + 函数末自然 drop），
+/// 计数验证走引擎侧（jev_gated/jev_skipped），不做 expect 断言。
+async fn mock_confidence(scores: &str) -> MockServer {
     let server = MockServer::start().await;
-    let mock = Mock::given(method("POST"))
+    Mock::given(method("POST"))
         .and(body_string_contains("项目"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "choices": [{"message": {"content": scores}}]
         })))
-        .expect(expect_calls)
-        .mount_as_scoped(&server)
+        .mount(&server)
         .await;
-    (server, mock)
+    server
 }
-
-/// 低置信对被门控拒绝：0.2 < 0.6 → 不入 bigram；被拒行的日志保留（下轮带
-/// 更多证据再判），C2 无尾行照删。
 #[tokio::test]
 async fn jev_gate_rejects_low_confidence() {
     let db = tmp_db("jev_reject");
     let mut d = Dict::open(&db).unwrap();
     log_pair_3x(&mut d);
 
-    let (server, guard) = mock_confidence("[0.2]", 1).await;
+    let server = mock_confidence("[0.2]").await;
     let gate = Jeving::new(server.uri(), "jev-latest".into(), None);
     let st = lm::mine_gated(d.conn(), Some(&gate)).unwrap();
 
@@ -101,8 +99,6 @@ async fn jev_gate_rejects_low_confidence() {
     assert_eq!(st.jev_skipped, 0, "端点可达，无降级");
     assert_eq!(bigram_count(&d, "项目", "进度"), 0, "被拒对不入 bigram");
     assert_eq!(log_rows_left(&d), 3, "被拒对的日志行保留（C2 无尾行已删）");
-    drop(guard); // wiremock 0.6.5：MockGuard drop 时同步验证 expect 计数
-    server.stop().await;
     let _ = fs::remove_file(&db);
 }
 
@@ -158,7 +154,7 @@ async fn phrase_case(conf: &str, expect_learned: bool) {
     let mut d = Dict::open(&db).unwrap();
     seed_phrase_candidate(&mut d);
 
-    let (server, guard) = mock_confidence(conf, 1).await;
+    let server = mock_confidence(conf).await;
     let gate = Jeving::new(server.uri(), "jev-latest".into(), None);
     let st = lm::mine_gated(d.conn(), Some(&gate)).unwrap();
 
@@ -182,8 +178,6 @@ async fn phrase_case(conf: &str, expect_learned: bool) {
         assert_eq!(st.jev_gated, 1, "被组词档拒绝");
         assert_eq!(learned, 0, "词库无「项目进度」");
     }
-    drop(guard); // MockGuard drop = 同步验证 expect 计数
-    server.stop().await;
     let _ = fs::remove_file(&db);
 }
 
