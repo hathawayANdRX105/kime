@@ -1951,16 +1951,18 @@ mod tests {
     #[test]
     fn punct_commit_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihaoni".chars() {
+        for c in "nihao".chars() {
             e.key(k(c));
         }
-        // #81：选词入 pending；标点 = 情况 B（选当前页首候选 + 释放整段 + 标点）
+        // #81：选词入 pending（nihao 完整消耗，letters 空）；标点 = 情况 A
+        // （letters 空 + pending 非空）：释放 pending + 标点，硬终结点
         assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
-        assert_eq!(e.letters, "ni", "部分选词剩拼音");
+        assert!(e.letters.is_empty());
+        assert_eq!(e.preedit(), "你好", "pending 显示");
         assert_eq!(e.undo_depth(), 1);
         // 标点上屏终结 burst
         match e.key(k('.')) {
-            Outcome::Commit(t) => assert_eq!(t, "你好ni。", "pending + 剩余拼音整段 + 标点"),
+            Outcome::Commit(t) => assert_eq!(t, "你好。", "pending 释放 + 标点"),
             other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
@@ -1977,7 +1979,7 @@ mod tests {
     #[test]
     fn backspace_to_empty_no_mode_path() {
         let (mut e, db, yaml) = engine_with_fixture();
-        for c in "nihaoni".chars() {
+        for c in "nihao".chars() {
             e.key(k(c));
         }
         // #81：选词入 pending → 再空格释放
@@ -1988,8 +1990,8 @@ mod tests {
         }
         // #77 撤销优先 + #79：第一下退格弹选词（还原原串、栈净、删上屏字）
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihaoni", "弹选词还原原串");
-        for _ in 0..7 {
+        assert_eq!(e.letters, "nihao", "弹选词还原原串");
+        for _ in 0..5 {
             assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         }
         assert!(e.letters.is_empty());
@@ -2124,11 +2126,11 @@ mod tests {
         // 下一页
         assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
         assert_eq!(e.page(), (1, 10));
-        // 页内数字 2 → 全局第 12 个候选
+        // 页内数字 2 → 全局第 12 个候选入 pending（#81）
         let out = e.key(k('2'));
         match out {
-            Outcome::Commit(t) => assert_eq!(t, "词11"),
-            other => panic!("expected commit, got {:?}", other),
+            Outcome::Consumed => assert!(e.preedit().contains("词11")),
+            other => panic!("expected pending Consumed, got {:?}", other),
         }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
