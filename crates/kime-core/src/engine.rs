@@ -189,6 +189,7 @@ impl Engine {
             last_reading: Vec::new(),
             preedit: String::new(),
             page_index: 0,
+            fuzzy_map,
             undo_consumed: Vec::new(),
             pending_words: Vec::new(),
             preedit_display: String::new(),
