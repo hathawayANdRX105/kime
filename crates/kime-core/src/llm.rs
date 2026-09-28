@@ -21,24 +21,38 @@ pub struct LlmRequest {
 pub struct LlmClient {
     endpoint: String,
     model: String,
+    api_key: Option<String>,
     blocking_client: reqwest::blocking::Client,
     async_client: reqwest::Client,
 }
 
 impl LlmClient {
     pub fn new(endpoint: String, model: String) -> Self {
+        Self::new_with_timeout(endpoint, model, Duration::from_secs(2))
+    }
+
+    /// 自定义超时构建（离线挖掘的 jev 判定调用慢于 IME 热路径，放宽到分钟级）。
+    pub fn new_with_timeout(endpoint: String, model: String, timeout: Duration) -> Self {
         Self {
             endpoint: endpoint.clone(),
             model: model.clone(),
+            api_key: None,
             blocking_client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(2))
+                .timeout(timeout)
                 .build()
                 .expect("Failed to build reqwest blocking client"),
             async_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
+                .timeout(timeout)
                 .build()
                 .expect("Failed to build reqwest async client"),
         }
+    }
+
+    /// 设置 API key（每次请求带 `Authorization: Bearer` 头）；None = 无鉴权头。
+    /// jev 门控的 key 只从 CLI `--jev-key` / KIME_JEV_KEY 传入，不落 config。
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
     }
 
     /// 发送 LLM 请求（同步版本，供测试用）
@@ -51,29 +65,32 @@ impl LlmClient {
         context: Option<&str>,
     ) -> Result<Vec<Candidate>, String> {
         let prompt = build_prompt(syllables, context);
+        let text = self.chat_raw_sync(&prompt, 100)?;
+        Ok(parse_candidates(&text, syllables))
+    }
+
+    /// OpenAI 兼容单轮裸请求：返回 `choices[0].message.content` 原文，
+    /// 由调用方自行解析（jev 门控的置信度表走这里）；协议与
+    /// `request_sync` 同源，不新增 HTTP 客户端。
+    pub fn chat_raw_sync(&self, prompt: &str, max_tokens: u32) -> Result<String, String> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 100,
+            "max_tokens": max_tokens,
         });
-
-        let resp = self
-            .blocking_client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .map_err(|e| format!("HTTP 错误: {}", e))?;
-
+        let mut req = self.blocking_client.post(&self.endpoint).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().map_err(|e| format!("HTTP 错误: {}", e))?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-
         let json: serde_json::Value = resp.json().map_err(|e| format!("JSON 解析失败: {}", e))?;
-        let text = json["choices"][0]["message"]["content"]
+        Ok(json["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("");
-
-        Ok(parse_candidates(text, syllables))
+            .unwrap_or("")
+            .to_string())
     }
 
     /// 发送 LLM 请求（异步版本，供壳侧后台线程用）

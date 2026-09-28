@@ -156,3 +156,7 @@
 
 - [x] 上屏时把引擎 context（落屏句上屏前文尾）落 `commit_log.tail_ctx`；离线挖掘按词库前缀切成前词、取总频最高切分补 (前词, 本词) 真实相邻对；`ctx_id IS NULL` 且有尾的行也参与挖掘（C2 不变式保留），旧库缺列 `Dict::open` 自动 ALTER 补列
 
+## M20 — 挖掘 jev 置信度门控（#88）
+
+- [x] `mine-lm --jev`：准入对 / 组词对先送 jev noul 判定（OpenAI 兼容端点，凭据走 CLI/环境变量不落盘），bigram 档 conf ≥ 0.6、组词档 ≥ 0.7 才准入；端点失败整批降级纯计数（`jev_gated` / `jev_skipped` 计数），无 `--jev` 行为与合入前一致
+
