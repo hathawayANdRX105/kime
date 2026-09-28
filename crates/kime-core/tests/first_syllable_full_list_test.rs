@@ -29,7 +29,8 @@ const CN: &str = "---\nname: test\n...\n\
 中介人\tzhong guo ren\t4000\n\
 钟国人\tzhong guo ren\t3000\n\
 忠国人\tzhong guo ren\t2000\n\
-众国人\tzhong guo ren\t1000\n";
+众国人\tzhong guo ren\t1000\n\
+中国人吗\tzhong guo ren ma\t500\n";
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -82,6 +83,21 @@ fn first_syllable_chars_survive_full_candidate_list() {
     assert!(
         first.chars().count() > 1,
         "首选应仍是整句/词条，实际 {first:?}"
+    );
+    // #87 升位契约：高频首音节单字「中」（eff 90 万）按分数越过 L2 弱补全
+    // 「中国人吗」（500 量级）——旧「一律追加垫底」行为会把 中 排在它之后；
+    // 受保护首段（整串全覆盖 L1 精确词）仍先行，中 落在首段之后。
+    let mid_pos = texts
+        .iter()
+        .position(|t| t == "中")
+        .expect("中必须在列表内");
+    let ma_pos = texts
+        .iter()
+        .position(|t| t == "中国人吗")
+        .expect("弱补全必须仍在列表内");
+    assert!(
+        mid_pos < ma_pos,
+        "中（90 万）须越过低频补全 中国人吗（500），实际 中={mid_pos:?} 中国人吗={ma_pos:?}：{texts:?}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

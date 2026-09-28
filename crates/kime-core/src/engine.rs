@@ -1015,7 +1015,7 @@ impl Engine {
                     // 不是被锁在「你们」整句里。末键半截（has_pending）时同样强制。
                     // 此分支只在双拼模式内，全拼的 context_seed 契约不受影响。
                     if !self.candidates.is_empty() && (has_pending || syllables.len() >= 2) {
-                        Self::append_first_syllable_candidates(
+                        Self::merge_first_syllable_candidates(
                             &mut self.candidates,
                             &self.dict,
                             &syllables,
@@ -1235,7 +1235,7 @@ impl Engine {
         // place_sentences 落好的整句名次零影响，空格首选永远是层一最优候选。
         if !cands.is_empty() {
             if let Some(full) = segs.first() {
-                Self::append_first_syllable_candidates(
+                Self::merge_first_syllable_candidates(
                     &mut cands,
                     &self.dict,
                     full,
@@ -1271,20 +1271,22 @@ impl Engine {
         None
     }
 
-    /// 长串降级（用户诉求）：**长串**（≥3 音节）拼音的候选被整句/长组合词占满但
-    /// 不足一页时，把首音节的单字候选追加到列表末尾（整句在前、单字在后，与
-    /// 「中文在前英文在后」的落位约定一致——英文块由 `merge_english` 之后统一
-    /// 追加，仍垫底）。用户翻页翻得到「我」这类首音节的字，选它继续组词。
+    /// 长串降级 + #87 交错：**长串**（≥3 音节）拼音的候选被整句/长组合词占满但
+    /// 不足一页时，把首音节的单字候选进同一列表——用户翻页翻得到「我」这类
+    /// 首音节的字，选它继续组词。
+    ///
+    /// #87 交错：单字不再一律追加垫底——**保护首段 + 双列稳定合并**：整串
+    /// 全覆盖的候选（整句 / 精确词，pinyin == 整串读音）构成的首段原样置顶
+    /// （「你好世界」不被低效单字越过），首段之后的池内按 eff 双列稳定合并——
+    /// 高频单字（「zhongguoren」的「中」90 万）顶到低效补全前，低频单字仍沉底；
+    /// 池内相对名次零扰动。按文本去重、总量截到 limit。
     ///
     /// 长度门控是硬契约：1–2 音节输入（`wo` / `zaishuo` 这类「一个词」）的候选
     /// 列表逐字不变——精确命中 + 补全本就够用，单字塞进来只会污染短串行为
     /// （`tests/context_seed_test.rs` 钉死了两音节输入的完整候选列表）。
-    ///
-    /// 只做追加：按文本去重、总量截到 limit，层一精确命中块与 `place_sentences`
-    /// 落好的整句名次零变化，空格首选永远是层一最优候选。
     /// `syllables` = 整串首切分读音（与 `longest_prefix_candidates` 同源）；
-    /// 音节不足 3 个、候选已满一页（>= page_size）或无完整切分 → 不动作。
-    fn append_first_syllable_candidates(
+    /// 音节不足 3 个、无完整切分 → 不动作（`force` = 双拼半截键强制）。
+    fn merge_first_syllable_candidates(
         cands: &mut Vec<Candidate>,
         dict: &Dict,
         syllables: &[String],
@@ -1298,12 +1300,31 @@ impl Engine {
             return;
         };
         extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
-        // 预算独立于主查询的 candidate_limit：之前 truncate 到「剩余空间」，
-        // 主查询占满 50 时剩余 0 → max(1) 只追加 1 个单字（zhongguoren 实测
-        // 只剩 1 个「中」）。参照 qingjian/fcitx5：候选总量可远超一页，首音节
-        // 单字全量进同一列表，翻页在平台层做。extra 本身已被 lookup 的 limit
-        // 约束为 freq 降序的前 limit 条，追加在末尾不污染层一/整句名次。
-        cands.extend(extra);
+        if extra.is_empty() {
+            return;
+        }
+        // 保护首段：整串全覆盖的候选（整句 / 精确词）置顶，单字不得越过。
+        let full_joined = syllables.join("'");
+        let head = cands.iter().take_while(|c| c.pinyin == full_joined).count();
+        // 预算独立于主查询的 candidate_limit：候选总量可远超一页，首音节单字
+        // 全量进同一列表，翻页在平台层做。extra 已被 lookup 的 limit 约束为
+        // eff 降序的前 limit 条；双列稳定合并（池内序原样保留，#87 交错）。
+        let mut merged: Vec<Candidate> = cands[..head].to_vec();
+        let mut main = cands.iter().skip(head).peekable();
+        for e in extra.iter() {
+            while let Some(n) = main.peek() {
+                if n.eff >= e.eff {
+                    merged.push((*n).clone());
+                    main.next();
+                } else {
+                    break;
+                }
+            }
+            merged.push(e.clone());
+        }
+        merged.extend(main.map(|n| n.clone()));
+        merged.truncate(limit);
+        *cands = merged;
     }
     /// 由上下文尾巴反查「上文末词」的读音，作为整句联想的种子（上下文感知）。
     ///
