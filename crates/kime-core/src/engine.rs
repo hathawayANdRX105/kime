@@ -73,7 +73,7 @@ pub struct Engine {
     /// 当前候选是否出自双拼解码路径（含半截键 pending）。true 时选词消耗按**键位**计：
     /// 一个完整双拼音节恒等于 2 个键位，其拼音字母数与键位数无关（neng 4 字母但
     /// `ng` 只 2 键）——按字母消耗会吃掉下一音节的键位（长串逐字单选剩余拼音被截断的
-    /// 根因，见 [`Self::commit_candidate`]）。`refresh_candidates` 双拼解码成功分支置
+    /// 根因，见 [`Self::select_candidate`]）。`refresh_candidates` 双拼解码成功分支置
     /// true（双拼回退全拼后仍无候选时也恢复 true：候选全来自双拼音节序列）；
     /// 全拼路径（双拼解码失败、或回退全拼查到了词）置 false。
     sp_active: bool,
@@ -110,6 +110,14 @@ pub struct Engine {
     /// 退格：栈非空 = 撤销最近选词（拼音还原 + UndoApp(n) 让壳删上屏字）；
     /// 栈净 = 逐字删拼音；双空 = 放行应用。
     undo_consumed: Vec<(String, usize)>,
+    /// 预选缓冲（#81）：已选但**尚未释放**的词（LIFO；释放 = 拼音选完后的
+    /// 空格 / 标点 / Enter / Shift-flush，整段一次性上屏）。上屏前退格
+    /// = 弹最近选词（纯内部，应用零删除）；弹词时同序弹出该词在
+    /// undo_consumed 里配对入栈的条目（未释放 = 无效撤销记录）。
+    pending_words: Vec<String>,
+    /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
+    /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
+    preedit_display: String,
 }
 
 impl Engine {
@@ -181,7 +189,9 @@ impl Engine {
             last_reading: Vec::new(),
             preedit: String::new(),
             page_index: 0,
-            fuzzy_map,
+            undo_consumed: Vec::new(),
+            pending_words: Vec::new(),
+            preedit_display: String::new(),
             span_cache: crate::lattice::SpanCache::default(),
             punct_mode,
             quote_open: None,
@@ -197,9 +207,9 @@ impl Engine {
         self.chinese
     }
 
-    /// 当前 preedit：未上屏拼音串（如 "niha"）
+    /// 当前 preedit 显示串（#81：预选词拼接 + 未上屏拼音，如 "你好niha"）
     pub fn preedit(&self) -> &str {
-        &self.preedit
+        &self.preedit_display
     }
 
     /// (当前页, 页大小) — 候选窗布局用
@@ -227,8 +237,10 @@ impl Engine {
     /// 奇数位光标补上半截键所代表的声母（与 refresh 的 pending 同一算法）。
     pub fn preedit_cursor(&self) -> usize {
         let pe_len = self.preedit.chars().count();
+        // #81：显示串前缀 = 预选词拼接，caret 偏移同量
+        let pending_len: usize = self.pending_words.iter().map(|w| w.chars().count()).sum();
         if self.sp.is_none() || self.preedit == self.letters {
-            return self.cursor.min(pe_len);
+            return pending_len + self.cursor.min(pe_len);
         }
         let full_pairs = self.cursor / 2;
         let mut idx: usize = self.last_reading[..full_pairs.min(self.last_reading.len())]
@@ -240,7 +252,7 @@ impl Engine {
                 idx += self.sp.as_ref().unwrap().initial_of(c).chars().count();
             }
         }
-        idx.min(pe_len)
+        pending_len + idx.min(pe_len)
     }
 
     /// 更新输入框上下文尾巴（平台壳在 `surrounding_text` 事件时调用）。
@@ -256,9 +268,6 @@ impl Engine {
     /// 全量清空组合：候选/读音/preedit/页码/光标一并归位。所有上屏与 Esc 路径共用。
     ///
     /// #79 起清组合 = 硬终结点：撤销链随之清空（Esc / 壳层焦点抖动的合成
-    /// Esc 都走这里）。注意全量选词上屏**不走**此路（commit_candidate 只截
-    /// 串不清组合）——链跨上屏存活，退格可弹上屏字，回退统一。
-    /// （#70「抖动保留栈」旧契约由 #77 作废；#79 再改链生命周期。）
     fn clear_composition(&mut self) {
         self.letters.clear();
         self.candidates.clear();
@@ -269,20 +278,31 @@ impl Engine {
         self.last_joined.clear();
         self.sp_active = false;
         self.undo_consumed.clear();
+        self.pending_words.clear();
+        self.preedit_display.clear();
     }
 
-    /// 选词上屏：learn + 清空候选/页码，但**只消耗被选候选覆盖的音节**，
-    /// 剩余字母重组回 letters 继续组词。
+    /// 重建 preedit 显示串 = 预选词拼接 + 剩余拼音缓存（#81）。
+    /// 所有改 pending / preedit 缓存的路径末尾调一次。
+    fn rebuild_preedit_display(&mut self) {
+        let mut s: String = self.pending_words.concat();
+        s.push_str(&self.preedit);
+        self.preedit_display = s;
+    }
+
+    /// 选词入 pending（#81）：learn + 清空候选/页码，但**只消耗被选候选
+    /// 覆盖的音节**，剩余字母重组回 letters 继续组词；词进
+    /// pending_words 缓冲（不立即上屏，等释放：拼音选完后的空格 /
+    /// 标点 / Enter / Shift-flush 整段上屏）。撤销栈条目同步入栈
+    /// （未释放前无效：退格弹 pending 时成对弹出；释放后存活为
+    /// #80 LIFO 条目）。
     ///
-    /// 用户诉求：打长串 `womendoubuzhidao` 翻页选了首音节单字「我」后，
-    /// 之前的实现把整串字母全清掉，没法接着选「们」「都」……。候选自带
-    /// 读音（pinyin 按 `'` 切分），能算出消耗了几个音节；剩余音节拼回
-    /// 字母串，refresh_candidates 重新出候选。
-    ///
-    /// 剩余音节不足一个完整音节（半截尾）时也保留——用户继续打字补全。
-    /// 候选无自带读音（AI 注入）时回退整串消耗（last_reading 是首切分，
-    /// 无法可靠对齐字母边界，保持旧行为）。
-    fn commit_candidate(&mut self, cand: &Candidate) -> Outcome {
+    /// 候选自带读音（pinyin 按 `'` 切分）：打长串 `womendoubuzhidao`
+    /// 翻页选了「我」后剩余音节拼回字母串，refresh_candidates 重新
+    /// 出候选，可继续选「们」「都」。双拼按**键位**消耗（每音节恒
+    /// 2 键），按字母会吃掉下一音节键位。候选无自带读音（AI 注入）
+    /// 时回退整串消耗。
+    fn select_candidate(&mut self, cand: &Candidate) -> Outcome {
         let text = cand.text.clone();
         self.learn_or_warn(cand);
 
@@ -291,8 +311,8 @@ impl Engine {
         } else {
             cand.pinyin.split('\'').map(str::to_string).collect()
         };
-        // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；双拼按**键位**
-        // 消耗（每音节恒 2 键），否则 neng（4 字母）会多吃掉下一音节的键位。
+        // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；
+        // 双拼按键位消耗（见 doc）。
         let old_len = self.letters.len();
         let remaining = if self.sp_active {
             let k = consumed.len();
@@ -312,7 +332,6 @@ impl Engine {
         self.preedit.clear();
         self.last_reading.clear();
         // 词级撤销：记下本次选词消耗的拼音键串（原串前段）+ 上屏字符数。
-        // 退格弹栈时拼音还原进组合，壳按字符数补发应用退格删掉上屏字（#79）。
         let undo_entry = self.letters[..old_len - remaining.len()].to_string();
         self.letters = remaining;
         if !undo_entry.is_empty() {
@@ -321,14 +340,16 @@ impl Engine {
                 self.undo_consumed.remove(0);
             }
         }
-        // 光标落在剩余拼音末尾：caret 在「最后」，后续打字续在尾部；
-        // 此前复位 0 导致剩余 preedit 前移、新字符插到头部（「光标不是最后」根因）。
+        // 词进 pending 缓冲（#81：不立即上屏）
+        self.pending_words.push(text);
+        // 光标落在剩余拼音末尾：caret 在「最后」，后续打字续在尾部。
         self.cursor = self.letters.len();
 
         if !self.letters.is_empty() {
             self.refresh_candidates();
         }
-        Outcome::Commit(text)
+        self.rebuild_preedit_display();
+        Outcome::Consumed
     }
 
     /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
@@ -358,10 +379,13 @@ impl Engine {
             && !k.alt
             && (k.code == KEY_LEFTSHIFT || k.code == KEY_RIGHTSHIFT)
         {
-            if self.letters.is_empty() {
+            // #81：Shift-flush 连同 pending 整段冲刷（硬终结点：清组合含
+            // 预选词与撤销栈，输入串结束）
+            let pending_text = self.pending_words.join("");
+            if self.letters.is_empty() && pending_text.is_empty() {
                 return Outcome::Consumed;
             }
-            let text = self.letters.clone();
+            let text = format!("{pending_text}{}", self.letters);
             // 清组合（#77 起同步清撤销栈）：Shift-flush 原样上屏 = 输入串结束。
             self.clear_composition();
             return Outcome::Commit(text);
@@ -381,9 +405,24 @@ impl Engine {
         // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态，Ignored
         // 放行给应用删字符。长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
+            // #81 pending 弹词最优先：释放前退格 = 弹最近预选词（纯内部，
+            // 应用零删除），并成对弹出该词在 undo_consumed 里的无效条目；
+            // pending 弹空后才进 #80 释放后 LIFO（undo_consumed / UndoApp）。
+            if !self.pending_words.is_empty() {
+                self.pending_words.pop();
+                // 该词消耗的拼音弹回组合（可重新选词/组词），成对弹出
+                // undo_consumed 里该词的无效条目
+                let (consumed, _chars) = self.undo_consumed.pop().unwrap_or_default();
+                let remaining = std::mem::take(&mut self.letters);
+                self.letters = format!("{consumed}{remaining}");
+                self.cursor = self.letters.len();
+                self.page_index = 0;
+                self.refresh_candidates();
+                self.rebuild_preedit_display();
+                return Outcome::Consumed;
+            }
             // 撤销优先（#77 起）+ #79 统一 undo：栈非空（无论 letters 空否）
             // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余），壳转发这次物理
-            // 退格并补发 app_chars-1 对合成退格删掉上屏字。栈净才删拼音；
             // 双空 = 空闲态，Ignored 放行给应用删字符。
             if let Some((consumed, app_chars)) = self.undo_consumed.pop() {
                 let remaining = std::mem::take(&mut self.letters);
@@ -409,9 +448,12 @@ impl Engine {
         // 关闭对话框等）。之前无条件 Consumed，空组合按 ESC 被吞掉，
         // 与英文模式行为不一致。
         if k.ch.is_none() && k.code == KEY_ESC {
-            if self.letters.is_empty() {
+            if self.letters.is_empty() && self.pending_words.is_empty() {
                 return Outcome::Ignored;
             }
+            // #81：Esc = 整句取消——预选词 + 剩余拼音全清，不上屏；
+            // 已释放词的撤销链（undo_consumed）不动。clear_composition
+            // 同时清 pending 与显示串。
             self.clear_composition();
             return Outcome::Consumed;
         }
@@ -500,10 +542,21 @@ impl Engine {
             }
         }
 
-        // Space — 无候选时放行；有候选时上屏首选并清空。
+        // 空格 — 有候选 = 选当前页首候选入 pending（#81：不再写死第一页，
+        // 翻页 page_index 参与提交）；无候选且有 pending = 整段释放上屏；
+        // 双空 = 放行。
         if k.ch.is_none() && k.code == KEY_SPACE {
-            if let Some(top) = self.candidates.first().cloned() {
-                return self.commit_candidate(&top);
+            if !self.candidates.is_empty() {
+                let top = self.candidates[self.highlight()].clone();
+                return self.select_candidate(&top);
+            }
+            if !self.pending_words.is_empty() {
+                // 整段释放（#81）：pending 一次性上屏。撤销链**不清**——
+                // 释放后退格走 #80 LIFO 逐词弹回 + 应用级删除。
+                let text = self.pending_words.join("");
+                self.pending_words.clear();
+                self.preedit_display.clear();
+                return Outcome::Commit(text);
             }
             return Outcome::Ignored;
         }
@@ -538,27 +591,34 @@ impl Engine {
                     _ => mapped,
                 };
                 if self.letters.is_empty() {
-                    // 情况 A：无预编辑串，直接上屏标点。#77 不变式
-                    // （letters 空 ⟹ 栈空）保证撤销栈已空，不冗余清栈。
-                    return Outcome::Commit(mapped.to_string());
-                } else {
-                    // 有预编辑串，检查是否存在候选词
-                    if let Some(top) = self.candidates.first().cloned() {
-                        // 情况 B：顶字上屏，拼接标点。剩余音节保留由
-                        // commit_candidate 处理；标点拼到本次提交文本尾。
-                        match self.commit_candidate(&top) {
-                            Outcome::Commit(t) => {
-                                // 情况 B 上屏 = 输入串结束：清空撤销栈
-                                self.undo_consumed.clear();
-                                return Outcome::Commit(format!("{}{}", t, mapped));
-                            }
-                            other => return other,
-                        }
-                    } else {
-                        // 情况 C：无候选词，字母串+标点上屏（= 输入串结束：清空撤销栈）
-                        self.undo_consumed.clear();
-                        return Outcome::Commit(format!("{}{}", self.letters, mapped));
+                    // 情况 A：无预编辑串。有 pending = 释放 pending + 标点；
+                    // 无 pending = 直接上屏标点（#77 不变式：letters 空 ⟹ 链空）。
+                    if self.pending_words.is_empty() {
+                        return Outcome::Commit(mapped.to_string());
                     }
+                    let text = self.pending_words.join("");
+                    self.pending_words.clear();
+                    self.preedit_display.clear();
+                    // 标点上屏 = 输入串结束：清空撤销栈
+                    self.undo_consumed.clear();
+                    return Outcome::Commit(format!("{text}{mapped}"));
+                } else if !self.candidates.is_empty() {
+                    // 情况 B（#81）：选当前页首候选入 pending，整段释放
+                    // pending + 标点；标点 = 输入串结束（硬终结点清栈）。
+                    let top = self.candidates[self.highlight()].clone();
+                    self.select_candidate(&top);
+                    let text = self.pending_words.join("");
+                    self.pending_words.clear();
+                    self.preedit_display.clear();
+                    self.undo_consumed.clear();
+                    return Outcome::Commit(format!("{text}{mapped}"));
+                } else {
+                    // 情况 C：无候选词，字母串（连同 pending 整段）+ 标点
+                    // 原样上屏（= 输入串结束：clear_composition 清 pending 与撤销栈）
+                    let pending_text = self.pending_words.join("");
+                    let text = format!("{pending_text}{}", self.letters);
+                    self.clear_composition();
+                    return Outcome::Commit(format!("{text}{mapped}"));
                 }
             }
         }
@@ -580,7 +640,7 @@ impl Engine {
                     let offset = if digit == 0 { 9 } else { digit - 1 };
                     let idx = self.page_index * self.page_size() + offset;
                     if let Some(cand) = self.candidates.get(idx).cloned() {
-                        let r = self.commit_candidate(&cand);
+                        let r = self.select_candidate(&cand);
                         // 数字在此被消费成中文候选上屏，不是输出字面数字；
                         // after_digit 必须清零，否则下一个 ,.: 会被误当数字分隔符放行半角。
                         self.after_digit = false;
@@ -596,10 +656,18 @@ impl Engine {
         //   无字母 → Ignored，回车原样放行。
         if k.ch.is_none() && k.code == 28 {
             if !self.letters.is_empty() {
-                let text = self.letters.clone();
+                // 有字母（#81：连同 pending 整段）原样上屏，组合清空、面板
+                // 消失、撤销栈清空（输入串结束）。
+                let text = format!("{}{}", self.pending_words.join(""), self.letters);
                 self.clear_composition();
-                // Enter 原样上屏 = 输入串结束：清空撤销栈
-                self.undo_consumed.clear();
+                return Outcome::Commit(text);
+            }
+            if !self.pending_words.is_empty() {
+                // 无字母有 pending（#81）：Enter = 整段释放，撤销链存活
+                // （释放后 LIFO 可退格弹回）
+                let text = self.pending_words.join("");
+                self.pending_words.clear();
+                self.preedit_display.clear();
                 return Outcome::Commit(text);
             }
             return Outcome::Ignored;
@@ -716,6 +784,7 @@ impl Engine {
             self.candidates.clear();
             self.last_reading.clear();
             self.preedit.clear();
+            self.rebuild_preedit_display();
             self.last_joined.clear();
             return;
         }
@@ -773,6 +842,7 @@ impl Engine {
                     self.sp_active = true;
                     self.last_reading = syllables.clone();
                     self.preedit = format!("{}{}", syllables.join(""), pending);
+                    self.rebuild_preedit_display();
                     self.last_joined = sp_joined.clone();
                     let mut cands = self
                         .dict
@@ -850,6 +920,7 @@ impl Engine {
                             // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                             self.last_reading = syllables.clone();
                             self.preedit = format!("{}{}", syllables.join(""), pending);
+                            self.rebuild_preedit_display();
                             self.last_joined = sp_joined.clone();
                         }
                         // pending（半截键对）非空时句子没有消耗全部输入 → 不抢层一名次。
@@ -940,6 +1011,7 @@ impl Engine {
 
         self.last_reading = reading.clone();
         self.preedit = self.letters.clone();
+        self.rebuild_preedit_display();
         self.last_joined = joined_key(&reading, &tail);
 
         // 主路径查询（首切分，显示与层一契约以它为准）
@@ -1435,11 +1507,11 @@ mod tests {
         for c in "nih".chars() {
             e.key(k(c));
         }
-        // 1 选词 "你好"，应触发 learn -> 候选顺序变化
+        // 1 选词 "你好"（#81 起入 pending，不上屏），应触发 learn -> 候选顺序变化
         let outcome = e.key(k('1'));
         match outcome {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit(你好), got {:?}", other),
+            Outcome::Consumed => {}
+            other => panic!("expected Consumed(pending), got {:?}", other),
         }
         // 再查询，确保排序已更新（用户词频率更高）
         let mut e2 = Engine::new(Dict::open(&db).unwrap(), Config::default());
@@ -1458,11 +1530,15 @@ mod tests {
         for c in "nih".chars() {
             e.key(k(c));
         }
+        // #81：空格选词 = 入 pending（不上屏），再按空格整段释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.preedit(), "你好", "pending 进显示串");
+        assert!(e.candidates().is_empty());
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
-        assert!(e.preedit().is_empty());
+        assert!(e.preedit().is_empty(), "释放后显示串清空");
         assert!(e.candidates().is_empty());
         // 学习后再次查询，用户词频率更高
         let mut e2 = Engine::new(Dict::open(&db).unwrap(), Config::default());
@@ -1559,10 +1635,10 @@ mod tests {
         }
         let outcome = e.key(k('1'));
         match outcome {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit(你好), got {:?}", other),
+            Outcome::Consumed => {}
+            other => panic!("expected Consumed(pending), got {:?}", other),
         }
-        assert!(e.preedit().is_empty());
+        assert_eq!(e.preedit(), "你好", "数字选词入 pending（#81）");
         assert!(e.candidates().is_empty());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
@@ -1574,9 +1650,12 @@ mod tests {
         for c in "nih".chars() {
             e.key(k(c));
         }
+        // #81：空格选词入 pending，再按空格整段释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.preedit(), "你好");
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
         assert!(e.preedit().is_empty());
         let _ = fs::remove_file(&db);
@@ -1629,15 +1708,15 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit(你好), got {:?}", other),
-        }
+        // #81：空格选词入 pending（不上屏），显示串 = pending + 剩余拼音
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "ni", "剩余拼音必须保留");
-        assert_eq!(e.cursor(), e.letters.len(), "光标必须在剩余拼音末尾");
-        assert_eq!(e.preedit_cursor(), e.letters.len());
+        assert_eq!(e.preedit(), "你好ni", "显示串含预选词");
+        assert_eq!(e.cursor(), e.letters.len(), "光标在剩余拼音末尾");
+        assert_eq!(e.preedit_cursor(), 4, "caret = 你好(2) + ni(2)");
         e.key(k('h'));
         assert_eq!(e.letters, "nih", "新字符续在剩余拼音尾部");
+        assert_eq!(e.preedit(), "你好nih");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1650,9 +1729,12 @@ mod tests {
         for c in "nihao".chars() {
             e.key(k(c));
         }
+        // #81：第一次空格 = 选词入 pending（不上屏）；第二次 = 整段释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.preedit(), "你好", "pending 显示");
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
         assert!(e.letters.is_empty());
         assert_eq!(e.undo_depth(), 1, "全量选词上屏，撤销链跨上屏存活");
@@ -1667,38 +1749,46 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #79 用户场景（ufmewfti = 什么问题 的等价）：连续两次选词上屏
-    /// （你好 + 泥猴），退格 LIFO 逐条弹回——先弹最近一次（泥猴 的拼音
-    /// 弹回可重组），再弹第一条还原整串；每次弹回都带应用删除指令。
-    /// （单 burst 内部分选词的弹回见 backspace_partial_selection_undoes_in_order；
-    /// 整串输入时 lattice 会拼整句候选，首候选即全句，故 LIFO 用顺序两 burst。）
+    /// #81 预选 + #80 LIFO：连选两词（你好 + 泥猴）入 pending；释放前
+    /// 退格 = 逐词弹出（拼音弹回可重组，应用零删除）；释放后 = LIFO
+    /// 弹回 + 应用级删除。
     #[test]
     fn two_word_chain_pops_in_lifo_order() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit(你好), got {:?}", other),
-        }
+        // 选词入 pending（#81：不上屏）
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.preedit(), "你好");
         for c in "nihou".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "泥猴"),
-            other => panic!("expected Commit(泥猴), got {:?}", other),
-        }
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.preedit(), "你好泥猴", "两词都在 pending");
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 2, "两次选词 = 两条撤销记录");
-        // 第一下退格 = 撤销最近一次（泥猴）：拼音弹回 + 壳删 2 上屏字
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihou", "先清理最近选词（可重新组词）");
+        assert_eq!(
+            e.undo_depth(),
+            2,
+            "两次选词 = 两条栈条目（与 pending 配对）"
+        );
+        // 释放前退格 = 弹最近词（泥猴）：拼音弹回、应用零删除
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihou", "弹词拼音可重组");
         assert_eq!(e.undo_depth(), 1);
-        // 第二下退格 = 撤销 你好：整串还原
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihaonihou", "回退到整串可重新组词");
+        // 再弹 = 你好：整串还原
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihaonihou", "整串可重新组词");
         assert_eq!(e.undo_depth(), 0);
+        // 再选（fixture 整句候选 你好泥猴 为首，#80 钉死）+ 整段释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好泥猴"),
+            other => panic!("expected 释放 Commit, got {:?}", other),
+        }
+        // 释放后 LIFO：弹整句 + 壳删 4 个上屏字（物理 1 + 合成 3）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(3));
+        assert_eq!(e.letters, "nihaonihou", "拼音弹回组合");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1712,12 +1802,14 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Commit(_)));
+        // #81：选词入 pending（不上屏）
+        assert!(matches!(e.key(code_k(KEY_SPACE)), Outcome::Consumed));
         assert_eq!(e.letters, "ni");
-        // 第一下退格 = 撤销选词（弹栈还原整串 + 删上屏字），不是删拼音
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihaoni", "撤销选词：消耗段 + 剩余 = 原串");
-        assert_eq!(e.undo_depth(), 0, "弹出后栈净");
+        assert_eq!(e.preedit(), "你好ni");
+        // 释放前退格 = 弹选词（纯内部，应用零删除；拼音弹回）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihaoni", "弹词：消耗段 + 剩余 = 原串");
+        assert_eq!(e.undo_depth(), 0, "弹词同序弹掉无效栈条目");
         // 栈净 → 删拼音逐字
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "nihaon");
@@ -1741,12 +1833,21 @@ mod tests {
         for c in "nihczz".chars() {
             e.key(k(c));
         }
+        // #81：选词入 pending（不上屏）
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "zz", "部分选词剩键位串");
+        assert_eq!(e.preedit(), "你好zz");
+        // 释放前退格 = 弹词（键位串弹回，应用零删除）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "nihczz", "弹词还原键位串");
+        assert_eq!(e.undo_depth(), 0, "弹词同序清掉无效条目");
+        // 再选 + 整段释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
-        assert_eq!(e.letters, "zz", "部分选词剩键位串");
-        // 第一下退格 = 撤销选词（弹回键位串 + 删 2 个上屏字）
+        // 释放后 LIFO：弹整词 + 删 2 上屏字
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
         assert_eq!(e.letters, "nihczz", "双拼撤销弹回键位串");
         assert_eq!(e.undo_depth(), 0);
@@ -1761,17 +1862,15 @@ mod tests {
 
     /// #77 推翻 #70：Esc 清组合（壳层 DEACTIVATE 合成 Esc 同此路径）=
     /// 撤销链终结——面板关闭后退格放行应用，不弹旧拼音。
-    /// 前置必须是部分选词（全量选词已在 commit_candidate 终止链路）。
+    /// 前置必须是部分选词（全量选词已在 select_candidate 终止链路）。
     #[test]
     fn esc_clears_undo_stack() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
-        }
+        // #81：选词入 pending；Esc 取消整句（含 pending），栈随组合清
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "ni", "部分选词剩拼音，撤销链在栈上");
         assert_eq!(e.undo_depth(), 1);
         // Esc 清掉剩余组合——#77 起同步清栈（#70 旧契约推翻）
@@ -1792,10 +1891,8 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
-        }
+        // #81：选词入 pending（不上屏）
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "ni");
         assert_eq!(e.undo_depth(), 1);
         // C-h 逐字删（光标在尾）：删空也不清链
@@ -1804,7 +1901,12 @@ mod tests {
         assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
         assert!(e.letters.is_empty());
         assert_eq!(e.undo_depth(), 1, "删空不清链（#79）");
-        // 退格 = 弹上屏词：拼音还原 + 壳删 2 字
+        // 空格释放整段
+        match e.key(code_k(KEY_SPACE)) {
+            Outcome::Commit(t) => assert_eq!(t, "你好"),
+            other => panic!("expected 释放 Commit, got {:?}", other),
+        }
+        // 释放后退格 = 弹词：拼音还原 + 壳删 2 字
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
         assert_eq!(e.letters, "nihao");
         let _ = fs::remove_file(&db);
@@ -1822,16 +1924,14 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
-        }
-        assert_eq!(e.letters, "ni", "部分选词剩拼音，撤销链在栈上");
+        // #81：选词入 pending
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "ni", "部分选词剩拼音");
         assert_eq!(e.undo_depth(), 1);
-        // 剩余组合在、直接 Shift：原字母上屏 + 清组合，模式不变，burst 结束
+        // 剩余组合在、直接 Shift：pending + 原字母整段上屏 + 清组合，burst 结束
         match e.key(shift_k(KEY_LEFTSHIFT)) {
-            Outcome::Commit(t) => assert_eq!(t, "ni", "shift-flush 上屏的是原字母"),
-            other => panic!("expected Commit(ni), got {:?}", other),
+            Outcome::Commit(t) => assert_eq!(t, "你好ni", "shift-flush 连 pending 冲刷"),
+            other => panic!("expected Commit(你好ni), got {:?}", other),
         }
         assert!(e.chinese(), "#83 起 Shift 不切模式");
         assert!(e.letters.is_empty());
@@ -1854,16 +1954,14 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
-        match e.key(code_k(KEY_SPACE)) {
-            Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
-        }
-        assert_eq!(e.letters, "ni", "部分选词剩拼音，撤销链在栈上");
+        // #81：选词入 pending；标点 = 情况 B（选当前页首候选 + 释放整段 + 标点）
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "ni", "部分选词剩拼音");
         assert_eq!(e.undo_depth(), 1);
-        // 标点上屏（组合非空，情况 B：顶字+标点）终结 burst
+        // 标点上屏终结 burst
         match e.key(k('.')) {
-            Outcome::Commit(t) => assert_eq!(t, "你好。", "顶字上屏拼接标点"),
-            other => panic!("expected Commit(你好。), got {:?}", other),
+            Outcome::Commit(t) => assert_eq!(t, "你好ni。", "pending + 剩余拼音整段 + 标点"),
+            other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
         assert_eq!(
@@ -1882,9 +1980,11 @@ mod tests {
         for c in "nihaoni".chars() {
             e.key(k(c));
         }
+        // #81：选词入 pending → 再空格释放
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
         // #77 撤销优先 + #79：第一下退格弹选词（还原原串、栈净、删上屏字）
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
@@ -2262,7 +2362,7 @@ mod tests {
         // 第一候选应当是由 Viterbi 最优路径合成的连贯整句「你好世界」
         assert_eq!(cands[0].text, "你好世界");
 
-        // 空格直接上屏整句
+        // #81：空格选词入 pending（整句），拼音选完再按空格整段释放
         let outcome = e.key(Key {
             ch: None,
             code: KEY_SPACE,
@@ -2271,8 +2371,13 @@ mod tests {
             alt: false,
         });
         match outcome {
+            Outcome::Consumed => {}
+            other => panic!("expected pending Consumed, got {:?}", other),
+        }
+        assert_eq!(e.preedit(), "你好世界", "整句在 pending 显示");
+        match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(text) => assert_eq!(text, "你好世界"),
-            other => panic!("expected Commit, got {:?}", other),
+            other => panic!("expected 释放 Commit, got {:?}", other),
         }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
@@ -2295,12 +2400,64 @@ mod tests {
         // 翻到第 2 页
         e.key(code_k(KEY_EQUAL));
         assert_eq!(e.page().0, 1);
-        // 按 0 → 选第 10 个候选（全局索引 1*10 + 9 = 19）
+        // 按 0 → 选第 10 个候选入 pending（#81；全局索引 1*10 + 9 = 19）
         let outcome = e.key(k('0'));
         match outcome {
-            Outcome::Commit(text) => assert_eq!(text, "词19"),
-            other => panic!("expected Commit(词19), got {:?}", other),
+            Outcome::Consumed => {}
+            other => panic!("expected pending Consumed, got {:?}", other),
         }
+        assert!(
+            e.preedit().contains("词19"),
+            "第 2 页第 10 个候选在 pending 显示串里（空格修页同路）",
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// #81 空格修页：翻到第 2 页后按空格 = 选**当前页**首候选（全局
+    /// 索引 10）入 pending，不再写死第一页首候选。
+    #[test]
+    fn space_selects_current_page_top_after_paging() {
+        let (db, yaml) = fixture_many_ni();
+        let dict = Dict::open(&db).unwrap();
+        let cfg = Config {
+            page_size: 10,
+            shuangpin: None,
+            ..Config::default()
+        };
+        let mut e = Engine::new(dict, cfg);
+        for c in "ni".chars() {
+            e.key(k(c));
+        }
+        e.key(code_k(KEY_EQUAL)); // 翻到第 2 页
+        assert_eq!(e.page().0, 1);
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert!(
+            e.preedit().contains("词10"),
+            "第 2 页首候选（全局 10）在 pending 显示串里",
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// #81 Esc 取消：选词入 pending 后按 Esc = 整句不上屏（应用零提交），
+    /// pending 与剩余拼音全清；已释放词不受影响。
+    #[test]
+    fn esc_cancels_pending_without_commit() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihaoni".chars() {
+            e.key(k(c));
+        }
+        assert_eq!(
+            e.key(code_k(KEY_SPACE)),
+            Outcome::Consumed,
+            "选词入 pending"
+        );
+        assert_eq!(e.preedit(), "你好ni");
+        assert_eq!(e.key(code_k(KEY_ESC)), Outcome::Consumed, "Esc 取消");
+        assert!(e.letters.is_empty());
+        assert!(e.preedit().is_empty(), "显示串全清，无内容上屏");
+        assert!(e.candidates().is_empty());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
