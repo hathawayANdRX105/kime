@@ -636,7 +636,11 @@ fn backspace_chains_pop_in_lifo_order() {
     sh.release(KEY_BACKSPACE);
     // 退格 #2 = 弹「你好」：拼音弹回，1 对合成退格删第 2 字
     assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(1));
-    assert_eq!(sh.engine.letters(), "nihaonan", "整串还原可重新组词");
+    assert_eq!(
+        sh.engine.letters(),
+        "nihaoan",
+        "整串还原可重新组词（你好 + 安）"
+    );
     sh.release(KEY_BACKSPACE);
     let _ = fs::remove_dir_all(&dir);
 }
