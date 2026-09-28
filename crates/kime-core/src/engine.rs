@@ -435,13 +435,13 @@ impl Engine {
         // 标点撤销（last_punc 在 → PuncCancel，一次性）否则 Ignored 放行给应用。
         // 长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
-            // 非空闲退格是消费键（#85）：清掉过期标点撤销态，退格路径不会
-            // 继承上一轮的 last_punc。
-            self.last_punc = None;
             // #81 pending 弹词最优先：释放前退格 = 弹最近预选词（纯内部，
             // 应用零删除），并成对弹出该词在 undo_consumed 里的无效条目；
             // pending 弹空后才进 #80 释放后 LIFO（undo_consumed / UndoApp）。
+            // 非空闲退格是消费键：清掉过期标点撤销态（#85）；双空（空闲态）
+            // 不在此清，留给下面的 PuncCancel 消费。
             if !self.pending_words.is_empty() {
+                self.last_punc = None;
                 self.pending_words.pop();
                 // 该词消耗的拼音弹回组合（可重新选词/组词），成对弹出
                 // undo_consumed 里该词的无效条目
@@ -455,9 +455,9 @@ impl Engine {
                 return Outcome::Consumed;
             }
             // 撤销优先（#77 起）+ #79 统一 undo：栈非空（无论 letters 空否）
-            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余），壳转发这次物理
-            // 双空 = 空闲态，Ignored 放行给应用删字符。
+            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余）
             if let Some((consumed, app_chars)) = self.undo_consumed.pop() {
+                self.last_punc = None;
                 let remaining = std::mem::take(&mut self.letters);
                 self.letters = format!("{consumed}{remaining}");
                 self.cursor = self.letters.len();
@@ -466,6 +466,7 @@ impl Engine {
                 return Outcome::UndoApp(app_chars.saturating_sub(1));
             }
             if !self.letters.is_empty() {
+                self.last_punc = None;
                 if self.cursor > 0 {
                     self.letters.remove(self.cursor - 1);
                     self.cursor -= 1;
@@ -2015,7 +2016,7 @@ mod tests {
     }
 
     /// 标点上屏 = 输入串结束：部分选词剩组合时接标点（情况 B 顶字+标点），
-    /// 撤销链随 burst 终止，退格放行给应用、不再弹回旧选词的拼音。
+    /// 撤销链随 burst 终止；#85：智能标点转换后退格 = PuncCancel 还原原键。
     #[test]
     fn punct_commit_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -2034,10 +2035,19 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
+        // #85：空闲退格先消费「末次标点撤销」，不直接放行应用
+        assert_eq!(
+            e.key(code_k(KEY_BACKSPACE)),
+            Outcome::PuncCancel {
+                original: ".".into(),
+                fullwidth: "。".into()
+            },
+            "栈已清，退格先撤销智能标点转换"
+        );
         assert_eq!(
             e.key(code_k(KEY_BACKSPACE)),
             Outcome::Ignored,
-            "栈已清，退格放行"
+            "撤销已消费，再退格放行"
         );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
