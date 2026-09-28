@@ -895,6 +895,31 @@ impl AppState {
         self.popup_show(qh);
     }
 
+    /// #85 智能标点撤销：Wayland IM 协议无 delete_surrounding_text——降级退格点击：
+    /// 转发这次物理 BackSpace press（release 走记账放行 = 第 1 次点击，应用删
+    /// 掉 1 个上屏全角字符），不足部分补合成退格点击（每对 press+release = 1 次
+    /// 点击），最后上屏原半角按键串。合成键走 IM key 事件通道（vk），不经
+    /// surrounding_text/text_change 通道——context_batch.rs 的回声过滤只作用于
+    /// 上下文尾巴推引擎的裁决（is_from_input_method），吞不到这里的退格。
+    fn punc_cancel(
+        &mut self,
+        original: String,
+        fullwidth: String,
+        code: u32,
+        time: u32,
+        qh: &QueueHandle<Self>,
+    ) {
+        // 外层 Consume arm 已记 consume；改 forward = 物理 release 放行收齐第 1 击。
+        self.swallowed.forward(code);
+        self.forward_key(time, code, true);
+        for _ in 1..fullwidth.chars().count().max(1) {
+            let t = now_ms() as u32;
+            self.forward_key(t, code, true);
+            self.forward_key(t, code, false);
+        }
+        self.apply_commit(original, qh);
+    }
+
     /// 剪贴板模式按键执行层：决策全部在纯函数 [`clip_route`]（可离线单测），
     /// 这里只做副作用（重绘/提交/模式翻转）。
     ///
@@ -1011,6 +1036,10 @@ impl AppState {
                 self.swallowed.consume(code);
                 match outcome {
                     Outcome::Commit(text) => self.apply_commit(text, qh),
+                    Outcome::PuncCancel {
+                        original,
+                        fullwidth,
+                    } => self.punc_cancel(original, fullwidth, code, time, qh),
                     _ => self.apply_consumed(qh),
                 }
             }
