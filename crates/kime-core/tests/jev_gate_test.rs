@@ -102,6 +102,7 @@ async fn jev_gate_rejects_low_confidence() {
     assert_eq!(bigram_count(&d, "项目", "进度"), 0, "被拒对不入 bigram");
     assert_eq!(log_rows_left(&d), 3, "被拒对的日志行保留（C2 无尾行已删）");
     drop(guard); // wiremock 0.6.5：MockGuard drop 时同步验证 expect 计数
+    server.stop().await;
     let _ = fs::remove_file(&db);
 }
 
@@ -182,6 +183,7 @@ async fn phrase_case(conf: &str, expect_learned: bool) {
         assert_eq!(learned, 0, "词库无「项目进度」");
     }
     drop(guard); // MockGuard drop = 同步验证 expect 计数
+    server.stop().await;
     let _ = fs::remove_file(&db);
 }
 
