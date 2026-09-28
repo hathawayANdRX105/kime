@@ -1304,7 +1304,7 @@ impl Engine {
             return;
         }
         // 保护首段：整串全覆盖的候选（整句 / 精确词）置顶，单字不得越过。
-        let full_joined = syllables.join("'-");
+        let full_joined = syllables.join("'");
         let head = cands.iter().take_while(|c| c.pinyin == full_joined).count();
         // 预算独立于主查询的 candidate_limit：候选总量可远超一页，首音节单字
         // 全量进同一列表，翻页在平台层做。extra 已被 lookup 的 limit 约束为
