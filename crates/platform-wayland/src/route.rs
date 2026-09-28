@@ -160,6 +160,7 @@ pub fn key_log_line(
         Outcome::Consumed => "Consumed".to_string(),
         Outcome::Ignored => "Ignored".to_string(),
         Outcome::Commit(text) => format!("Commit({text})"),
+        Outcome::UndoApp(n) => format!("UndoApp({n})"),
     };
     format!(
         "key code={code} ch={} mods={}{}{} -> {outcome_str}\n",
