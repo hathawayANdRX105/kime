@@ -589,8 +589,10 @@ fn modifiers_only_ctrl_reaches_engine_without_key_events() {
 fn backspace_full_selection_undoes_with_app_deletes() {
     let (mut sh, dir) = Shell::new("undo_full");
     sh.type_str("nihao");
-    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
+    // #81：空格选词入 pending（不上屏）；第二次空格 = 整段释放
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Consumed);
     assert!(sh.engine.letters().is_empty());
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
     // 第一下退格 = 撤销整词：拼音还原 + 删 2 个上屏字
     assert_eq!(
         sh.press(KEY_BACKSPACE),
@@ -627,15 +629,17 @@ fn backspace_full_selection_undoes_with_app_deletes() {
 fn backspace_chains_pop_in_lifo_order() {
     let (mut sh, dir) = Shell::new("undo_lifo");
     sh.type_str("nihao");
-    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
+    // #81：选词入 pending（不上屏）
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Consumed);
     sh.type_str("an");
-    assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("安".into()));
-    // 退格 #1 = 弹「安」：拼音 an 还原，无合成（1 字 = 物理退格自己删）
-    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(0));
-    assert_eq!(sh.engine.letters(), "an");
+    assert_eq!(sh.press(KEY_SPACE), Outcome::Consumed);
+    assert_eq!(sh.engine.preedit(), "你好安", "两词都在 pending");
+    // 退格 #1 = 释放前弹词（安）：拼音弹回，应用零删除
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::Consumed);
+    assert_eq!(sh.engine.letters(), "an", "弹词拼音可重组");
     sh.release(KEY_BACKSPACE);
-    // 退格 #2 = 弹「你好」：拼音弹回，1 对合成退格删第 2 字
-    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(1));
+    // 退格 #2 = 弹（你好）：整串还原
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::Consumed);
     assert_eq!(
         sh.engine.letters(),
         "nihaoan",

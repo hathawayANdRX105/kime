@@ -170,11 +170,11 @@ fn punct_mapping_outside_digit_context_unchanged() {
 fn digit_separator_cleared_after_selection_commit() {
     let (mut e, dir) = engine();
     type_letters(&mut e, "ni");
-    assert_eq!(press(&mut e, '1'), Outcome::Commit("你".into()));
+    assert_eq!(press(&mut e, '1'), Outcome::Consumed, "#81 选词入 pending");
     assert_eq!(
         press(&mut e, '.'),
-        Outcome::Commit("。".into()),
-        "选词提交后已不是「数字之后」，. 应为全角句号"
+        Outcome::Commit("你。".into()),
+        "标点释放 pending + 全角句号"
     );
     fs::remove_dir_all(dir).unwrap();
 }

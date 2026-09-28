@@ -107,8 +107,8 @@ fn select_text(e: &mut Engine, text: &str) -> String {
     );
     let digit = (b'1' + idx as u8) as char;
     match e.key(ch(digit)) {
-        Outcome::Commit(t) => t,
-        other => panic!("选「{text}」期望 Commit，实际 {other:?}"),
+        Outcome::Consumed => text.to_string(),
+        other => panic!("选「{text}」期望入 pending（#81 Consumed），实际 {other:?}"),
     }
 }
 
@@ -130,8 +130,8 @@ fn char_by_char_selection_keeps_following_syllables() {
     assert_eq!(select_text(&mut e, "能"), "能");
     assert_eq!(
         e.preedit(),
-        "liang",
-        "选「能」后应剩 liang（nd 键位），实际 {:?}",
+        "能liang",
+        "#81：pending（能）+ 剩余键位解码（liang），实际 {:?}",
         e.preedit()
     );
     assert!(
@@ -142,7 +142,7 @@ fn char_by_char_selection_keeps_following_syllables() {
 
     // 接着选「量」：整串吃完，组合清空。
     assert_eq!(select_text(&mut e, "量"), "量");
-    assert!(e.preedit().is_empty(), "选完后 preedit 应清空");
+    assert_eq!(e.preedit(), "能量", "#81：整段在 pending 显示（等释放）");
     assert!(e.candidates().is_empty(), "选完后候选应清空");
     cleanup(&db, &yaml);
 }
@@ -157,7 +157,7 @@ fn three_syllable_string_keeps_middle_syllable() {
     assert_eq!(select_text(&mut e, "能"), "能");
     assert_eq!(
         e.preedit(),
-        "nihao",
+        "能nihao",
         "中间的 ni 不该被 neng 的 4 个字母吃掉，实际 {:?}",
         e.preedit()
     );
@@ -177,7 +177,7 @@ fn whole_word_selection_consumes_all_keys() {
     }
     // 整词「能够」= 2 音节 = 4 键位，nggb 全部消耗（键位消耗不回退成旧行为）。
     assert_eq!(select_text(&mut e, "能够"), "能够");
-    assert!(e.preedit().is_empty(), "整词上屏后 preedit 应清空");
+    assert_eq!(e.preedit(), "能够", "#81：整词在 pending 显示（等释放）");
     assert!(e.candidates().is_empty(), "整词上屏后候选应清空");
     cleanup(&db, &yaml);
 }
@@ -201,6 +201,6 @@ fn full_pinyin_fallback_list_stays_pure_full_pinyin() {
         "全拼语义下不得混入双拼派生的「啊」（选它会按字母切、剩 ang 而非 ng）：{list:?}"
     );
     assert_eq!(select_text(&mut e, "阿昂"), "阿昂");
-    assert!(e.preedit().is_empty(), "整词上屏后 preedit 应清空");
+    assert_eq!(e.preedit(), "阿昂", "#81：整词在 pending 显示（等释放）");
     cleanup(&db, &yaml);
 }

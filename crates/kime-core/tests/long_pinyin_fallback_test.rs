@@ -81,13 +81,18 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
         vec!["我们都不知道", "我", "握", "窝"],
         "整句在前、首音节单字追加到末尾，实际 {cs:?}"
     );
-    // 空格首选不变：仍是整句首候选（追加的单字不污染层一/整句名次）
+    // 空格首选入 pending（#81）：仍是整句首候选
+    match e.key(code_k(KEY_SPACE)) {
+        Outcome::Consumed => {}
+        other => panic!("expected pending Consumed, got {:?}", other),
+    }
+    assert_eq!(e.preedit(), "我们都不知道", "整句在 pending 显示");
+    // 再按空格整段释放
     match e.key(code_k(KEY_SPACE)) {
         Outcome::Commit(t) => assert_eq!(t, "我们都不知道"),
-        other => panic!("expected Commit, got {:?}", other),
+        other => panic!("expected 释放 Commit, got {:?}", other),
     }
     assert!(e.preedit().is_empty() && e.candidates().is_empty());
-
     // 重新打长串，翻到末页选单字「窝」——追加的单字是一等候选
     for c in "womendoubuzhidao".chars() {
         e.key(k(c));
@@ -96,12 +101,13 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
     assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
     assert_eq!(e.page(), (1, 2), "末页应只剩追加的首音节单字");
     match e.key(k('1')) {
-        Outcome::Commit(t) => assert_eq!(t, "握"),
-        other => panic!("expected Commit(握), got {:?}", other),
+        Outcome::Consumed => {}
+        other => panic!("expected pending Consumed, got {:?}", other),
     }
 
-    // 选了单字后剩余音节保留在组合里，继续出候选（用户诉求：接着选下一个）
-    assert_eq!(e.preedit(), "mendoubuzhidao", "剩余音节必须保留");
+    // 选了单字入 pending 后剩余音节保留在组合里，继续出候选（接着选下一个）
+    assert_eq!(e.preedit(), "握mendoubuzhidao", "pending + 剩余音节");
+
     assert!(
         e.candidates().iter().any(|c| c.text == "们"),
         "剩余音节应继续出候选，实际 {:?}",
