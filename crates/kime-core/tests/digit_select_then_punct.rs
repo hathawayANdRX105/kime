@@ -61,15 +61,16 @@ fn digit_select_then_comma_is_full_width() {
         Some("你好".to_string()),
         "fixture 下「你好」应为首候选"
     );
-    // #81：1 选首候选「你好」入 pending（不上屏）
+    // 1 选首候选「你好」（覆盖全部输入 = 立即上屏）
     match e.key(k('1')) {
-        Outcome::Consumed => {}
-        other => panic!("expected pending Consumed, got {:?}", other),
+        Outcome::Commit(t) => assert_eq!(t, "你好"),
+        other => panic!("expected Commit(你好), got {:?}", other),
     }
-    // 紧接着按逗号：释放 pending + 全角标点
+    // 紧接着按逗号：组合已空，标点独立上屏；after_digit 已被选词路径
+    // 清零 → 逗号走全角（数字选词后标点不得被 digit_sep 放行半角）
     match e.key(k(',')) {
-        Outcome::Commit(t) => assert_eq!(t, "你好，", "pending 释放 + 逗号全角"),
-        other => panic!("expected Commit(你好，), got {:?}", other),
+        Outcome::Commit(t) => assert_eq!(t, "，", "标点全角"),
+        other => panic!("expected Commit(，), got {:?}", other),
     }
 }
 

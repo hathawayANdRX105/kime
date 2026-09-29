@@ -170,11 +170,15 @@ fn punct_mapping_outside_digit_context_unchanged() {
 fn digit_separator_cleared_after_selection_commit() {
     let (mut e, dir) = engine();
     type_letters(&mut e, "ni");
-    assert_eq!(press(&mut e, '1'), Outcome::Consumed, "#81 选词入 pending");
+    // 选词覆盖全部输入 = 立即上屏（fcitx5 语义）；after_digit 清零
+    match press(&mut e, '1') {
+        Outcome::Commit(t) => assert_eq!(t, "你"),
+        other => panic!("expected Commit(你), got {:?}", other),
+    }
     assert_eq!(
         press(&mut e, '.'),
-        Outcome::Commit("你。".into()),
-        "标点释放 pending + 全角句号"
+        Outcome::Commit("。".into()),
+        "组合空后标点全角（不被 digit_sep 放行半角）"
     );
     fs::remove_dir_all(dir).unwrap();
 }
