@@ -392,9 +392,7 @@ where
             let outcome = engine.key(key);
             // Commit 也要取剩余组合：选词只消耗已选音节时，剩余拼音转为新 preedit
             let preedit = match outcome {
-                Outcome::Consumed | Outcome::Commit(_) | Outcome::UndoApp(_) => {
-                    Some(engine.preedit().to_owned())
-                }
+                Outcome::Consumed | Outcome::Commit(_) => Some(engine.preedit().to_owned()),
                 _ => None,
             };
             (outcome, preedit)
@@ -442,16 +440,6 @@ where
                         self.hide_window();
                     }
                 }
-                Ok(true)
-            }
-            Outcome::UndoApp(_) => {
-                // #79 XIM 侧降级：选词消耗的拼音已还原进组合（preedit 刷新），
-                // 但 XIM 客户端无合成退格能力——上屏字符不删，仅组合更新
-                // （wayland 前端走 UndoApp 全语义，见 platform-wayland）。
-                if let Some(preedit) = preedit {
-                    server.preedit_draw(&mut user_ic.ic, &preedit)?;
-                }
-                self.update_window();
                 Ok(true)
             }
             Outcome::PuncCancel {

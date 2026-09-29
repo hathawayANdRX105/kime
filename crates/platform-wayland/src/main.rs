@@ -19,7 +19,7 @@ use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEX
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::mode_badge::{badge_enabled, BadgeFrame, BadgeSlot, ModeBadge};
 use platform_wayland::next_backoff_ms;
-use platform_wayland::repeat::{KeyRepeat, ShiftComposer};
+use platform_wayland::repeat::{KeyRepeat, ShiftComposer, ShiftRelease};
 use platform_wayland::route::{
     clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
     ClipAction, PressAction,
@@ -1113,19 +1113,6 @@ impl AppState {
                 // 点击，继续删应用字符），表不撤；物理 release 到达才停。
                 self.tap_pair(code);
             }
-            PressAction::Undo(extra) => {
-                // #79 撤销选词：引擎已把消耗拼音弹回组合；应用里该次选词上屏的
-                // 字符逐个删掉——物理退格 press 直接转发（release 走记账随后
-                // 放行 = 第 1 次点击），再补 extra 对合成退格（每对 = 一次点击）。
-                self.swallowed.forward(code);
-                self.forward_key(time, code, true);
-                for _ in 0..extra {
-                    let t = now_ms() as u32;
-                    self.forward_key(t, code, true);
-                    self.forward_key(t, code, false);
-                }
-                self.apply_consumed(qh);
-            }
         }
         // chinese() 翻转只可能是 Shift 中英切换（引擎唯一翻转路径，工单第 1 条）：
         // 闪一次对应模式字，下一次按键收掉；常驻角标同时翻面。
@@ -1778,11 +1765,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 let is_shift = matches!(key, 42 | 54);
 
                 if released {
-                    // Shift release：只推进行姿态状态机（#83 起裁决无动作，
-                    // 轻点/按住都不再切模式）；有组合时按 Shift 的冲刷在 press
-                    // 路径（下方 1696 附近）直喂引擎。
-                    if is_shift {
-                        state.shift_gesture.on_shift_release();
+                    // Shift release：手势裁决轻点=切模式——把这一次 Shift 补交给
+                    // 引擎（引擎翻转 chinese + 闪角标）；按住打过键=临时英文已发生，
+                    // 模式不动。有组合时按 Shift 的冲刷在 press 路径直喂引擎。
+                    if is_shift && state.shift_gesture.on_shift_release() == ShiftRelease::Toggle {
+                        state.engine_press(key, time, false, qh);
                     }
                     // 撤表只认自己（Shift/Ctrl 的 release 停不了 F 的重复），随后按
                     // press 记账决定 release 吞放。route_release 见 route.rs。
