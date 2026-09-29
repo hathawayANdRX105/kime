@@ -77,14 +77,6 @@ pub fn route_press(code: u32, synthetic: bool, composing: bool, outcome: &Outcom
             arm: false,
             disarm: true,
         },
-        // 标点撤销（#85）：壳用退格点击删掉上屏全角字符并上屏原半角按键串
-        // （main.rs Consume arm 再按 PuncCancel 分流）；按键本身不转发应用
-        // （转了会多删一个字符）。
-        Outcome::PuncCancel { .. } => PressRoute {
-            action: PressAction::Consume,
-            arm: false,
-            disarm: true,
-        },
     }
 }
 
@@ -159,12 +151,6 @@ pub fn key_log_line(
         Outcome::Consumed => "Consumed".to_string(),
         Outcome::Ignored => "Ignored".to_string(),
         Outcome::Commit(text) => format!("Commit({text})"),
-        Outcome::PuncCancel {
-            original,
-            fullwidth,
-        } => {
-            format!("PuncCancel({original}<-{fullwidth})")
-        }
     };
     format!(
         "key code={code} ch={} mods={}{}{} -> {outcome_str}\n",
