@@ -1220,19 +1220,30 @@ impl Engine {
             }
             self.last_reading.clear();
         }
-        // 句级联想（M8/Task 5）：如果有完整音节切分且长度 >= 2，尝试通过 Viterbi 构词成句
-        if let Some(full_reading) = segs.first() {
-            if full_reading.len() >= 2 {
-                let seed = self.context_seed();
-                let sentences = crate::lattice::viterbi_sentences_seeded(
-                    &self.dict,
-                    full_reading,
-                    seed,
-                    &mut self.span_cache,
-                );
-                // 全拼路径：full_reading == reading + [tail]，句子读音恒等于 joined。
-                Self::place_sentences(&mut cands, sentences, &self.last_joined);
-            }
+        // 句级联想（M8/Task 5）：有完整音节切分且长度 >= 2 时 Viterbi 构词成句。
+        // segment 只收「全部音节合法」的路径——尾巴敲一半（shenmey 的 y）时整串
+        // 切不出任何路径，segs 为空，若依赖 segs.first() 句候选会整个消失
+        // （用户实测「偶数键位长句在第一、奇数键位掉队/消失」）。此时退回
+        // fallback 切分的完整音节 reading 组句：fcitx5 语义 = 句候选按已敲完
+        // 的音节计算，半截尾巴不参与、也不影响句位。
+        let viterbi_sylls: Option<Vec<String>> = match segs.first() {
+            Some(full) if full.len() >= 2 => Some(full.clone()),
+            _ if reading.len() >= 2 => Some(reading.clone()),
+            _ => None,
+        };
+        if let Some(viterbi_sylls) = viterbi_sylls {
+            let seed = self.context_seed();
+            let sentences = crate::lattice::viterbi_sentences_seeded(
+                &self.dict,
+                &viterbi_sylls,
+                seed,
+                &mut self.span_cache,
+            );
+            // 落位 key = 句子覆盖的读音（完整音节 join）。尾巴半截时带尾的
+            // last_joined（shen'me'y）与句读音（shen'me）不匹配，句会被误判
+            // 「未覆盖全输入」挂到列表尾部——按不含尾巴的 join 落补开区。
+            let joined = joined_key(&viterbi_sylls, "");
+            Self::place_sentences(&mut cands, sentences, &joined);
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
         // 用**整串的首切分**音节序列（= 用户敲出的完整读音），无完整切分则无回退空间。
@@ -1379,13 +1390,12 @@ impl Engine {
         best.map(|(reading, freq)| Seed { reading, freq })
     }
 
-    /// 整句候选名次（工单第 4 条）：覆盖全部输入音节的句子属层一——
-    /// **永不压过层一的精确命中词**（ln(freq) 可加的代价模型里「两个超高频单字」
-    /// 永远比一个真词便宜，`ufme`→神么 压过 什么 是实测过的回归），
-    /// 但在补全区里按自身频率（`lattice::sentence_score` 的联合概率折算值）落位：
-    /// 精确块为空时，覆盖句因此排进 `我们确信`/`最近好吗` 这类
-    /// 「还要继续敲」的补全之前，而不是无条件钉死在列表末尾。
-    /// 没覆盖全输入的句子（双拼半截键 pending）不参与落位，挂末尾。
+    /// 整句候选名次：覆盖全部输入音节的句子属层一——**永不压过层一的精确
+    /// 命中词**（词条本体已在列表时句被文本去重），但**恒落在层一精确块
+    /// 之后、其余所有候选（补全词条 / 单字）之前**——fcitx5 的组句习惯：
+    /// 用户敲长串时第一位永远是当前已敲音节的最优句子，词条分数不该把句
+    /// 压到中间（用户实测长句被高频单字挤下第一后打断组句流）。
+    /// 没覆盖全输入的句子（半截尾巴）不参与落位，挂末尾。
     fn place_sentences(cands: &mut Vec<Candidate>, sentences: Vec<Candidate>, joined: &str) {
         let l1_end = cands.iter().take_while(|c| c.pinyin == joined).count();
         // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
@@ -1396,12 +1406,9 @@ impl Engine {
                 continue;
             }
             let pos = if sentence.pinyin == joined {
-                // 补全区是 freq 降序的：落在第一个比它弱的候选之前；层一永不被越过。
+                // fcitx5 组句语义：句恒落层一精确块之后、其余候选之前，
+                // 词条分数不把句压到中间（用户实测长句被高频单字挤下第一）。
                 cursor
-                    + cands[cursor..]
-                        .iter()
-                        .position(|c| c.freq < sentence.freq)
-                        .unwrap_or(cands.len() - cursor)
             } else {
                 cands.len()
             };
@@ -2662,8 +2669,8 @@ mod tests {
         // 主查补开区间 [ni'quan'que'n, ...) = 你全却呢(3000)/你全却能(1)；
         // 全覆盖 Viterbi 句 = 你 + 全却 → 「你全却」（文本与 L1/L2 词互异）。
         // 修前句 pinyin（完整音节 join）匹配不到含 pending 的 sp_joined 被挂尾；
-        // 修后按整音节 join 落位，句按自身分数插进补全区（你全却呢 3000 之后、
-        // 你全却能 1 之前）。
+        // 修后按整音节 join 落位，句恒插层一精确块之后（merge 保护段保证
+        // 首音节单字交错后句仍居首）——fcitx5 组句语义：长句恒在第一。
         let (mut e, db, yaml) = engine_with_sp_sentence_fixture();
         for c in "niqrqtn".chars() {
             e.key(k(c));
@@ -2676,9 +2683,83 @@ mod tests {
             "全覆盖句候选「你全却」必须在列表内：{cands:?}"
         );
         assert!(
-            idx("你全却呢") < idx("你全却") && idx("你全却") < idx("你全却能"),
-            "句须按分数插进补全区（3000 的你全却呢 之后、1 的你全却能 之前），\
-             不许挂尾：{cands:?}"
+            idx("你全却") < idx("你全却呢") && idx("你全却") < idx("你全却能"),
+            "句须恒在层一精确块之后、其余候选之前（fcitx5 组句语义），\
+             不许按词条分数被压到中间：{cands:?}"
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    fn engine_with_full_pinyin_pending_fixture() -> (Engine, std::path::PathBuf, std::path::PathBuf)
+    {
+        let db = tmp_db("fullpy");
+        let yaml = fixture_yaml_path();
+        let _dict = Dict::open(&db).expect("open dict");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES
+               ('shen', '神', 90, 'sh', 0),
+               ('shen''me', '什么', 12000, 'sm', 0),
+               ('shen''me''yang''de', '什么样的', 10, 'sm', 0);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let dict = Dict::open(&db).expect("reopen dict for lookups");
+        let config = Config {
+            shuangpin: None,
+            ..Config::default()
+        };
+        let engine = Engine::new(dict, config);
+        (engine, db, yaml)
+    }
+
+    #[test]
+    fn full_pinyin_pending_tail_keeps_sentence() {
+        // 全拼 shenmey = 完整音节 [shen,me] + 半截尾巴 y。is_syllable("y")==false
+        // → segment 整串切不出任何路径 → 修前句级联想被 segs.first()==None 短路，
+        // Viterbi 从不跑，句「什么」整个消失（主查只剩带尾前缀词条「什么样的」）
+        // ——用户实测「偶数键位长句在第一、奇数键位掉队/消失」。修后退回
+        // fallback 切分的完整音节组句：句恒随已敲完的音节计算、落层一之后
+        // （fcitx5 语义），半截尾巴不影响句位。
+        let (mut e, db, yaml) = engine_with_full_pinyin_pending_fixture();
+        for c in "shenmey".chars() {
+            e.key(k(c));
+        }
+        let cands = e.candidates();
+        let idx = |t: &str| cands.iter().position(|c| c.text == t).unwrap_or(usize::MAX);
+        assert!(
+            idx("什么") != usize::MAX,
+            "句候选「什么」必须在列表内（修前整个消失）：{cands:?}"
+        );
+        assert_eq!(
+            idx("什么"),
+            0,
+            "句须恒在层一之后、其余候选之前（fcitx5 组句语义）：{cands:?}"
+        );
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    #[test]
+    fn full_pinyin_complete_tail_keeps_sentence_first() {
+        // 回归钉：完整尾巴（shenme，tail="me" 是合法音节）走 segs.first() 老路，
+        // 句「什么」与词条文本去重后词条本身居首——修法不得改变此行为。
+        let (mut e, db, yaml) = engine_with_full_pinyin_pending_fixture();
+        for c in "shenme".chars() {
+            e.key(k(c));
+        }
+        let cands = e.candidates();
+        let idx = |t: &str| cands.iter().position(|c| c.text == t).unwrap_or(usize::MAX);
+        assert_eq!(
+            idx("什么"),
+            0,
+            "完整输入的句/词条「什么」必须居首：{cands:?}"
+        );
+        assert!(
+            idx("什么样的") != usize::MAX,
+            "补全词条「什么样的」必须在列表内：{cands:?}"
         );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
