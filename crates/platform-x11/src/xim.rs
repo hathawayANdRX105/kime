@@ -12,9 +12,7 @@ use std::sync::Arc;
 use kime_core::{Engine, Key, Outcome};
 use parking_lot::Mutex;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    ConnectionExt, EventMask, KeyButMask, KeyPressEvent, KeyReleaseEvent,
-};
+use x11rb::protocol::xproto::{ConnectionExt, KeyButMask, KeyPressEvent};
 use x11rb::rust_connection::RustConnection;
 use xim::{
     x11rb::X11rbServer, Server, ServerError, ServerHandler, UserInputContext, XimConnections,
@@ -26,9 +24,6 @@ use crate::window::CandidateWindow;
 
 const IM_NAME: &str = "kime";
 const XIM_FORWARD_KEY_PRESS: u32 = 1;
-/// X11 BackSpace 键码（#85：标准布局恒 22）。
-const X11_KEYCODE_BACKSPACE: u8 = 22;
-
 const X11_KEYCODE_OFFSET: u32 = 8;
 const KEY_ESC: u32 = 1;
 
@@ -91,7 +86,7 @@ impl X11IM {
                 None
             }
         };
-        let handler = Handler::new(engine, window, conn.clone());
+        let handler = Handler::new(engine, window);
 
         Ok(Self {
             conn,
@@ -120,12 +115,10 @@ struct Handler {
     /// 同应用焦点抖动（同一 IC 反复 set/unset focus）不清撤销栈（#70 契约）；
     /// 换应用（新 IC 的 set_focus）= 真实切应用 → `engine.clear_undo()`。
     last_ic_id: Option<u16>,
-    /// X11 连接（#85 标点撤销：合成退格 XSendEvent 用）。
-    conn: Arc<RustConnection>,
 }
 
 impl Handler {
-    fn new(engine: Engine, window: Option<CandidateWindow>, conn: Arc<RustConnection>) -> Self {
+    fn new(engine: Engine, window: Option<CandidateWindow>) -> Self {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(
             &context,
@@ -142,7 +135,6 @@ impl Handler {
             engine: Arc::new(Mutex::new(engine)),
             keyboard: xkb::State::new(&keymap),
             window,
-            conn,
             last_ic_id: None,
         }
     }
@@ -156,45 +148,6 @@ impl Handler {
             alt: false,
             ch: None,
         });
-    }
-
-    /// #85 标点撤销降级：向客户端窗口 XSendEvent 一对合成 BackSpace 点击
-    /// （KeyPress+KeyRelease；事件缓冲首字节置 send_event 位）。个别应用
-    /// 过滤合成事件时退格被忽略，但后续 commit 上屏不受影响。
-    fn send_synthetic_backspace(&self, win: u32) {
-        let mask = EventMask::KEY_PRESS | EventMask::KEY_RELEASE;
-        let press = KeyPressEvent {
-            response_type: x11rb::protocol::xproto::KEY_PRESS_EVENT | 0x01, // send_event 位
-            detail: X11_KEYCODE_BACKSPACE,
-            sequence: 0,
-            time: 0,
-            root: 0,
-            event: win,
-            child: 0,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0u16.into(),
-            same_screen: true,
-        };
-        let _ = self.conn.send_event(false, win, mask, press);
-        let release = KeyReleaseEvent {
-            response_type: x11rb::protocol::xproto::KEY_RELEASE_EVENT | 0x01, // send_event 位
-            detail: X11_KEYCODE_BACKSPACE,
-            sequence: 0,
-            time: 0,
-            root: 0,
-            event: win,
-            child: 0,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0u16.into(),
-            same_screen: true,
-        };
-        let _ = self.conn.send_event(false, win, mask, release);
     }
 
     fn key_from_event(&mut self, event: &KeyPressEvent) -> Key {
@@ -440,26 +393,6 @@ where
                         self.hide_window();
                     }
                 }
-                Ok(true)
-            }
-            Outcome::PuncCancel {
-                original,
-                fullwidth,
-            } => {
-                // #85 XIM 侧：无按键转发通道——降级 XSendEvent 合成退格点击
-                // （× fullwidth 字符数，删掉上屏全角字符），再上屏原半角按键串。
-                // 合成事件可能被过滤 send_event 的应用忽略，commit 不受影响。
-                let win = user_ic
-                    .ic
-                    .app_win()
-                    .map(NonZeroU32::get)
-                    .unwrap_or_else(|| user_ic.ic.client_win());
-                for _ in 0..fullwidth.chars().count().max(1) {
-                    self.send_synthetic_backspace(win);
-                }
-                server.commit(&user_ic.ic, &original)?;
-                server.preedit_draw(&mut user_ic.ic, "")?;
-                self.hide_window();
                 Ok(true)
             }
             Outcome::Ignored => Ok(false),

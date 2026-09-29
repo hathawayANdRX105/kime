@@ -4,7 +4,7 @@
 //!   kime build-dict --in <sqlite> --out <bin>
 //!   kime config <list|get KEY|set KEY VALUE>
 //!   kime english [--dict <path>] <字母串>...
-//!   kime debug [--scenario <commit-backspace|shift-mode|punct-cancel>] [键 token ...]
+//!   kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]
 //!   kime mine-lm [--dict <path>] [--jev] [--jev-endpoint <url>] [--jev-key <key>]
 //!   kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
@@ -110,7 +110,7 @@ fn dbg_token_to_key(tok: &str) -> Key {
     }
 }
 
-/// 内置场景（不依赖用户词库）：上屏后退格 / Shift 切英文 / 标点撤销保留。
+/// 内置场景（不依赖用户词库）：上屏后退格 / Shift 切英文 / 标点直出。
 fn dbg_builtin_scenario(name: &str) -> Vec<String> {
     match name {
         "commit-backspace" => {
@@ -130,9 +130,8 @@ fn dbg_builtin_scenario(name: &str) -> Vec<String> {
             .map(String::from)
             .collect()
         }
-        "punct-cancel" => {
-            // 中文模式下打「。」（. 转换上屏，置 last_punc）→ 退格触发 PuncCancel 还原「.」
-            // ——保留功能（#85）对照：标点撤销与词上屏撤销不同路径。
+        "punct-idle-backspace" => {
+            // 中文模式下打「。」（. 转换上屏）→ 退格 = Ignored 放行应用删全角字符。
             vec![".", "BACKSPACE", "BACKSPACE"]
                 .into_iter()
                 .map(String::from)
@@ -140,7 +139,7 @@ fn dbg_builtin_scenario(name: &str) -> Vec<String> {
         }
         other => {
             eprintln!(
-                "unknown scenario '{other}': use commit-backspace | shift-mode | punct-cancel"
+                "unknown scenario '{other}': use commit-backspace | shift-mode | punct-idle-backspace"
             );
             Vec::new()
         }
@@ -151,7 +150,7 @@ fn dbg_builtin_scenario(name: &str) -> Vec<String> {
 /// 候选/preedit/模式/撤销深度，不启动 IME server，不碰桌面与 fcitx5。
 ///
 /// 用法：
-///   kime debug --scenario <commit-backspace|shift-mode|punct-cancel>
+///   kime debug --scenario <commit-backspace|shift-mode|punct-idle-backspace>
 ///   kime debug tok1 tok2 ...            （自定义键序列）
 ///   cat keys.txt | kime debug           （每 token 一个，空白分隔）
 fn handle_debug_cmd(args: &[String]) -> ExitCode {
@@ -506,7 +505,7 @@ fn main() -> ExitCode {
             }
             "--help" => {
                 println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime debug [--scenario <commit-backspace|shift-mode|punct-cancel>] [键 token ...]（无头面板调试：逐键打印候选/模式，不启动 IME）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
+                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]（无头面板调试：逐键打印候选/模式，不启动 IME）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
                 );
                 return ExitCode::SUCCESS;
             }
