@@ -538,7 +538,11 @@ impl Engine {
         // 一个字符。**Ctrl+F/B 不再翻页**——翻页让位给 - / = 与 Ctrl+N/Ctrl+P（下方），
         // 这是用户的明确取舍（「C-f 前进一个字符、C-b 后退一个字符」）。
         // 只在有组合时拦截：空组合下 Ctrl+F/B/H 一律 Ignored，应用的 emacs 移动键照旧可用。
-        if k.ctrl && !k.alt && !self.letters.is_empty() {
+        // 门控从「letters 非空」放宽到「整个 preedit 非空」（letters 或 pending 任一）：
+        // 纯预选态（全选了词、letters 空）下 C-h 镜像 #81 Backspace 弹词——最近预选词
+        // 消耗的音节弹回 letters（成对弹 undo_consumed），之后可继续逐字删；C-b/C-f
+        // 在串尾 no-op 但一律 Consumed（此前整段 Ignored，即用户报的「预选模式没作用」）。
+        if k.ctrl && !k.alt && (!self.letters.is_empty() || !self.pending_words.is_empty()) {
             match k.ch {
                 Some('b') => {
                     self.cursor = self.cursor.saturating_sub(1);
@@ -549,14 +553,25 @@ impl Engine {
                     return Outcome::Consumed;
                 }
                 Some('h') => {
-                    // C-h 只删剩余拼音，不动 pending 与其配对的撤销条目
-                    //（链生命周期 = 未释放，见 undo_consumed 字段注释）。
                     if self.cursor > 0 {
+                        // 拼音区：删光标前一个拼音字符（原有行为，不碰 pending 与其
+                        // 配对的撤销条目，链生命周期 = 未释放）。
                         self.letters.remove(self.cursor - 1);
                         self.cursor -= 1;
-                        self.refresh_candidates();
-                        self.page_index = 0;
+                    } else if !self.pending_words.is_empty() {
+                        // 纯预选态（cursor 在头、letters 空）：C-h 取消最近预选词——
+                        // 该词消耗段弹回 letters（#81 弹词镜像），之后可继续逐字删。
+                        self.pending_words.pop();
+                        let (consumed, _chars) = self.undo_consumed.pop().unwrap_or_default();
+                        let remaining = std::mem::take(&mut self.letters);
+                        self.letters = format!("{consumed}{remaining}");
+                        self.cursor = self.letters.len();
+                    } else {
+                        // 无 pending 且 cursor 在头：无可删，仅消费不吞应用字符。
+                        return Outcome::Consumed;
                     }
+                    self.refresh_candidates();
+                    self.page_index = 0;
                     return Outcome::Consumed;
                 }
                 _ => {}
@@ -2043,6 +2058,51 @@ mod tests {
         // 释放后退格 = Ignored 放行应用，不再弹词
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         assert!(e.letters.is_empty(), "链死亡后无拼音弹回");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// #98：纯预选态（letters 空、pending 词在）下 C-f/C-h 不再 Ignored：
+    /// C-h 镜像 #81 弹词——最近预选词的音节弹回 letters（之后可继续逐字删）；
+    /// C-f 在串尾 no-op 但被消费（此前整段 Ignored，即用户报的「没作用」）。
+    #[test]
+    fn ctrl_h_in_pure_preselect_releases_word() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        for c in "nihaoni".chars() {
+            e.key(k(c));
+        }
+        // 选词入 pending：「你好」进 pending，剩余 "ni" 留在 letters
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
+        assert_eq!(e.letters, "ni");
+        // C-h 逐字删剩余 letters → letters 空、只剩 pending「你好」= 纯预选态
+        assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
+        assert_eq!(e.letters, "n");
+        assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
+        assert!(e.letters.is_empty());
+        assert_eq!(e.undo_depth(), 1);
+        // C-f 纯预选态：串尾 no-op 但被消费（此前 Ignored）
+        assert_eq!(
+            e.key(Key {
+                ch: Some('f'),
+                code: 33,
+                shift: false,
+                ctrl: true,
+                alt: false
+            }),
+            Outcome::Consumed
+        );
+        // C-h 纯预选态：弹最近预选词，音节回 letters
+        assert_eq!(
+            e.key(ctrl_h_k()),
+            Outcome::Consumed,
+            "纯预选态 C-h 须被消费"
+        );
+        assert_eq!(e.letters, "nihao", "弹回词的音节进 letters");
+        assert!(e.pending_words.is_empty(), "pending 词已弹回");
+        assert_eq!(e.undo_depth(), 0, "成对撤销同弹");
+        // 之后可继续逐字删
+        assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
+        assert_eq!(e.letters, "niha");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
