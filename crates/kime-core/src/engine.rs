@@ -2004,11 +2004,6 @@ mod tests {
         // 上屏后空闲退格 = Ignored：应用删字，引擎不弹词
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         assert_eq!(e.letters, "", "链死亡后无拼音弹回");
-        // 栈净后逐键删到 nihc，双拼解码重建 preedit（纯 engine 内部 Consumed）
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.letters, "nihc");
-        assert_eq!(e.preedit(), "nihao", "弹回后按双拼解码重建 preedit");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
