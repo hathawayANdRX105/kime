@@ -41,9 +41,6 @@ pub enum PressAction {
     Consume,
     /// 合成 tick 撞上组合已空：给应用补一次完整的 press+release 点击。
     Tap,
-    /// 撤销选词（#79）：引擎已弹栈还原拼音；壳转发这次物理退格 press，
-    /// 并补发 `extra` 对合成退格点击，删掉该次选词上屏的字符。
-    Undo(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,12 +76,6 @@ pub fn route_press(code: u32, synthetic: bool, composing: bool, outcome: &Outcom
             action: PressAction::Forward,
             arm: false,
             disarm: true,
-        },
-        // 撤销选词：组合（弹回的拼音）在则允许长按续撤（同 Consumed 起表）。
-        Outcome::UndoApp(extra) => PressRoute {
-            action: PressAction::Undo(*extra),
-            arm: !synthetic && composing && is_repeatable_edit(code),
-            disarm: false,
         },
         // 标点撤销（#85）：壳用退格点击删掉上屏全角字符并上屏原半角按键串
         // （main.rs Consume arm 再按 PuncCancel 分流）；按键本身不转发应用
@@ -168,7 +159,6 @@ pub fn key_log_line(
         Outcome::Consumed => "Consumed".to_string(),
         Outcome::Ignored => "Ignored".to_string(),
         Outcome::Commit(text) => format!("Commit({text})"),
-        Outcome::UndoApp(n) => format!("UndoApp({n})"),
         Outcome::PuncCancel {
             original,
             fullwidth,
