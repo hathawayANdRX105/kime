@@ -1534,7 +1534,13 @@ mod tests {
                ('ni''hao','你好',5000,'h%',0),
                ('ni''hao','你好',5000,'x',0),
                ('fan''gan','反感',600,'fg',0),
-               ('fang''an','方案',900,'fa',0);
+               ('fang''an','方案',900,'fa',0),
+               -- bian 系（小鹤 bmh = bian + pending h）：模拟高频单字压组合词场景
+               ('bian',  '边',  9000, 'bm', 0),
+               ('bian',  '便',  7000, 'bm', 0),
+               ('bian',  '变',  6000, 'bm', 0),
+               ('bian''hua', '变化', 5000, 'bhm', 0),
+               ('bian''hao', '编号', 4000, 'bhh', 0);
             ",
         )
         .unwrap();
@@ -1621,6 +1627,34 @@ mod tests {
         // tail "h" 应触发 "ha" 前缀匹配，候选应含 "你好"
         let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
         assert!(cs.contains(&"你好".to_string()));
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// 奇数双拼半截态（小鹤 bmh = bian + 半截 h）：组合词（变化/编号）
+    /// 必须排在高频单字（边/便/变）之前——半截组合词区间首屏优先。
+    #[test]
+    fn shuangpin_pending_compound_words_precede_singles() {
+        let (mut e, db, yaml) = engine_with_shuangpin_fixture();
+        // 小鹤 bm = bian（xiaohe.rs），h 为末位半截键
+        for c in "bmh".chars() {
+            e.key(k(c));
+        }
+        let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
+        // 组合词在候选内
+        let compound = cs
+            .iter()
+            .position(|t| t == "变化" || t == "编号")
+            .expect("组合词 变化/编号 必须在候选: {cs:?}");
+        // 高频单字边也在候选，且必须在组合词之后
+        let single = cs
+            .iter()
+            .position(|t| t == "边")
+            .expect("单字 边 应在候选: {cs:?}");
+        assert!(
+            compound < single,
+            "半截态组合词须优先于单字（变化@{compound} 应在 边@{single} 前）: {cs:?}"
+        );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
