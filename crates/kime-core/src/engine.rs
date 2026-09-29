@@ -969,7 +969,9 @@ impl Engine {
                     if self.candidates.is_empty() {
                         // 双拼解出错误音节（如 nihao→ni+ha）且查无词 → 全拼重试。
                         // 先试全拼：混输的键串按全拼才是对的，此时不该拿双拼音节硬凑句子。
-                        self.refresh_full_pinyin();
+                        // fallback 句联想关闭（false）：这种串也可能是双拼半截键
+                        // （aaj），误组句会抢走正确的双拼解释。
+                        self.refresh_full_pinyin(false);
                         if self.candidates.is_empty() {
                             // 全拼也查无词：键串仍只能按双拼键位解释（下面的整句
                             // 联想 / 缺陷 A 回退候选全部来自 syllables），消耗必须
@@ -1037,15 +1039,19 @@ impl Engine {
                     }
                 }
                 Err(_) => {
-                    // 非法键对：按全拼重新切分（preedit 保持原字母串）
-                    self.refresh_full_pinyin();
+                    // 非法键对：按全拼重新切分（preedit 保持原字母串）。
+                    // fallback 句联想关闭：键串含双拼不存在的键（v 等），半截
+                    // 状态组句只会产出误句（同 aaj 场景）。
+                    self.refresh_full_pinyin(false);
                 }
             }
             self.merge_english();
             return;
         }
 
-        self.refresh_full_pinyin();
+        // 纯全拼模式（无双拼解码）：半截尾巴的串也按已敲完音节组句
+        // （shenmey → 句「什么」恒在第一），没有双拼解释权竞争。
+        self.refresh_full_pinyin(true);
         self.merge_english();
     }
 
@@ -1070,7 +1076,7 @@ impl Engine {
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
-    fn refresh_full_pinyin(&mut self) {
+    fn refresh_full_pinyin(&mut self, fallback_sentences: bool) {
         // 全拼候选按拼音字母消耗键串（双拼解码失败回退全拼时也走这里）。
         self.sp_active = false;
         let segs = segment(&self.letters);
@@ -1228,7 +1234,11 @@ impl Engine {
         // 的音节计算，半截尾巴不参与、也不影响句位。
         let viterbi_sylls: Option<Vec<String>> = match segs.first() {
             Some(full) if full.len() >= 2 => Some(full.clone()),
-            _ if reading.len() >= 2 => Some(reading.clone()),
+            // 整串无合法切分（半截尾巴）时退回完整音节组句——但仅限纯全拼
+            // 模式。双拼分支的「查无词全拼重试」也走这里：那种串多半是双拼
+            // 半截键（aaj），fallback 句会把「安安」这类误组句抢进候选、
+            // 顶掉正确的双拼解释（安+残键），必须保持保守。
+            _ if fallback_sentences && reading.len() >= 2 => Some(reading.clone()),
             _ => None,
         };
         if let Some(viterbi_sylls) = viterbi_sylls {
