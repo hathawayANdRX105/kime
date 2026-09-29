@@ -1,9 +1,4 @@
-# kime 英文词表（import_english 数据源）
-# 来源：qingjian lexicon（wordfreq 英文 Zipf 词频 ×1000），col1=词 col2=同形别名 col3=词频。
-# 导入到你的词典（一次性，可重复执行幂等）：
-#   kime --import-english data/english.tsv   （再 build-dict / 重启 IME 生效）
-# 引擎侧：refresh 末尾 merge_english 追加英文块（精确在前、补全在后，整体位于中文候选之后），
-# 双拼/全拼一致（按原始按键串匹配，不做拼音解码，对齐 rime english translator）。
+...
 a	a	7360
 aardvark	aardvark	2390
 aback	aback	2990
