@@ -208,7 +208,8 @@ fn bundled_data_file_imports_and_serves_words() {
     assert_eq!(d.import_english(data).unwrap(), 0, "重复导入应幂等");
     // 高频常用词精确命中须为首候选
     for word in ["hello", "world", "the"] {
-        let hits = texts(&d.lookup_english(word, 5));
+        let cands = d.lookup_english(word, 5);
+        let hits = texts(&cands);
         assert_eq!(hits.first(), Some(&word), "{word} 须为精确首候选: {hits:?}");
     }
     let _ = fs::remove_file(&db);
