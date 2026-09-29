@@ -189,3 +189,27 @@ fn english_does_not_pollute_chinese_lookups() {
         );
     }
 }
+
+/// 数据守卫：`data/english.tsv`（import_english 数据源）须能整体导入且常用词查得到。
+/// 词表从仓根 data/ 取（测试 cwd 在 crate 目录，两级上到仓根）。
+#[test]
+fn bundled_data_file_imports_and_serves_words() {
+    let data = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../data/english.tsv"
+    ));
+    assert!(data.exists(), "data/english.tsv 缺失: {}", data.display());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dict.sqlite3");
+    let mut d = Dict::open(&db).unwrap();
+    let n = d.import_english(data).unwrap();
+    assert!(n > 50_000, "词表规模异常（须 >5 万词）: {n}");
+    // 幂等：重复导入不再写行
+    assert_eq!(d.import_english(data).unwrap(), 0, "重复导入应幂等");
+    // 高频常用词精确命中须为首候选
+    for word in ["hello", "world", "the"] {
+        let hits = texts(&d.lookup_english(word, 5));
+        assert_eq!(hits.first(), Some(&word), "{word} 须为精确首候选: {hits:?}");
+    }
+    let _ = fs::remove_file(&db);
+}
