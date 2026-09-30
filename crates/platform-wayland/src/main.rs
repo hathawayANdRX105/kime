@@ -94,21 +94,46 @@ fn log_file() -> String {
     std::env::var("KIME_LOG_FILE").unwrap_or_else(|_| "/tmp/kime-ime.log".to_string())
 }
 
+/// 常驻句柄：KIME_KEY_LOG 开启时惰性打开一次，之后复用（不再每键 open+fstat）。
+/// `written` 内存记累计字节，超 1MiB 就 set_len(0) 归零（O_APPEND 下 seek 无效）。
+struct KeyLogFile {
+    buf: BufWriter<File>,
+    written: u64,
+}
+
+/// 逐键路由日志开关：`KIME_KEY_LOG=1` 才写，**默认关**。常驻实例的逐键文件
+/// I/O（open+fstat+write+每键一行）是「打字卡顿 / over-IO」的主因——kime 持有
+/// IM grab，每个应用每个键都付这份成本。默认关 = 键路径零文件 I/O；要取证时
+/// 设 KIME_KEY_LOG=1 重跑（与 KIME_LOG_FILE 路径约定不变）。
+static KEY_LOG: AtomicBool = AtomicBool::new(false);
+static KEY_LOG_FILE: LazyLock<Mutex<Option<KeyLogFile>>> = LazyLock::new(|| Mutex::new(None));
+
 fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+    if !KEY_LOG.load(Ordering::Relaxed) {
+        return;
+    }
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file())
-    {
-        if f.metadata()
-            .map(|m| m.len() > MAX_LOG_BYTES)
-            .unwrap_or(false)
-        {
-            let _ = f.set_len(0);
+    let mut g = KEY_LOG_FILE.lock().unwrap_or_else(|p| p.into_inner());
+    if g.is_none() {
+        *g = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file())
+            .ok()
+            .map(|f| KeyLogFile {
+                buf: BufWriter::new(f),
+                written: 0,
+            });
+    }
+    if let Some(kf) = g.as_mut() {
+        let n = line.len() as u64;
+        if kf.written + n > MAX_LOG_BYTES {
+            let _ = kf.buf.get_mut().set_len(0);
+            kf.written = 0;
         }
-        let _ = f.write_all(line.as_bytes());
+        kf.written += n;
+        let _ = kf.buf.write_all(line.as_bytes());
     }
 }
 
@@ -228,7 +253,9 @@ impl Drop for ShmBuffer {
         // 崩溃取证：buffer 被 drop（munmap+close+代理销毁）的时刻与尺寸。
         // 若 drop 发生在合成器仍持有该 buffer 时（release 未到），随后的
         // create_pool/create_buffer 就可能越界——与 pool 创建日志对时间线。
-        log(&format!("popup buffer drop w={} h={}", self.w, self.h));
+        if DEBUG.load(Ordering::Relaxed) {
+            log(&format!("popup buffer drop w={} h={}", self.w, self.h));
+        }
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
@@ -360,7 +387,9 @@ impl PopupCanvas {
     }
 
     fn on_frame(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
-        log("popup: frame 回调到达");
+        if DEBUG.load(Ordering::Relaxed) {
+            log("popup: frame 回调到达");
+        }
         self.frame = None;
         if self.dirty {
             self.present(renderer, qh);
@@ -468,7 +497,9 @@ impl PopupCanvas {
         let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         // 崩溃取证：create_pool 是 wl_shm 唯一建池入口，崩前最后一行这条日志
         // 即肇事 pool 规格（w/h/len），对照 mangowm 的池校验定根因。
-        log(&format!("popup create_pool w={w} h={h} len={len}"));
+        if DEBUG.load(Ordering::Relaxed) {
+            log(&format!("popup create_pool w={w} h={h} len={len}"));
+        }
         let pool = shm.create_pool(fd_borrowed, len as i32, qh, ());
         let buffer = pool.create_buffer(
             0,
@@ -811,7 +842,9 @@ impl AppState {
                 None => (Vec::new(), 0),
             }
         };
-        log(&format!("popup_show 候选={page:?} hl={hl}"));
+        if DEBUG.load(Ordering::Relaxed) {
+            log(&format!("popup_show 候选={page:?} hl={hl}"));
+        }
         if let Some(canvas) = self.popup.as_mut() {
             canvas.set_content(page, hl, &mut self.renderer, qh);
         }
@@ -1364,7 +1397,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                     Some(engine) => match action {
                         ContextCommit::Unchanged => {}
                         ContextCommit::Echo => {
-                            log("context: 回声过滤（cause=INPUT_METHOD），不推引擎");
+                            if DEBUG.load(Ordering::Relaxed) {
+                                log("context: 回声过滤（cause=INPUT_METHOD），不推引擎");
+                            }
                         }
                         ContextCommit::Apply(tail) => {
                             match &tail {
@@ -1919,6 +1954,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // KIME_DEBUG=1：状态转移日志开关，启动读一次 env（之后按键路径零 env 读取）。
     DEBUG.store(std::env::var_os("KIME_DEBUG").is_some(), Ordering::Relaxed);
+    // KIME_KEY_LOG=1：逐键路由日志开关（默认关 → 键路径零文件 I/O，见 key_log）。
+    KEY_LOG.store(
+        std::env::var_os("KIME_KEY_LOG").is_some(),
+        Ordering::Relaxed,
+    );
     if DEBUG.load(Ordering::Relaxed) {
         log("KIME_DEBUG=1: 状态日志追加写 /tmp/kime-ime-debug.log");
     }
