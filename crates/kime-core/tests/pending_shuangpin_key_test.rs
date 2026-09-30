@@ -87,7 +87,6 @@ fn pending_key_completes_into_the_full_syllable() {
     assert_eq!(e.preedit(), "shi");
     let top = e.candidates().first().map(|c| c.text.clone());
     assert_eq!(top.as_deref(), Some("是"), "补全后首候选应是「是」");
-    // 空格选首候选入 pending（#81：不上屏），再空格整段释放
     let out = e.key(Key {
         ch: None,
         code: 57,
@@ -95,14 +94,5 @@ fn pending_key_completes_into_the_full_syllable() {
         ctrl: false,
         alt: false,
     });
-    assert_eq!(out, Outcome::Consumed, "选词入 pending");
-    assert_eq!(e.preedit(), "是", "pending 显示");
-    let out = e.key(Key {
-        ch: None,
-        code: 57,
-        shift: false,
-        ctrl: false,
-        alt: false,
-    });
-    assert_eq!(out, Outcome::Commit("是".into()), "第二次空格释放");
+    assert_eq!(out, Outcome::Commit("是".into()), "选词立即上屏");
 }

@@ -95,6 +95,8 @@ fn texts(e: &Engine) -> Vec<String> {
 }
 
 /// 按候选文本选中（数字键 1-9 选页内第 1-9 个），返回上屏文本。
+/// 全覆盖时立即上屏（fcitx5 语义）：返回整段（含之前 pending 缓冲的词）；
+/// 部分覆盖时返回所选词本身（词留在 pending 等整串覆盖）。
 fn select_text(e: &mut Engine, text: &str) -> String {
     let list = texts(e);
     let idx = list
@@ -108,7 +110,8 @@ fn select_text(e: &mut Engine, text: &str) -> String {
     let digit = (b'1' + idx as u8) as char;
     match e.key(ch(digit)) {
         Outcome::Consumed => text.to_string(),
-        other => panic!("选「{text}」期望入 pending（#81 Consumed），实际 {other:?}"),
+        Outcome::Commit(t) => t,
+        other => panic!("选「{text}」期望入 pending 或立即上屏，实际 {other:?}"),
     }
 }
 
@@ -140,9 +143,9 @@ fn char_by_char_selection_keeps_following_syllables() {
         texts(&e)
     );
 
-    // 接着选「量」：整串吃完，组合清空。
-    assert_eq!(select_text(&mut e, "量"), "量");
-    assert_eq!(e.preedit(), "能量", "#81：整段在 pending 显示（等释放）");
+    // 接着选「量」：整串吃完 → 立即上屏（能量一起，fcitx5 语义）。
+    assert_eq!(select_text(&mut e, "量"), "能量");
+    assert!(e.preedit().is_empty(), "整串覆盖 = 立即上屏");
     assert!(e.candidates().is_empty(), "选完后候选应清空");
     cleanup(&db, &yaml);
 }
@@ -177,7 +180,7 @@ fn whole_word_selection_consumes_all_keys() {
     }
     // 整词「能够」= 2 音节 = 4 键位，nggb 全部消耗（键位消耗不回退成旧行为）。
     assert_eq!(select_text(&mut e, "能够"), "能够");
-    assert_eq!(e.preedit(), "能够", "#81：整词在 pending 显示（等释放）");
+    assert!(e.preedit().is_empty(), "整词覆盖全部输入 = 立即上屏");
     assert!(e.candidates().is_empty(), "整词上屏后候选应清空");
     cleanup(&db, &yaml);
 }
@@ -201,6 +204,6 @@ fn full_pinyin_fallback_list_stays_pure_full_pinyin() {
         "全拼语义下不得混入双拼派生的「啊」（选它会按字母切、剩 ang 而非 ng）：{list:?}"
     );
     assert_eq!(select_text(&mut e, "阿昂"), "阿昂");
-    assert_eq!(e.preedit(), "阿昂", "#81：整词在 pending 显示（等释放）");
+    assert!(e.preedit().is_empty(), "整串覆盖 = 立即上屏");
     cleanup(&db, &yaml);
 }

@@ -81,16 +81,9 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
         vec!["我们都不知道", "我", "握", "窝"],
         "整句在前、首音节单字追加到末尾，实际 {cs:?}"
     );
-    // 空格首选入 pending（#81）：仍是整句首候选
-    match e.key(code_k(KEY_SPACE)) {
-        Outcome::Consumed => {}
-        other => panic!("expected pending Consumed, got {:?}", other),
-    }
-    assert_eq!(e.preedit(), "我们都不知道", "整句在 pending 显示");
-    // 再按空格整段释放
     match e.key(code_k(KEY_SPACE)) {
         Outcome::Commit(t) => assert_eq!(t, "我们都不知道"),
-        other => panic!("expected 释放 Commit, got {:?}", other),
+        other => panic!("expected Commit, got {:?}", other),
     }
     assert!(e.preedit().is_empty() && e.candidates().is_empty());
     // 重新打长串，翻到末页选单字「窝」——追加的单字是一等候选
