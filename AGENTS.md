@@ -12,6 +12,7 @@
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
 - **本地禁止任何 `cargo build` / `cargo test` / `cargo run`**（含单个测试、example、`--bin`）：编译与测试一律放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test）。本地不验证正确性，靠 CI 绿灯为准；需要复现行为时写成**测试文件或 example 提交进仓库**，由 CI 跑，不在本地执行。
 - 本地允许的仅：读代码、grep/glob、`git` 操作、写文件；不产生任何 target/ 产物。
+- **更新/安装本地二进制同样禁止本地编译**：`kime`/`platform-wayland`/`platform-x11` 的编译全部由 CI 负责；本地要装新 IME/CLI 时，**下载 PR CI（绿灯 run）的 `kime-binaries` artifact** 装到 `~/.local/bin/`（`kime`=CLI、`platform-wayland`→`kime-ime`、`platform-x11`→`kime-xim`）。「为了装包」「为了体验」「为了安装」都不构成本地 `cargo build` 的理由——这条已因误判「装包」而违规过一次。
 - bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
 
 ### `.wt/` 工作目录保护（硬约束）
@@ -43,7 +44,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 #### cpulimit（硬约束）
 
-- 编译、测试、装包、基准测试一律加限制：`cpulimit -l 65 -i -- cargo <cmd>`。
+- 仅对**本地允许的**跑命令（即 `cargo bench`，见「开发方式」）加限制：`cpulimit -l 65 -i -- cargo bench …`。编译 / 测试 / 装包**不在本地跑**（CI 负责），cpulimit 不适用于它们。
 - git、grep、文件读写等轻量命令不需要。
 
 #### 键盘/输入法真机会话约定
