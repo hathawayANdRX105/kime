@@ -4,3 +4,6 @@
 /.oi
 /todo
 /.agent
+/.codegraph
+__pycache__/
+*.pyc
