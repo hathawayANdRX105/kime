@@ -52,18 +52,19 @@ platform-mac/         （规划中）macOS IMKit 壳
 
 ## 快速开始
 
-### 1. 构建 FST 词库（一次性，将 192 万词条编译为 42MB 二进制）
+### 1. 构建 FST 词库（一次性，将词库编译为 ~42MB 二进制）
 ```bash
-cargo run --release -p kime -- build-dict \
+# kime 二进制取自 PR CI（绿灯 run）的 kime-binaries artifact（本地不编译，见「开发约定」）
+kime build-dict \
   --in ~/.local/share/kime/dict.sqlite3 \
   --out ~/.local/share/kime/dict.bin
 ```
 
 ### 2. CLI 试打（REPL）
 ```bash
-cargo run -p kime
+kime
 # 或指定双拼方案
-cargo run -p kime -- --shuangpin xiaohe
+kime --shuangpin xiaohe
 ```
 
 ### 3. 切换输入法
@@ -73,14 +74,14 @@ kime-switch fcitx   # 切回 fcitx5
 kime-switch status
 ```
 
-### 4. 运行性能基准测试
+### 4. 运行性能基准测试（本地唯一允许的 cargo，套 cpulimit）
 ```bash
-cargo bench --bench kime_bench
+cpulimit -l 65 -i -- cargo bench --bench kime_bench
 ```
 
 ## 开发约定
 
-- **所有测试只在 PR CI 跑**（`ci.yml`：fmt check + `cargo test --workspace`）；本地只做 `cargo check` / `fmt --check` 轻量验证
+- **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；装二进制从 CI 的 `kime-binaries` artifact 下载到 `~/.local/bin/`）；本地唯一允许 `cargo bench`（套 `cpulimit -l 65 -i --`）
 - 测试放 `tests/` 目录，src 内严禁 `#[cfg(test)]`（githook 强制）
 - 依赖单向：`bin/kime -> platform-wayland -> kime-core -> kime-shuangpin -> kime-pinyin`
 - core 不碰任何显示/UI；壳只做「按键进、候选出、上屏提交」
