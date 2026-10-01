@@ -4,7 +4,6 @@ ignore_paths:
   - "node_modules/"
   - "target/"
   - "__pycache__/"
-  - ".codegraph/"
   - ".git/"
   - ".benchmarks/"
   - ".pytest_cache/"

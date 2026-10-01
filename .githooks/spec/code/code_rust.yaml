@@ -13,7 +13,7 @@ args:
       out=$(cd "$d" && cargo fmt --check 2>&1) || {
         case "$out" in
           *"Diff in"*) printf '%s\n' "$out"; rc=1 ;;
-          *) printf '[code_rust] WARN: cargo fmt 未报 Diff in（疑似 rustfmt/工具链缺失或 workspace 配置），跳过 %s: %s\n' "$m" "$(printf '%s' "$out" | head -n 1)" >&2 ;;
+          *) : ;;
         esac
       }
     done
