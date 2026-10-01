@@ -74,6 +74,7 @@ severity_overrides:
 #   ocr 已退役：ocr 二进制缺席时 RV-07 只看 CRG，语义层交给 ocr_rust/go/javascript checklist
 merge_review:
   required: true
+  ocr_timeout_secs: 600
 
 # ---------------------------------------------------------------------------
 # 检查能力选择 (capability allowlist)

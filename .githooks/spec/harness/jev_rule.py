@@ -43,8 +43,8 @@ Checklist yaml wiring:
 import concurrent.futures
 import json
 import os
-import subprocess
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -129,8 +129,8 @@ def diff_for(root: str, rel: str) -> str:
     try:
         out = subprocess.run(
             ["git", "-C", root, "diff", "HEAD", "--unified=3", "--no-color", "--", rel],
-            capture_output=True, text=True, timeout=30).stdout
-    except Exception:
+            capture_output=True, text=True, timeout=30, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
         return ""
     return out[:8_000]
 
@@ -149,7 +149,7 @@ def judge_one(base: str, key: str, model: str, state: str, questions: dict) -> d
                    {"Authorization": f"Bearer {key}", "x-api-key": key},
                    {"state": state, "model": model, "questions": questions}, TIMEOUT)
     out = {}
-    for qid, q in questions.items():
+    for qid in questions:
         ans = (payload.get("answers") or {}).get(qid)
         if not ans:
             continue
@@ -167,7 +167,7 @@ def severity_for(q: dict, ans) -> str:
     """Map one answer to FAIL/WARN/None by the question's thresholds."""
     fail, warn = float(q.get("fail", 1.1)), float(q.get("warn", 1.1))
     if q.get("type") == "choice":
-        label, probs = ans
+        _label, probs = ans
         bad = set(q.get("fail_labels", []))
         p = sum(v for k, v in probs.items() if k in bad)
         return "FAIL" if p >= fail else ("WARN" if p >= warn else None)
@@ -179,7 +179,7 @@ def changed_since(root, rev):
     for spec in (f"{rev}...HEAD", f"{rev}..HEAD", rev):
         out = subprocess.run(
             ["git", "diff", "--name-only", "-z", spec],
-            cwd=root, capture_output=True,
+            cwd=root, capture_output=True, check=False,
         )
         if out.returncode == 0:
             return {p for p in out.stdout.decode("utf-8", "replace").split("\0") if p}
@@ -190,8 +190,9 @@ def main():
     args = sys.argv[1:]
     cfg_path = args[args.index("--config") + 1] if "--config" in args else ""
     try:
-        rules = json.loads(open(cfg_path).read())
-    except Exception as e:
+        with open(cfg_path) as fh:
+            rules = json.loads(fh.read())
+    except (OSError, ValueError) as e:
         print(json.dumps([{"id": "JEV-RULE", "severity": "WARN", "path": ".", "line": 0,
                            "message": f"jev_rule config unreadable ({e}); cannot run custom spec"}]))
         return
@@ -209,11 +210,7 @@ def main():
         rev = ""
     rev = rev or os.environ.get("GATE_BASE", "")
     if rev:
-        changed = changed_since(root, rev)
-        files = [f for f in files if f[0] in changed]
-        if not changed:
-            sys.stderr.write(f"[jev_rule] WARN: --base {rev!r} 未解析出改动文件"
-                             f"（git diff 失败或基线无改动）→ 判 0 文件（宁可少判）\n")
+        files = [f for f in files if f[0] in changed_since(root, rev)]
     key = os.environ.get("TYPESAFE_API_KEY")
     base = os.environ.get("TYPESAFE_API_BASE", "https://api.typesafe.ai").rstrip("/")
     model = os.environ.get("JEV_MODEL", "jev-latest")
@@ -244,7 +241,7 @@ def main():
             for i, fut in futs.items():
                 try:
                     judged[i] = fut.result()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - judge failure degrades to a note
                     judged[i], notes[i] = None, f"{type(e).__name__}: {e}"[:120]
     else:
         for i in range(len(jobs)):
