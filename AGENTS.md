@@ -1,10 +1,10 @@
-<!-- managed by canon agents.yaml @ 2026-09-24 -->
+<!-- managed by canon agents.yaml @ 2026-10-01 -->
 ## kime 约定
 
 ### 开工前
 
 1. 读本文件（`AGENTS.md`）。
-2. 读 `README.md`。
+2. 读 `README.md` 与 `ROADMAP.md`，确认当前里程碑顺序。
 3. 检查当前分支与未提交改动；禁止覆盖未提交代码。
 
 ### 开发方式
@@ -12,7 +12,6 @@
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
 - **本地禁止任何 `cargo build` / `cargo test` / `cargo run`**（含单个测试、example、`--bin`）：编译与测试一律放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test）。本地不验证正确性，靠 CI 绿灯为准；需要复现行为时写成**测试文件或 example 提交进仓库**，由 CI 跑，不在本地执行。
 - 本地允许的仅：读代码、grep/glob、`git` 操作、写文件；不产生任何 target/ 产物。
-- **更新/安装本地二进制同样禁止本地编译**：`kime`/`platform-wayland`/`platform-x11` 的编译全部由 CI 负责；本地要装新 IME/CLI 时，**下载 PR CI（绿灯 run）的 `kime-binaries` artifact** 装到 `~/.local/bin/`（`kime`=CLI、`platform-wayland`→`kime-ime`、`platform-x11`→`kime-xim`）。「为了装包」「为了体验」「为了安装」都不构成本地 `cargo build` 的理由——这条已因误判「装包」而违规过一次。
 - bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
 
 ### `.wt/` 工作目录保护（硬约束）
@@ -44,7 +43,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 #### cpulimit（硬约束）
 
-- 仅对**本地允许的**跑命令（即 `cargo bench`，见「开发方式」）加限制：`cpulimit -l 65 -i -- cargo bench …`。编译 / 测试 / 装包**不在本地跑**（CI 负责），cpulimit 不适用于它们。
+- 编译、测试、装包、基准测试一律加限制：`cpulimit -l 65 -i -- cargo <cmd>`。
 - git、grep、文件读写等轻量命令不需要。
 
 #### 键盘/输入法真机会话约定
@@ -67,13 +66,13 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 ## 发现处置纪律
 
-自动检查（gate 的 `FAIL`/`WARN`、`jev` L3 语义发现、CRG / `ocr review` 审查意见）
+自动检查（canon 的 `FAIL`/`WARN`、`jev` L3 语义发现、CRG / `ocr review` 审查意见）
 产出的是**发现**，不是判决。每条发现都必须被显式处置，不存在"绕过"这个选项。
 
 ### 先读规范，再改代码
 
 1. 拿到 finding，先读规则原文，确认这条发现到底要求什么：
-   - gate 规则总览：`.githooks/GATE_HANDBOOK.md`（无则 `canon/manual/gate.md`）
+   - canon 规则总览：`gate-spec` skill（正本）；各仓 `.githooks/spec/docs/SPEC_OVERVIEW.md` 为播种副本
    - 单条规则的参数（匹配范围 / 严重度 / harness）：`.githooks/spec/**/<rule>.yaml`
    - 项目适配说明（本仓为什么这么定）：`.agent/rules/gates.md`
 2. 不确定 finding 是否成立时，读完规则仍不能判定 → **记为待裁决**并在交付记录里写明，
@@ -92,7 +91,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 ### 禁止糊弄式修复
 
-以下动作一律视为违规（无论 gate 是否因此变绿）：
+以下动作一律视为违规（无论 canon 是否因此变绿）：
 
 | 禁止 | 为什么 | 正确做法 |
 |---|---|---|
@@ -114,7 +113,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 
 ### 规范层级
 
-- `.githooks/` 是 gate 领地：agent 不改规则。
+- `.githooks/` 是 canon 领地：agent 不改规则。
 - `.agent/rules/`、`specs/rules/` 是规范正本：发现规则与现实冲突 → 提 issue，不自行改写。
 - 本纪律与各仓既有条款冲突时，以本纪律为准（它更严格）。
 
@@ -221,7 +220,19 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
   `test:` / `ci:` / `build:` / `perf:` / `style:` / `revert:`）。
 - 标题**用英文**，正文可用中文。
 - 一个 commit 一件事。不把无关改动、格式化噪声、生成物混进逻辑改动。
-- 提交前跑对应检查（`gate pre-commit` / `gate pre-push`），不靠推送失败才发现。
+- 提交前跑对应检查（`canon pre-commit` / `canon pre-push`），不靠推送失败才发现。
+
+### 提交身份
+
+- commit 作者固定是维护者本人账号 `hathawayANdRX105`（大小写逐字一致）。
+- **不得**用 `git -c user.name=... -c user.email=...` 覆盖身份提交。历史上
+  `agent@local` / `ci@local` 这类签名就是这么来的：GitHub 账号对不上，
+  贡献归属、追责、审计全丢。
+- 提交前若 `git config user.name` / `user.email` 不是上面这个账号，先改成本仓配置
+  （`git config user.name hathawayANdRX105`），别带着错的身份往下走。
+- 邮箱两套都算合法：`2635254302@qq.com`（本地提交）与 GitHub 的
+  `61958173+hathawayANdRX105@users.noreply.github.com`（服务端 squash 落库时写的）。
+- 禁止 `Co-authored-by:`  trailer 署其他人或机器人账号。
 
 ### Issue
 
@@ -236,7 +247,19 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
   实现步骤 / 交付记录 / 怎么验证 / 检查清单。
 - 关联 issue 用 `Fixes #<n>` 收尾行；draft 阶段用 `Related #<n>`，合并授权前改 `Fixes`。
 - 开启或更新 PR 后看 CI 结果到底（`gh pr checks`），红了就修，不等用户来问。
-- 被 gate 拦下就修代码，**不改规则**。规则确有缺陷 → 开 issue 交维护者裁决。
+- 被 canon 拦下就修代码，**不改规则**。规则确有缺陷 → 开 issue 交维护者裁决。
+
+### 合并
+
+- **只走 squash merge**：
+  `gh pr merge <N> --squash --delete-branch --body "Agent 🤖 - Merge: <原因>"`。
+- 禁用 `--merge` / `--rebase`（含 `-m` / `-r` 短形式）。merge commit 会让 PR
+  记录的分支历史消失，同一分支再合要重新三方合并、当初的冲突裁决全部丢失；
+  rebase-merge 还会逐个改写 commit 作者。两者都让 `main` 失去审计价值。
+- 不带任何合并方式的 `gh pr merge` 会弹交互菜单 —— agent 不该触发交互，一律显式
+  写 `--squash`。
+- 禁止本地 `git merge <分支>` 直接合进 `main` 再推 remote。要合就走 PR。
+- 各仓 GitHub 设置已关闭 merge commit 与 rebase merge，squash 是唯一可选项。
 
 ### 收尾
 
