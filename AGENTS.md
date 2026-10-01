@@ -12,7 +12,7 @@
 - `.wt/<name>/` 是开发工作目录：每个子任务用 `git worktree add .wt/<name> -b <branch>` 挂独立分支；主仓库根目录只读（除根 `Cargo.toml` 变更）。
 - **本地禁止任何 `cargo build` / `cargo test` / `cargo run`**（含单个测试、example、`--bin`）：编译与测试一律放 PR 的 CI（`.github/workflows/ci.yml`：fmt + clippy + test）。本地不验证正确性，靠 CI 绿灯为准；需要复现行为时写成**测试文件或 example 提交进仓库**，由 CI 跑，不在本地执行。
 - 本地允许的仅：读代码、grep/glob、`git` 操作、写文件；不产生任何 target/ 产物。
-- bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `cpulimit -l 65 -i --`。
+- bench（`cargo bench`）不跑 CI，需要时本地跑且必须套 `systemd-run --user --scope -p CPUQuota=65% --`。
 
 ### `.wt/` 工作目录保护（硬约束）
 
@@ -41,9 +41,9 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 - 一律使用 `gio trash <path>`（可恢复），禁止使用 `rm` / `rm -rf`。
 - VCS 跟踪的文件可以使用 `git rm`。
 
-#### cpulimit（硬约束）
+#### CPU 配额（硬约束）
 
-- 编译、测试、装包、基准测试一律加限制：`cpulimit -l 65 -i -- cargo <cmd>`。
+- 编译、测试、装包、基准测试一律加限制：`systemd-run --user --scope -p CPUQuota=65% -- cargo <cmd>`。
 - git、grep、文件读写等轻量命令不需要。
 
 #### 键盘/输入法真机会话约定
@@ -163,7 +163,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
   测试；testless 异常/零命中自动降级全量，绝不静默跳过。全量务必
   `cargo test --workspace`（根包 workspace 下裸 `cargo test` 只跑根包）。
 - 不要在会话里自行 `export RUSTC_WRAPPER` 或改 jobs——统一走仓配置；
-  重命令照旧套 `cpulimit -l 70 -i`。
+  重命令照旧套 cgroup CPU 配额（`systemd-run --user --scope -p CPUQuota=70% --`）。
 - 增量编译已关（缓存优先）：同树连续小改动按 crate 级重编是预期行为，不是
   回归；若本仓热重载明显变慢，提 issue 议局部放开。
 - 新建 `.wt` worktree 直接用；旧布局 worktree 若报 workspace 收编错误，
@@ -190,7 +190,7 @@ benches/              基准测试套件（cargo bench --bench kime_bench）
 - 全量测试、全量构建、全量 lint 放 CI 或收尾阶段，不在改动过程中反复跑。
 - 本地只跑轻量、快的针对性检查（单 crate `cargo check`、单包测试、`fmt --check`、
   类型检查）。
-- 需要本地跑重命令时，套资源限制（`cpulimit -l 65 -i --` 或本仓等价手段），
+- 需要本地跑重命令时，套资源限制（`systemd-run --user --scope -p CPUQuota=65% --` 或本仓等价手段），
   不抢占用户正在用的 CPU。
 - 装依赖、打包等命令同样受限。
 
