@@ -7,3 +7,4 @@
 /.codegraph
 __pycache__/
 *.pyc
+.testless/
