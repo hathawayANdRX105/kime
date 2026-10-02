@@ -61,7 +61,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
 };
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {msg}");
+    // stderr 写失败（EPIPE/EAGAIN/ENOSPC）宁可丢日志也不 panic——日志不许拉进程陪葬。
+    let _ = writeln!(std::io::stderr(), "[kime-ime] {msg}");
 }
 
 /// evdev keycodes — wayland 原生即此值，平台壳无需翻译（route.rs 同源约定）。

@@ -9,6 +9,7 @@
 //! 与 main.rs 的 PopupCanvas 保持同构，便于对照排障。
 
 use std::env;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use wayland_client::protocol::{
@@ -72,7 +73,8 @@ pub fn badge_enabled() -> bool {
 fn warn_once(msg: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("[kime] 警告：{msg}");
+        // stderr 写失败宁可丢日志也不 panic：徽标只是装饰，不值当拉进程陪葬。
+        let _ = writeln!(std::io::stderr(), "[kime] 警告：{msg}");
     }
 }
 
@@ -437,5 +439,6 @@ impl ModeBadge {
 }
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {msg}");
+    // stderr 写失败宁可丢日志也不 panic，理由同 warn_once。
+    let _ = writeln!(std::io::stderr(), "[kime-ime] {msg}");
 }

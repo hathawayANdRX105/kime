@@ -8,7 +8,7 @@
 //! 事件流：每个选区变化 → `sh -c 'cat; printf "\0"'` → 新选区内容 + NUL。
 //! Rust 侧按 NUL 切分；GUI 文本不含 NUL（UTF-8 禁止），可无损切分。
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -46,7 +46,13 @@ pub fn arm(cmd: &mut Command) {
 pub fn spawn(tx: Sender<String>) {
     std::thread::spawn(move || match Watcher::start() {
         Ok(mut w) => w.run(tx),
-        Err(e) => eprintln!("[kime-clip] wl-paste 不可用，剪贴板候选停用: {e}"),
+        Err(e) => {
+            // stderr 写失败宁可丢日志也不 panic：这是后台线程，日志不值当拉进程陪葬。
+            let _ = writeln!(
+                std::io::stderr(),
+                "[kime-clip] wl-paste 不可用，剪贴板候选停用: {e}"
+            );
+        }
     });
 }
 
@@ -95,12 +101,12 @@ impl Watcher {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[kime-clip] 读 wl-paste 输出失败: {e}");
+                    let _ = writeln!(std::io::stderr(), "[kime-clip] 读 wl-paste 输出失败: {e}");
                     break;
                 }
             }
         }
         let _ = self.child.wait();
-        eprintln!("[kime-clip] wl-paste --watch 退出");
+        let _ = writeln!(std::io::stderr(), "[kime-clip] wl-paste --watch 退出");
     }
 }
