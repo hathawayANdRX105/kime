@@ -25,6 +25,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use crate::learn_writer::{LearnJob, LearnWriter};
+
 fn io_to_sqlite(e: std::io::Error) -> SqliteError {
     SqliteError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
@@ -167,6 +169,11 @@ pub struct Dict {
     lm_generation: i64,
     /// commit_log 写失败已告警哨兵（一次性告警，防每键刷屏；见 `warn_once`）。
     lm_warned: bool,
+    /// 数据库路径：后台写线程懒 spawn 时按它开自己的连接（#101，
+    /// 见 `learn_writer` 模块）。写线程不存副本，单份存储在这里。
+    db_path: PathBuf,
+    /// 后台词库写线程句柄（懒 spawn；队满丢 job，键路径零 SQLite 写）。
+    writer: LearnWriter,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -549,6 +556,8 @@ impl Dict {
             lm_counts: HashMap::new(),
             lm_generation: 0,
             lm_warned: false,
+            db_path: path.to_path_buf(),
+            writer: LearnWriter::default(),
         })
     }
 
@@ -1315,6 +1324,48 @@ impl Dict {
         let pinyin = reading.join("'");
         let &(n, day) = self.user_stats.get(&(pinyin.clone(), text.to_string()))?;
         Some((pinyin, abbrev_of(reading), n, day))
+    }
+
+    /// commit_log 入队（键路径，#101：零 SQLite 写）。job 只携带原始串，
+    /// vocab id 由后台写线程执行时解析；读音/文本为空直接 no-op，与同步
+    /// [`Self::log_commit`] 的入口守卫同语义。
+    pub(crate) fn enqueue_log_commit(
+        &mut self,
+        ctx: Option<(&str, &str)>,
+        reading: &[String],
+        text: &str,
+        tail: Option<&str>,
+    ) {
+        if reading.is_empty() || text.is_empty() {
+            return;
+        }
+        let job = LearnJob::CommitLog {
+            ctx: ctx.map(|(t, r)| (t.to_string(), r.to_string())),
+            reading: reading.join("'"),
+            text: text.to_string(),
+            tail: tail.map(str::to_string),
+        };
+        self.writer.submit(&self.db_path, job);
+    }
+
+    /// learn 持久化入队（键路径，#101）。载荷取自 [`Self::learn_persist_payload`]
+    /// ——`learn_mem` 刚写进 `user_stats` 的本轮计数；内存提频已当帧生效，
+    /// 这里只把 phrase UPSERT + kime_kv 绝对计数交给后台写线程。
+    ///
+    /// `&mut self` 而非任务书建议的 `&self`：首个 job 需要懒 spawn 线程，
+    /// 写入 sender/句柄。
+    pub(crate) fn enqueue_learn(&mut self, reading: &[String], text: &str) {
+        let Some((pinyin, abbrev, n, day)) = self.learn_persist_payload(reading, text) else {
+            return;
+        };
+        let job = LearnJob::Learn {
+            pinyin,
+            abbrev,
+            text: text.to_string(),
+            n,
+            day,
+        };
+        self.writer.submit(&self.db_path, job);
     }
 
     /// todo/2026-09-18-offline-lm-design.md 第 0 层）。

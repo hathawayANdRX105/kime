@@ -35,6 +35,7 @@ pub mod correction;
 pub mod dict;
 pub mod engine;
 pub mod lattice;
+mod learn_writer;
 pub mod llm;
 pub mod lm;
 pub mod predict;

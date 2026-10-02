@@ -13,6 +13,7 @@ use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
 use crate::punct;
 use kime_pinyin::segment;
+use std::io::Write;
 
 // evdev keycodes — wayland 原生即此值，平台壳无需翻译。
 const KEY_ESC: u32 = 1;
@@ -869,12 +870,12 @@ impl Engine {
         } else {
             cand.pinyin.split('\'').map(str::to_string).collect()
         };
-        // 离线 LM 原材料：记录 (上次提交词, 本词) 供挖掘 bigram。
-        // 失败不阻塞上屏（log_commit 内部已吞错）。
-        // tail = 引擎自持的上屏前文尾（surrounding_text 末段），随 commit 落
-        // tail_ctx 列，离线挖掘按词库前缀切出真实相邻对（#89）。壳层零改动。
+        // 离线 LM 原材料：只带原始串入队，落库与 vocab 解析都在后台写线程
+        // （#101：键路径零 SQLite 写）。tail = 引擎自持的上屏前文尾
+        // （surrounding_text 末段），随 commit 落 tail_ctx 列，离线挖掘按
+        // 词库前缀切出真实相邻对（#89）。壳层零改动。
         let prev = self.last_commit.take();
-        self.dict.log_commit(
+        self.dict.enqueue_log_commit(
             prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
             &reading,
             &cand.text,
@@ -882,17 +883,26 @@ impl Engine {
         );
         self.last_commit = Some((cand.text.clone(), reading.join("'")));
         // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
-        // 顺手检查世代号（离线挖掘跑过则重载缓存）。
+        // 顺手检查世代号（离线挖掘跑过则重载缓存）；只读查询，miss 不写库。
         self.dict.set_lm_context(
             self.last_commit
                 .as_ref()
                 .map(|(t, r)| (t.as_str(), r.as_str())),
         );
-        if let Err(e) = self.dict.learn(&reading, &cand.text) {
-            eprintln!(
-                "[kime] 用户词学习失败 ({} → {}): {}",
-                self.preedit, cand.text, e
-            );
+        // 内存提频当帧生效（2026-09-15 拍板「使用即提升当场生效」），持久化
+        // 另走入队；learn_mem 成功才 enqueue，与旧 `learn` = 内存 + 持久化的
+        // 成功序一致。stderr 写失败直接吞——按键路径不许 panic。
+        match self.dict.learn_mem(&reading, &cand.text) {
+            Ok(()) => self.dict.enqueue_learn(&reading, &cand.text),
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[kime] 用户词学习失败 ({} → {}): {}",
+                    self.preedit,
+                    cand.text,
+                    e
+                );
+            }
         }
         // learn 改了条目 eff → 词图格子缓存整体作废（失效点：凡词库内容/eff 变化）
         self.span_cache.clear();
