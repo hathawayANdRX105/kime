@@ -18,6 +18,7 @@ use platform_wayland::clipboard_watch::spawn as spawn_clipboard_watcher;
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::mode_badge::{badge_enabled, BadgeFrame, BadgeSlot, ModeBadge};
+use platform_wayland::next_backoff_ms;
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer};
 use platform_wayland::route::{
     clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
@@ -60,7 +61,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
 };
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {msg}");
+    // stderr 写失败（EPIPE/EAGAIN/ENOSPC）宁可丢日志也不 panic——日志不许拉进程陪葬。
+    let _ = writeln!(std::io::stderr(), "[kime-ime] {msg}");
 }
 
 /// evdev keycodes — wayland 原生即此值，平台壳无需翻译（route.rs 同源约定）。
@@ -138,18 +140,29 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
 }
 
 /// KIME_DEBUG=1 状态转移日志：追加写 /tmp/kime-ime-debug.log（写失败静默忽略，
-/// 日志不许卡键流）。main() 启动读一次 env 落进 [`DEBUG`]；关闭时每个调用点
-/// 一次静态读就返回——零文件 I/O、零格式化、零分配。
+/// 自截断封顶 1MiB，见 [`debug_log`]）。main() 启动读一次 env 落进 [`DEBUG`]；
+/// 关闭时每个调用点一次静态读就返回——零文件 I/O、零格式化、零分配。
 static DEBUG: AtomicBool = AtomicBool::new(false);
 
 /// 惰性打开的追加写句柄（首条日志时打开，之后常驻；进程退出随析构 flush）。
-static DEBUG_FILE: LazyLock<Mutex<Option<BufWriter<File>>>> = LazyLock::new(|| Mutex::new(None));
+/// `written` 内存记累计字节，超 1MiB 就 set_len(0) 归零——与 [`key_log`] 同一套
+/// 自截断：O_APPEND 下 seek 无效，内核强制每次写落到当前文件尾，只有归零才让后续
+/// 行从头写起。没人清理的 tmpfs 日志否则会一路涨到把 RAM 吃干。
+static DEBUG_FILE: LazyLock<Mutex<Option<DebugLogFile>>> = LazyLock::new(|| Mutex::new(None));
+
+/// KIME_DEBUG 日志句柄：`written` 记账语义与 [`KeyLogFile`] 一致。
+struct DebugLogFile {
+    buf: BufWriter<File>,
+    written: u64,
+}
 
 /// 记一条 KIME_DEBUG 状态日志（行内容由闭包**惰性**构造：关着时连格式化都不做）。
+/// 写失败静默丢弃——日志不许卡键流。
 fn debug_log(line: impl FnOnce() -> String) {
     if !DEBUG.load(Ordering::Relaxed) {
         return;
     }
+    const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let mut guard = DEBUG_FILE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -159,10 +172,20 @@ fn debug_log(line: impl FnOnce() -> String) {
             .append(true)
             .open("/tmp/kime-ime-debug.log")
             .ok()
-            .map(BufWriter::new);
+            .map(|f| DebugLogFile {
+                buf: BufWriter::new(f),
+                written: 0,
+            });
     }
-    if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{}", line());
+    if let Some(df) = guard.as_mut() {
+        let msg = line();
+        let n = msg.len() as u64 + 1; // writeln! 追加的换行也算行长
+        if df.written + n > MAX_LOG_BYTES {
+            let _ = df.buf.get_mut().set_len(0);
+            df.written = 0;
+        }
+        df.written += n;
+        let _ = writeln!(df.buf, "{msg}");
     }
 }
 
@@ -235,7 +258,8 @@ struct SeatBind {
 }
 
 /// 一块 shm 画布：memfd 与其 mmap 必须是同源的（历史上渲染写 B、合成器读 A，
-/// 候选窗永远空白的根因）。Drop 时 munmap+close；WlBuffer 代理丢弃即 destroy。
+/// 候选窗永远空白的根因）。Drop 时先发 `wl_buffer.destroy`（代理 drop 本身不发
+/// 任何请求），再 munmap+close。
 struct ShmBuffer {
     buffer: WlBuffer,
     fd: i32,
@@ -250,12 +274,14 @@ struct ShmBuffer {
 
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
-        // 崩溃取证：buffer 被 drop（munmap+close+代理销毁）的时刻与尺寸。
+        // 崩溃取证：buffer 被 drop（wl_buffer.destroy + munmap+close）的时刻与尺寸。
         // 若 drop 发生在合成器仍持有该 buffer 时（release 未到），随后的
         // create_pool/create_buffer 就可能越界——与 pool 创建日志对时间线。
         if DEBUG.load(Ordering::Relaxed) {
             log(&format!("popup buffer drop w={} h={}", self.w, self.h));
         }
+        // 协议销毁先行，之后不再触碰 buffer；死连接上该请求静默丢弃不 panic。
+        self.buffer.destroy();
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
@@ -1139,12 +1165,20 @@ impl AppState {
         self.input_method_manager = None;
         self.input_method = None;
         self.im_instance = None;
+        // commit serial 必须等于该 zwp_input_method_v2 对象已发的 done 事件数
+        // （协议 XML input-method-unstable-v2 的 commit 描述）；重连拿到的是全新
+        // 对象、从 0 计。不复位 → serial 永远对不上 → 合成器静默丢弃状态变更
+        // （不报协议错误）→ 重连后提交不上屏。
+        self.im_serial = 0;
         // 重连 = 全新 IM 实例：引擎进程内保留，但旧 burst 的撤销栈必须随之作废
         // （重连后首个 ACTIVATE 的 im_instance 比较基准已清空，不会误清/漏清）。
         if let Some(engine) = self.engine.as_mut() {
             engine.clear_undo();
         }
-        self.grab = None;
+        if let Some(grab) = self.grab.take() {
+            // 连接已死：release 的 proxy upgrade 失败直接 return，静默 no-op 不 panic。
+            grab.release();
+        }
         self.vk_manager = None;
         self.vk = None;
         self.vk_keymap_ready = false;
@@ -1156,16 +1190,20 @@ impl AppState {
         self.badge = None;
         debug_log(|| "wayland conn-lost -> reset objects (engine kept, clear_undo)".to_string());
     }
-    /// 正常退出前:显式走协议销毁 vk/im(grab 无显式 destroy,drop 即可)并 flush,
-    /// 让 vk 走「协议 destroy」而非「断开连接时服务端自动销毁」,避开 mangowm 崩会路径。
+    /// 正常退出前:显式走协议销毁 grab/vk/im 并 flush——grab 走 `release`（协议有
+    /// destructor 请求），vk/im 走 `destroy`，让它们走「协议销毁」而非「断开连接时
+    /// 服务端自动销毁」,避开 mangowm 崩会路径。
     fn teardown_wayland_objects(&mut self) {
+        // grab 由 zwp_input_method_v2 创建，先释放子对象再销毁父对象。
+        if let Some(grab) = self.grab.take() {
+            grab.release();
+        }
         if let Some(vk) = self.vk.take() {
             vk.destroy();
         }
         if let Some(im) = self.input_method.take() {
             im.destroy();
         }
-        self.grab = None;
         if let Some(c) = &self.conn {
             // 拆除阶段 flush 失败（socket 已死）是预期路径：不 abort 重连流程
             let _ = c.flush();
@@ -1345,6 +1383,12 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 });
                 state.ensure_engine();
                 state.ensure_popup(im, qh);
+                // mangowm 高频 ACTIVATE/DEACTIVATE，可能没有配对 Deactivate 就被
+                // 下一次 ACTIVATE 覆盖：旧 grab 必须先走协议 release（take 防 double），
+                // 否则合成器侧随打字累积 grab 对象。
+                if let Some(old) = state.grab.take() {
+                    old.release();
+                }
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
@@ -1356,7 +1400,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method DEACTIVATE");
                 // DEACTIVATE 不动撤销栈（焦点抖动安全，#70）：只清组合。
                 debug_log(|| format!("DEACTIVATE im#{}", im.id()));
-                state.grab = None;
+                if let Some(grab) = state.grab.take() {
+                    grab.release();
+                }
                 state.repeat.clear();
                 state.shift_gesture.reset();
                 // 组合/preedit 一并作废：否则旧应用的拼音和候选带到下一个应用。
@@ -1377,7 +1423,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             ZwpInputMethodEvent::ContentType { hint, purpose } => {
                 let (hint, purpose) = (wenum_to_u32(hint), wenum_to_u32(purpose));
                 // 去重：合成器每次提交都回发 content_type（实测单次打字 1000+ 条），
-                // 同值反复 eprintln 阻塞按键路径——只在变化时记日志。
+                // 同值反复写 stderr 阻塞按键路径——只在变化时记日志。
                 if state.content_type != Some((hint, purpose)) {
                     state.content_type = Some((hint, purpose));
                     log(&format!("content_type hint={hint} purpose={purpose}"));
@@ -1642,12 +1688,19 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
 impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
     fn event(
         state: &mut Self,
-        _grab: &ZwpInputMethodKeyboardGrabV2,
+        grab: &ZwpInputMethodKeyboardGrabV2,
         event: ZwpInputMethodKeyboardGrabEvent,
         _data: &(),
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        // 只认当前 grab：已 release 的旧对象在合成器侧注销前仍可能投递
+        // Keymap/Key/Modifiers/Leave，身份不符一律不进状态机。当前对象不受影响
+        // （ACTIVATE 处理时 state.grab 已同步就位，事件经队列后才到达）。
+        if state.grab.as_ref() != Some(grab) {
+            debug_log(|| "stale grab event dropped".into());
+            return;
+        }
         match event {
             ZwpInputMethodKeyboardGrabEvent::Keymap { format, fd, size } => {
                 log(&format!("grab keymap size={size}"));
@@ -1788,26 +1841,31 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
 enum RunOutcome {
     /// 正常退出(should_exit)
     Done,
-    /// wayland 连接断开(协议错误/合成器重启)→ 重连
+    /// 连不上或连着断开(连接/注册失败、协议错误、合成器重启、poll 出错)→ 退避重连
     ConnLost,
-    /// 致命(连不上/注册失败)→ 退出进程
-    Fatal(Box<dyn std::error::Error>),
 }
 
 /// 连一次 wayland、bind 全局对象、跑事件循环,直到:
 ///   - 正常退出(should_exit)→ Done
-///   - 连接断开(协议错误/合成器重启)→ ConnLost(调用方重连,保住 IME 进程)
-///   - 致命错误（连不上/注册失败）→ Fatal
+///   - 连不上或连着断开(连接/注册失败、协议错误、合成器重启)→ ConnLost(调用方退避重连)
 ///
-/// 收敛核心：mangowm 崩/重启或偶发协议错误时，不再让整个 kime 进程跟着死——
+/// 收敛核心：mangowm 崩/重启、合成器还没起来或偶发协议错误时，不让整个 kime 进程
+/// 跟着死——连接类失败一律「reset → 退避 → 重试」，进程只有 should_exit → Done
+/// 一条正常退出路（#101）。
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,
-        Err(e) => return RunOutcome::Fatal(e.into()),
+        Err(e) => {
+            log(&format!("connect: wayland 连不上({e}),转退避重连"));
+            return RunOutcome::ConnLost;
+        }
     };
     let (globals, mut event_queue) = match registry_queue_init::<AppState>(&conn) {
         Ok(x) => x,
-        Err(e) => return RunOutcome::Fatal(e.into()),
+        Err(e) => {
+            log(&format!("registry: wayland 全局注册失败({e}),转退避重连"));
+            return RunOutcome::ConnLost;
+        }
     };
     let qh: QueueHandle<AppState> = event_queue.handle();
     app.conn = Some(conn);
@@ -1911,7 +1969,8 @@ fn run_once(app: &mut AppState) -> RunOutcome {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return RunOutcome::Fatal(err.into());
+            log(&format!("poll: 事件循环出错({err}),转退避重连"));
+            return RunOutcome::ConnLost;
         }
         if pfd[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             // 只在 socket 确实可读时进 prepare_read().read()(它会阻塞等数据)。
@@ -1968,21 +2027,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Renderer 不持 wayland 对象,连 wayland 之前同步构造即可,不引线程/异步。
     let renderer = Renderer::new();
     let mut app = AppState::new(target_seat, renderer);
+    // 退避 1s 起、×2、30s 封顶；会话活满 60s 视为「曾健康运行」，下次断连复位回
+    // 1s 基准。规则与测试在 lib.rs 的 next_backoff_ms / tests/backoff.rs。
     let mut backoff_ms: u32 = 1_000;
 
     loop {
+        // 会话时长决定本次断连后是复位还是继续翻倍。
+        let session_started = std::time::Instant::now();
         match run_once(&mut app) {
             RunOutcome::Done => break,
             RunOutcome::ConnLost => {
-                // 复位旧连接上的 wayland 对象,退避后重连;进程保持存活,IME 不断。
+                let lived = session_started.elapsed();
+                // 复位旧连接上的 wayland 对象(连接没建立时是幂等空操作),睡当前退避
+                // 值后按本次会话时长算下次值;进程保持存活,IME 不断。
                 app.reset_wayland_objects();
                 log(&format!(
-                    "wayland 连接断开,{backoff_ms}ms 后重连(进程不退出,不靠外部循环反复杀/拉)"
+                    "wayland 连接断开,{backoff_ms}ms 后重连(进程不退出,退避重连保 IME)"
                 ));
                 std::thread::sleep(std::time::Duration::from_millis(u64::from(backoff_ms)));
-                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+                backoff_ms = next_backoff_ms(backoff_ms, lived);
             }
-            RunOutcome::Fatal(e) => return Err(e),
         }
     }
     Ok(())

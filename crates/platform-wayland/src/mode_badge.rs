@@ -9,6 +9,7 @@
 //! 与 main.rs 的 PopupCanvas 保持同构，便于对照排障。
 
 use std::env;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use wayland_client::protocol::{
@@ -52,7 +53,7 @@ pub fn badge_warning_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty() && !is_truthy(v) && !is_falsy(v))
 }
 
-/// 读进程 env。无法识别的非空取值保守关闭并 eprintln 告警一次。
+/// 读进程 env。无法识别的非空取值保守关闭并告警一次。
 pub fn badge_enabled() -> bool {
     match env::var(ENV) {
         Ok(v) => {
@@ -72,7 +73,8 @@ pub fn badge_enabled() -> bool {
 fn warn_once(msg: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("[kime] 警告：{msg}");
+        // stderr 写失败宁可丢日志也不 panic：徽标只是装饰，不值当拉进程陪葬。
+        let _ = writeln!(std::io::stderr(), "[kime] 警告：{msg}");
     }
 }
 
@@ -88,7 +90,8 @@ pub struct BadgeSlot(pub u8);
 pub struct BadgeFrame;
 
 /// 一块 shm 画布：memfd 与其 mmap 必须同源（渲染写与合成器读必须落在同一段
-/// 内存）；Drop 时 munmap+close，WlBuffer 代理丢弃即 destroy。
+/// 内存）；Drop 时先发 `wl_buffer.destroy`（代理 drop 本身不发任何请求），
+/// 再 munmap+close。
 struct BadgeShmBuffer {
     buffer: WlBuffer,
     fd: i32,
@@ -116,6 +119,9 @@ struct BadgeShmBuffer {
 /// wlroots / GTK / Qt / weston-simple-shm 的 teardown 同样是无条件 unmap+close。
 impl Drop for BadgeShmBuffer {
     fn drop(&mut self) {
+        // 协议销毁先行（代理 drop 不发请求，不发就白留一个合成器侧对象）；
+        // 之后不再触碰 buffer，死连接上该请求静默丢弃不 panic。
+        self.buffer.destroy();
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
@@ -433,5 +439,6 @@ impl ModeBadge {
 }
 
 fn log(msg: &str) {
-    eprintln!("[kime-ime] {msg}");
+    // stderr 写失败宁可丢日志也不 panic，理由同 warn_once。
+    let _ = writeln!(std::io::stderr(), "[kime-ime] {msg}");
 }

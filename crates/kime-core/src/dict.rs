@@ -19,11 +19,13 @@
 //!
 //! 主路延迟（P99 < 20ms）由这里的索引形状保证。
 
-use rusqlite::{params, Connection, Error as SqliteError, Result};
+use rusqlite::{params, Connection, Error as SqliteError, OptionalExtension, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+
+use crate::learn_writer::{LearnJob, LearnWriter};
 
 fn io_to_sqlite(e: std::io::Error) -> SqliteError {
     SqliteError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -42,7 +44,7 @@ const USER_BOOST: u64 = 300_000;
 const USER_BOOST_HALF_LIFE_DAYS: f64 = 30.0;
 
 /// 「今天」= UNIX 纪元以来的天数。衰减窗口按天推进即可（半衰期本身 30 天粒度）。
-fn today_days() -> u64 {
+pub(crate) fn today_days() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
@@ -165,8 +167,13 @@ pub struct Dict {
     lm_counts: HashMap<String, HashMap<String, i64>>,
     /// 已消费的挖掘世代号（kime_kv 'lm_generation'）：变化即重载 lm_counts。
     lm_generation: i64,
-    /// commit_log 写失败已告警哨兵（一次性 eprintln，防每键刷屏）。
+    /// commit_log 写失败已告警哨兵（一次性告警，防每键刷屏；见 `warn_once`）。
     lm_warned: bool,
+    /// 数据库路径：后台写线程懒 spawn 时按它开自己的连接（#101，
+    /// 见 `learn_writer` 模块）。写线程不存副本，单份存储在这里。
+    db_path: PathBuf,
+    /// 后台词库写线程句柄（懒 spawn；队满丢 job，键路径零 SQLite 写）。
+    writer: LearnWriter,
 }
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
@@ -195,6 +202,173 @@ fn dict_body_lines(path: &Path) -> Result<impl Iterator<Item = String>> {
         }
     }
     Ok(lines)
+}
+
+/// 声母缩写（"ni'hao" → "nh"）。learn 的内存更新与持久化载荷共用，算式只有一份。
+fn abbrev_of(reading: &[String]) -> String {
+    let abbrev: String = reading.iter().filter_map(|s| s.chars().next()).collect();
+    abbrev.to_lowercase()
+}
+
+/// 一次性告警：flag 置位后静默，防每键刷屏；写 stderr 失败直接吞——
+/// 输入法与后台写线程都不许用会在 stderr 关闭时 panic 的打印宏。
+pub(crate) fn warn_once(flag: &mut bool, message: &str) {
+    if *flag {
+        return;
+    }
+    *flag = true;
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+/// 挖掘世代号（kime_kv 'lm_generation'）。行不存在/查询失败按 0，与挖掘前状态一致。
+fn lm_generation_of(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM kime_kv
+         WHERE key = 'lm_generation'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// 世代号失效：挖掘跑过 → vocab id 缓存全部作废重查（否则重建后的 vocab 用了
+/// 陈旧 id，commit_log 会记到错误的词上）。选词路径（`set_lm_context`）与后台
+/// 写线程共用这一份实现。
+pub(crate) fn refresh_vocab_cache(
+    conn: &Connection,
+    generation: &mut i64,
+    vocab_ids: &mut HashMap<(String, String), i64>,
+) {
+    let gen = lm_generation_of(conn);
+    if gen != *generation {
+        *generation = gen;
+        vocab_ids.clear();
+    }
+}
+
+/// 取（必要时建）vocab 行 id —— commit_log 落库的前置，同步 `log_commit` 与
+/// 后台写线程共用。`log_commit` 每次提交都调，命中缓存时零 SQL。
+///
+/// SELECT 命中 → 缓存；未命中 → 插入（UNIQUE 冲突说明并发已建，忽略）再回查拿 id。
+/// 不使用 RETURNING：旧 SQLite 不支持，且 execute 不返回行。读写失败一律 None——
+/// 跳过本次日志，不阻塞上屏。
+fn vocab_id_or_insert(
+    conn: &Connection,
+    vocab_ids: &mut HashMap<(String, String), i64>,
+    text: &str,
+    reading: &str,
+    today: u64,
+) -> Option<i64> {
+    let key = (text.to_string(), reading.to_string());
+    if let Some(&id) = vocab_ids.get(&key) {
+        return Some(id);
+    }
+    let id = conn
+        .query_row(
+            "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+            params![text, reading],
+            |row| row.get(0),
+        )
+        .ok()
+        .or_else(|| {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO vocab(text, reading, last_seen) VALUES (?1, ?2, ?3)",
+                params![text, reading, today as i64],
+            );
+            conn.query_row(
+                "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+                params![text, reading],
+                |row| row.get(0),
+            )
+            .ok()
+        });
+    if let Some(id) = id {
+        vocab_ids.insert(key, id);
+    }
+    id
+}
+
+/// 取 vocab 行 id（只读，#101）：`set_lm_context` 在选词同步路径上，miss 绝不回写
+/// ——键路径零 SQLite 写。miss → None → 本次跳过 LM 上下文，vocab 行落盘后下一次
+/// 选词自愈。命中的 id 照样进缓存（id 建立后永不变，世代号变化统一清）。
+fn vocab_id_readonly(
+    conn: &Connection,
+    vocab_ids: &mut HashMap<(String, String), i64>,
+    text: &str,
+    reading: &str,
+) -> Option<i64> {
+    let key = (text.to_string(), reading.to_string());
+    if let Some(&id) = vocab_ids.get(&key) {
+        return Some(id);
+    }
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
+            params![text, reading],
+            |row| row.get(0),
+        )
+        .ok()?;
+    vocab_ids.insert(key, id);
+    Some(id)
+}
+
+/// learn 持久化：phrase 提权 + kime_kv 使用计数。同步 [`Dict::learn`] 与后台
+/// 写线程共用这一份 SQL（#101：不许复制两份）。
+///
+/// - phrase：单条 UPSERT——行存在 → `freq+1, user=1`（旧 UPDATE 分支语义），
+///   不存在 → `freq=1` 插入（旧 INSERT 分支语义），语义等价且少一次往返、
+///   少一个竞态窗口。
+/// - kime_kv：写**绝对值** `n,day`（由 learn_mem 算好传入），队列丢一个 job
+///   后下一个 job 仍收敛到最新计数。
+pub(crate) fn persist_learn(
+    conn: &Connection,
+    pinyin: &str,
+    abbrev: &str,
+    text: &str,
+    n: u64,
+    day: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, 1, ?3, 1)
+         ON CONFLICT(pinyin, text) DO UPDATE SET freq = freq + 1, user = 1",
+        params![pinyin, text, abbrev],
+    )?;
+    conn.execute(
+        "INSERT INTO kime_kv(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![format!("{pinyin}\t{text}"), format!("{n},{day}")],
+    )?;
+    Ok(())
+}
+
+/// commit_log 落库（离线 LM 第 0 层）。同步 [`Dict::log_commit`] 与后台写线程
+/// 共用（#101：SQL 只有这一份）。
+///
+/// vocab id 在**执行时**解析（调用方传入自己的缓存；后台写线程按世代号失效，
+/// 见 [`refresh_vocab_cache`]）。读音/文本为空直接 no-op，与旧 `log_commit`
+/// 入口守卫同语义；INSERT 失败向上抛，由调用方一次性告警。
+pub(crate) fn persist_commit_log(
+    conn: &Connection,
+    vocab_ids: &mut HashMap<(String, String), i64>,
+    ctx: Option<(&str, &str)>,
+    reading: &str,
+    text: &str,
+    tail: Option<&str>,
+    today: u64,
+) -> Result<()> {
+    if reading.is_empty() || text.is_empty() {
+        return Ok(());
+    }
+    let Some(text_id) = vocab_id_or_insert(conn, vocab_ids, text, reading, today) else {
+        return Ok(());
+    };
+    let ctx_id = ctx.and_then(|(t, r)| vocab_id_or_insert(conn, vocab_ids, t, r, today));
+    conn.execute(
+        "INSERT INTO commit_log(ts, ctx_id, text_id, reading, tail_ctx)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![today as i64, ctx_id, text_id, reading, tail],
+    )?;
+    Ok(())
 }
 
 impl Dict {
@@ -303,7 +477,8 @@ impl Dict {
                     store = Some(s);
                 }
                 Err(e) => {
-                    eprintln!(
+                    let _ = writeln!(
+                        std::io::stderr(),
                         "[kime] 警告：FST 词库 {} 加载失败 ({e})，回退到 SQLite 内存索引（启动更慢、更占内存）",
                         bin_path.display()
                     );
@@ -381,6 +556,8 @@ impl Dict {
             lm_counts: HashMap::new(),
             lm_generation: 0,
             lm_warned: false,
+            db_path: path.to_path_buf(),
+            writer: LearnWriter::default(),
         })
     }
 
@@ -996,24 +1173,33 @@ impl Dict {
         Ok(candidates)
     }
 
-    /// 学习：更新词频或插入用户词。
+    /// 学习：内存即时提升 + 同步持久化。dict 级调用方（测试、工具）走这里，
+    /// 行为与拆分前一致；选词热路径走 [`Self::learn_mem`] + [`Self::enqueue_learn`]
+    /// （#101：键路径零 SQLite 写，见 `learn_writer` 模块）。
     pub fn learn(&mut self, reading: &[String], text: &str) -> Result<()> {
+        self.learn_mem(reading, text)?;
+        let Some((pinyin, abbrev, n, day)) = self.learn_persist_payload(reading, text) else {
+            return Ok(());
+        };
+        persist_learn(&self.conn, &pinyin, &abbrev, text, n, day)
+    }
+
+    /// learn 的**纯内存**部分（#101 拆分）：`user_stats` 计数、FST `user_overlay`、
+    /// SQLite `index`/`abbrev_index` 提频与块重排——全部选词当帧生效（2026-09-15
+    /// 拍板「使用即提升当场生效」）。库写由 [`persist_learn`] 承担：同步路径见
+    /// [`Self::learn`]，键路径见 [`Self::enqueue_learn`]。
+    ///
+    /// 拆分后本函数先跑、持久化后落，FST 过渡分支的 freq 回读读到的是**写前**值，
+    /// 用 +1 镜像 UPSERT（行不存在 = 新词，INSERT 将落 1，等价 `unwrap_or(0)+1`），
+    /// 读与写不再互为先后。
+    ///
+    /// 错误：只有 FST 过渡分支的 freq 回读可能失败（DB I/O/锁）；其余为纯内存操作。
+    pub fn learn_mem(&mut self, reading: &[String], text: &str) -> Result<()> {
         if reading.is_empty() {
             return Ok(());
         }
         let joined = reading.join("'");
-        let abbrev: String = reading.iter().filter_map(|s| s.chars().next()).collect();
-        let abbrev = abbrev.to_lowercase();
-        let updated = self.conn.execute(
-            "UPDATE phrase SET freq = freq + 1, user = 1 WHERE pinyin = ?1 AND text = ?2",
-            params![joined, text],
-        )?;
-        if updated == 0 {
-            self.conn.execute(
-                "INSERT INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, 1, ?3, 1)",
-                params![joined, text, abbrev],
-            )?;
-        }
+        let abbrev = abbrev_of(reading);
 
         // 用户提频计数（方案 B：使用即提升 + 按天时间衰减，rime user_freq 语义）。
         // phrase.freq 保持旧语义（词库频率 + 累计 bump 次数），使用次数 n 与最近使用日
@@ -1028,14 +1214,6 @@ impl Dict {
             .map(|(n, _)| n + 1)
             .unwrap_or(1);
         self.user_stats.insert(stats_key.clone(), (n, self.today));
-        self.conn.execute(
-            "INSERT INTO kime_kv(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![
-                format!("{}\t{}", joined, text),
-                format!("{n},{}", self.today)
-            ],
-        )?;
 
         // FST 模式：dict.bin 只读，用户词的查询数据源是 user_overlay，必须当场同步，
         // 否则刚学的词要等到下次开库才查得到。
@@ -1047,13 +1225,21 @@ impl Dict {
             {
                 Some(entry) => entry.freq += 1,
                 None => {
-                    // 这行刚从词库词转成用户词（UPDATE 命中，user 0→1），它的真实频率是
-                    // 词库频率 + 1，不是 1。读回权威值，别让 overlay 把候选踢到末尾。
-                    let freq: i64 = self.conn.query_row(
-                        "SELECT freq FROM phrase WHERE pinyin = ?1 AND text = ?2",
-                        params![&joined, text],
-                        |row| row.get(0),
-                    )?;
+                    // 这行刚从词库词转成用户词（提权即将落盘），它的真实频率是
+                    // 词库频率 + 1，不是 1。持久化还没跑，读回的是写前权威值，
+                    // +1 镜像 UPSERT 的 freq+1；行不存在（全新用户词）按 0+1 折算
+                    // 成 1，与旧实现「先 INSERT 再回读 1」等价——别让 overlay 把
+                    // 候选踢到末尾。
+                    let freq: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT freq FROM phrase WHERE pinyin = ?1 AND text = ?2",
+                            params![&joined, text],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .unwrap_or(0)
+                        + 1;
                     let eff =
                         freq as u64 + user_bonus_of(&self.user_stats, self.today, &joined, text);
                     let pos = self.user_overlay.partition_point(|e| e.pinyin < joined);
@@ -1123,6 +1309,65 @@ impl Dict {
         Ok(())
     }
 
+    /// learn 持久化载荷：`(pinyin, abbrev, 使用次数 n, 最近使用日)`。
+    /// n/day 取自 [`Self::learn_mem`] 刚写进 `user_stats` 的本轮计数——非空读音
+    /// 时该键必在（learn_mem 先更新计数再做任何可能失败的读），返回 None 只可能是
+    /// 读音为空。同步 [`Self::learn`] 与 [`Self::enqueue_learn`] 共用。
+    fn learn_persist_payload(
+        &self,
+        reading: &[String],
+        text: &str,
+    ) -> Option<(String, String, u64, u64)> {
+        if reading.is_empty() {
+            return None;
+        }
+        let pinyin = reading.join("'");
+        let &(n, day) = self.user_stats.get(&(pinyin.clone(), text.to_string()))?;
+        Some((pinyin, abbrev_of(reading), n, day))
+    }
+
+    /// commit_log 入队（键路径，#101：零 SQLite 写）。job 只携带原始串，
+    /// vocab id 由后台写线程执行时解析；读音/文本为空直接 no-op，与同步
+    /// [`Self::log_commit`] 的入口守卫同语义。
+    pub(crate) fn enqueue_log_commit(
+        &mut self,
+        ctx: Option<(&str, &str)>,
+        reading: &[String],
+        text: &str,
+        tail: Option<&str>,
+    ) {
+        if reading.is_empty() || text.is_empty() {
+            return;
+        }
+        let job = LearnJob::CommitLog {
+            ctx: ctx.map(|(t, r)| (t.to_string(), r.to_string())),
+            reading: reading.join("'"),
+            text: text.to_string(),
+            tail: tail.map(str::to_string),
+        };
+        self.writer.submit(&self.db_path, job);
+    }
+
+    /// learn 持久化入队（键路径，#101）。载荷取自 [`Self::learn_persist_payload`]
+    /// ——`learn_mem` 刚写进 `user_stats` 的本轮计数；内存提频已当帧生效，
+    /// 这里只把 phrase UPSERT + kime_kv 绝对计数交给后台写线程。
+    ///
+    /// `&mut self` 而非任务书建议的 `&self`：首个 job 需要懒 spawn 线程，
+    /// 写入 sender/句柄。
+    pub(crate) fn enqueue_learn(&mut self, reading: &[String], text: &str) {
+        let Some((pinyin, abbrev, n, day)) = self.learn_persist_payload(reading, text) else {
+            return;
+        };
+        let job = LearnJob::Learn {
+            pinyin,
+            abbrev,
+            text: text.to_string(),
+            n,
+            day,
+        };
+        self.writer.submit(&self.db_path, job);
+    }
+
     /// todo/2026-09-18-offline-lm-design.md 第 0 层）。
     ///
     /// `ctx` = 上一次 kime 上屏的词 `(text, reading)`，用来挖掘 bigram。
@@ -1139,28 +1384,22 @@ impl Dict {
         text: &str,
         tail: Option<&str>,
     ) {
-        if reading.is_empty() || text.is_empty() {
-            return;
-        }
-        let joined = reading.join("'");
-        let today = today_days();
-        let text_id = match self.vocab_id(text, &joined, today) {
-            Some(id) => id,
-            None => return,
-        };
-        let ctx_id = ctx.and_then(|(t, r)| self.vocab_id(t, r, today));
         // 失败不阻塞上屏（输入法优先级），但不能静默：日志是离线挖掘唯一
-        // 原材料，连失败会掏空排序质量。一次性告警（ lm_warned 哨兵防刷屏
-        // ——每键都打印会淹掉终端）。
-        if let Err(e) = self.conn.execute(
-            "INSERT INTO commit_log(ts, ctx_id, text_id, reading, tail_ctx)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![today as i64, ctx_id, text_id, joined, tail],
+        // 原材料，连失败会掏空排序质量。一次性告警（lm_warned 哨兵防刷屏
+        // ——每键都打印会淹掉终端），且绝不 panic（见 warn_once）。
+        if let Err(e) = persist_commit_log(
+            &self.conn,
+            &mut self.vocab_ids,
+            ctx,
+            &reading.join("'"),
+            text,
+            tail,
+            today_days(),
         ) {
-            if !self.lm_warned {
-                self.lm_warned = true;
-                eprintln!("[kime] commit_log 写入失败（后续不再重复提示）: {e}");
-            }
+            warn_once(
+                &mut self.lm_warned,
+                &format!("[kime] commit_log 写入失败（后续不再重复提示）: {e}"),
+            );
         }
     }
 
@@ -1170,26 +1409,17 @@ impl Dict {
     /// 查询是一条走主键前缀（bigram 主键 prev_id 打头）的范围扫描，
     /// 个位数行，微秒级；按键热路径只查内存 HashMap。
     pub fn set_lm_context(&mut self, prev: Option<(&str, &str)>) {
-        // 世代号变了（离线挖掘跑过）→ vocab id 缓存全部作废重查
-        let gen: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM kime_kv
-                 WHERE key = 'lm_generation'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if gen != self.lm_generation {
-            self.lm_generation = gen;
-            self.vocab_ids.clear();
-        }
+        // 世代号变了（离线挖掘跑过）→ vocab id 缓存全部作废重查。
+        // 与后台写线程共用同一份失效实现（#101）。
+        refresh_vocab_cache(&self.conn, &mut self.lm_generation, &mut self.vocab_ids);
         let Some((text, reading)) = prev else {
             self.lm_ctx = None;
             self.lm_counts.clear();
             return;
         };
-        let Some(ctx) = self.vocab_id(text, reading, today_days()) else {
+        // 只读解析（#101：键路径零 SQLite 写）：vocab 行还没被后台写线程落盘时
+        // miss → 本次跳过 LM 上下文，行落盘后下一次选词自愈。
+        let Some(ctx) = vocab_id_readonly(&self.conn, &mut self.vocab_ids, text, reading) else {
             self.lm_ctx = None;
             self.lm_counts.clear();
             return;
@@ -1234,41 +1464,6 @@ impl Dict {
             .and_then(|m| m.get(c.pinyin.as_str()))
             .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
             .unwrap_or(0)
-    }
-
-    /// 取（必要时建）vocab 行的 id。`log_commit` 每次提交都调，命中缓存时零 SQL。
-    fn vocab_id(&mut self, text: &str, reading: &str, today: u64) -> Option<i64> {
-        let key = (text.to_string(), reading.to_string());
-        if let Some(&id) = self.vocab_ids.get(&key) {
-            return Some(id);
-        }
-        // SELECT 命中 → 缓存；未命中 → 插入（UNIQUE 冲突说明并发已建，忽略）
-        // 再回查拿 id。不使用 RETURNING：旧 SQLite 不支持，且 execute 不返回行。
-        let id = self
-            .conn
-            .query_row(
-                "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
-                params![text, reading],
-                |row| row.get(0),
-            )
-            .ok()
-            .or_else(|| {
-                let _ = self.conn.execute(
-                    "INSERT OR IGNORE INTO vocab(text, reading, last_seen) VALUES (?1, ?2, ?3)",
-                    params![text, reading, today as i64],
-                );
-                self.conn
-                    .query_row(
-                        "SELECT id FROM vocab WHERE text = ?1 AND reading = ?2",
-                        params![text, reading],
-                        |row| row.get(0),
-                    )
-                    .ok()
-            });
-        if let Some(id) = id {
-            self.vocab_ids.insert(key, id);
-        }
-        id
     }
 }
 
