@@ -140,18 +140,29 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
 }
 
 /// KIME_DEBUG=1 状态转移日志：追加写 /tmp/kime-ime-debug.log（写失败静默忽略，
-/// 日志不许卡键流）。main() 启动读一次 env 落进 [`DEBUG`]；关闭时每个调用点
-/// 一次静态读就返回——零文件 I/O、零格式化、零分配。
+/// 自截断封顶 1MiB，见 [`debug_log`]）。main() 启动读一次 env 落进 [`DEBUG`]；
+/// 关闭时每个调用点一次静态读就返回——零文件 I/O、零格式化、零分配。
 static DEBUG: AtomicBool = AtomicBool::new(false);
 
 /// 惰性打开的追加写句柄（首条日志时打开，之后常驻；进程退出随析构 flush）。
-static DEBUG_FILE: LazyLock<Mutex<Option<BufWriter<File>>>> = LazyLock::new(|| Mutex::new(None));
+/// `written` 内存记累计字节，超 1MiB 就 set_len(0) 归零——与 [`key_log`] 同一套
+/// 自截断：O_APPEND 下 seek 无效，内核强制每次写落到当前文件尾，只有归零才让后续
+/// 行从头写起。没人清理的 tmpfs 日志否则会一路涨到把 RAM 吃干。
+static DEBUG_FILE: LazyLock<Mutex<Option<DebugLogFile>>> = LazyLock::new(|| Mutex::new(None));
+
+/// KIME_DEBUG 日志句柄：`written` 记账语义与 [`KeyLogFile`] 一致。
+struct DebugLogFile {
+    buf: BufWriter<File>,
+    written: u64,
+}
 
 /// 记一条 KIME_DEBUG 状态日志（行内容由闭包**惰性**构造：关着时连格式化都不做）。
+/// 写失败静默丢弃——日志不许卡键流。
 fn debug_log(line: impl FnOnce() -> String) {
     if !DEBUG.load(Ordering::Relaxed) {
         return;
     }
+    const MAX_LOG_BYTES: u64 = 1024 * 1024;
     let mut guard = DEBUG_FILE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -161,10 +172,20 @@ fn debug_log(line: impl FnOnce() -> String) {
             .append(true)
             .open("/tmp/kime-ime-debug.log")
             .ok()
-            .map(BufWriter::new);
+            .map(|f| DebugLogFile {
+                buf: BufWriter::new(f),
+                written: 0,
+            });
     }
-    if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{}", line());
+    if let Some(df) = guard.as_mut() {
+        let msg = line();
+        let n = msg.len() as u64 + 1; // writeln! 追加的换行也算行长
+        if df.written + n > MAX_LOG_BYTES {
+            let _ = df.buf.get_mut().set_len(0);
+            df.written = 0;
+        }
+        df.written += n;
+        let _ = writeln!(df.buf, "{msg}");
     }
 }
 
