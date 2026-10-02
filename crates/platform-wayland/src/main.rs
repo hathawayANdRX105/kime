@@ -1665,12 +1665,19 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
 impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
     fn event(
         state: &mut Self,
-        _grab: &ZwpInputMethodKeyboardGrabV2,
+        grab: &ZwpInputMethodKeyboardGrabV2,
         event: ZwpInputMethodKeyboardGrabEvent,
         _data: &(),
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        // 只认当前 grab：已 release 的旧对象在合成器侧注销前仍可能投递
+        // Keymap/Key/Modifiers/Leave，身份不符一律不进状态机。当前对象不受影响
+        // （ACTIVATE 处理时 state.grab 已同步就位，事件经队列后才到达）。
+        if state.grab.as_ref() != Some(grab) {
+            debug_log(|| "stale grab event dropped".into());
+            return;
+        }
         match event {
             ZwpInputMethodKeyboardGrabEvent::Keymap { format, fd, size } => {
                 log(&format!("grab keymap size={size}"));
