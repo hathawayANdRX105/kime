@@ -1142,6 +1142,11 @@ impl AppState {
         self.input_method_manager = None;
         self.input_method = None;
         self.im_instance = None;
+        // commit serial 必须等于该 zwp_input_method_v2 对象已发的 done 事件数
+        // （协议 XML input-method-unstable-v2 的 commit 描述）；重连拿到的是全新
+        // 对象、从 0 计。不复位 → serial 永远对不上 → 合成器静默丢弃状态变更
+        // （不报协议错误）→ 重连后提交不上屏。
+        self.im_serial = 0;
         // 重连 = 全新 IM 实例：引擎进程内保留，但旧 burst 的撤销栈必须随之作废
         // （重连后首个 ACTIVATE 的 im_instance 比较基准已清空，不会误清/漏清）。
         if let Some(engine) = self.engine.as_mut() {
