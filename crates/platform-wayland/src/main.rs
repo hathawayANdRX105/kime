@@ -235,7 +235,8 @@ struct SeatBind {
 }
 
 /// 一块 shm 画布：memfd 与其 mmap 必须是同源的（历史上渲染写 B、合成器读 A，
-/// 候选窗永远空白的根因）。Drop 时 munmap+close；WlBuffer 代理丢弃即 destroy。
+/// 候选窗永远空白的根因）。Drop 时先发 `wl_buffer.destroy`（代理 drop 本身不发
+/// 任何请求），再 munmap+close。
 struct ShmBuffer {
     buffer: WlBuffer,
     fd: i32,
@@ -250,12 +251,14 @@ struct ShmBuffer {
 
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
-        // 崩溃取证：buffer 被 drop（munmap+close+代理销毁）的时刻与尺寸。
+        // 崩溃取证：buffer 被 drop（wl_buffer.destroy + munmap+close）的时刻与尺寸。
         // 若 drop 发生在合成器仍持有该 buffer 时（release 未到），随后的
         // create_pool/create_buffer 就可能越界——与 pool 创建日志对时间线。
         if DEBUG.load(Ordering::Relaxed) {
             log(&format!("popup buffer drop w={} h={}", self.w, self.h));
         }
+        // 协议销毁先行，之后不再触碰 buffer；死连接上该请求静默丢弃不 panic。
+        self.buffer.destroy();
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);

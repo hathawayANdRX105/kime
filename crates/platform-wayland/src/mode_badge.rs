@@ -88,7 +88,8 @@ pub struct BadgeSlot(pub u8);
 pub struct BadgeFrame;
 
 /// 一块 shm 画布：memfd 与其 mmap 必须同源（渲染写与合成器读必须落在同一段
-/// 内存）；Drop 时 munmap+close，WlBuffer 代理丢弃即 destroy。
+/// 内存）；Drop 时先发 `wl_buffer.destroy`（代理 drop 本身不发任何请求），
+/// 再 munmap+close。
 struct BadgeShmBuffer {
     buffer: WlBuffer,
     fd: i32,
@@ -116,6 +117,9 @@ struct BadgeShmBuffer {
 /// wlroots / GTK / Qt / weston-simple-shm 的 teardown 同样是无条件 unmap+close。
 impl Drop for BadgeShmBuffer {
     fn drop(&mut self) {
+        // 协议销毁先行（代理 drop 不发请求，不发就白留一个合成器侧对象）；
+        // 之后不再触碰 buffer，死连接上该请求静默丢弃不 panic。
+        self.buffer.destroy();
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
