@@ -53,7 +53,7 @@ pub fn badge_warning_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty() && !is_truthy(v) && !is_falsy(v))
 }
 
-/// 读进程 env。无法识别的非空取值保守关闭并 eprintln 告警一次。
+/// 读进程 env。无法识别的非空取值保守关闭并告警一次。
 pub fn badge_enabled() -> bool {
     match env::var(ENV) {
         Ok(v) => {

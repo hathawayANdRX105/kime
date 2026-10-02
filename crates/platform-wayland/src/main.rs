@@ -1423,7 +1423,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
             ZwpInputMethodEvent::ContentType { hint, purpose } => {
                 let (hint, purpose) = (wenum_to_u32(hint), wenum_to_u32(purpose));
                 // 去重：合成器每次提交都回发 content_type（实测单次打字 1000+ 条），
-                // 同值反复 eprintln 阻塞按键路径——只在变化时记日志。
+                // 同值反复写 stderr 阻塞按键路径——只在变化时记日志。
                 if state.content_type != Some((hint, purpose)) {
                     state.content_type = Some((hint, purpose));
                     log(&format!("content_type hint={hint} purpose={purpose}"));
