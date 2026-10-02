@@ -1144,7 +1144,10 @@ impl AppState {
         if let Some(engine) = self.engine.as_mut() {
             engine.clear_undo();
         }
-        self.grab = None;
+        if let Some(grab) = self.grab.take() {
+            // 连接已死：release 的 proxy upgrade 失败直接 return，静默 no-op 不 panic。
+            grab.release();
+        }
         self.vk_manager = None;
         self.vk = None;
         self.vk_keymap_ready = false;
@@ -1156,16 +1159,20 @@ impl AppState {
         self.badge = None;
         debug_log(|| "wayland conn-lost -> reset objects (engine kept, clear_undo)".to_string());
     }
-    /// 正常退出前:显式走协议销毁 vk/im(grab 无显式 destroy,drop 即可)并 flush,
-    /// 让 vk 走「协议 destroy」而非「断开连接时服务端自动销毁」,避开 mangowm 崩会路径。
+    /// 正常退出前:显式走协议销毁 grab/vk/im 并 flush——grab 走 `release`（协议有
+    /// destructor 请求），vk/im 走 `destroy`，让它们走「协议销毁」而非「断开连接时
+    /// 服务端自动销毁」,避开 mangowm 崩会路径。
     fn teardown_wayland_objects(&mut self) {
+        // grab 由 zwp_input_method_v2 创建，先释放子对象再销毁父对象。
+        if let Some(grab) = self.grab.take() {
+            grab.release();
+        }
         if let Some(vk) = self.vk.take() {
             vk.destroy();
         }
         if let Some(im) = self.input_method.take() {
             im.destroy();
         }
-        self.grab = None;
         if let Some(c) = &self.conn {
             // 拆除阶段 flush 失败（socket 已死）是预期路径：不 abort 重连流程
             let _ = c.flush();
@@ -1345,6 +1352,12 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 });
                 state.ensure_engine();
                 state.ensure_popup(im, qh);
+                // mangowm 高频 ACTIVATE/DEACTIVATE，可能没有配对 Deactivate 就被
+                // 下一次 ACTIVATE 覆盖：旧 grab 必须先走协议 release（take 防 double），
+                // 否则合成器侧随打字累积 grab 对象。
+                if let Some(old) = state.grab.take() {
+                    old.release();
+                }
                 let grab = im.grab_keyboard(qh, ());
                 log("grab_keyboard requested");
                 state.grab = Some(grab);
@@ -1356,7 +1369,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 log("input_method DEACTIVATE");
                 // DEACTIVATE 不动撤销栈（焦点抖动安全，#70）：只清组合。
                 debug_log(|| format!("DEACTIVATE im#{}", im.id()));
-                state.grab = None;
+                if let Some(grab) = state.grab.take() {
+                    grab.release();
+                }
                 state.repeat.clear();
                 state.shift_gesture.reset();
                 // 组合/preedit 一并作废：否则旧应用的拼音和候选带到下一个应用。
