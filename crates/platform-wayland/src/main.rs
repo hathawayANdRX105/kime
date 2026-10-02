@@ -18,6 +18,7 @@ use platform_wayland::clipboard_watch::spawn as spawn_clipboard_watcher;
 use platform_wayland::context_batch::{plan_context_commit, ContextCommit, CONTEXT_TAIL_CHARS};
 use platform_wayland::keyboard::{Keyboard, KEYMAP_FORMAT_XKB_V1};
 use platform_wayland::mode_badge::{badge_enabled, BadgeFrame, BadgeSlot, ModeBadge};
+use platform_wayland::next_backoff_ms;
 use platform_wayland::repeat::{KeyRepeat, ShiftComposer};
 use platform_wayland::route::{
     clip_route, key_log_line, route_press, route_release, shell_key, shift_holds_passthrough,
@@ -1818,26 +1819,31 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
 enum RunOutcome {
     /// 正常退出(should_exit)
     Done,
-    /// wayland 连接断开(协议错误/合成器重启)→ 重连
+    /// 连不上或连着断开(连接/注册失败、协议错误、合成器重启、poll 出错)→ 退避重连
     ConnLost,
-    /// 致命(连不上/注册失败)→ 退出进程
-    Fatal(Box<dyn std::error::Error>),
 }
 
 /// 连一次 wayland、bind 全局对象、跑事件循环,直到:
 ///   - 正常退出(should_exit)→ Done
-///   - 连接断开(协议错误/合成器重启)→ ConnLost(调用方重连,保住 IME 进程)
-///   - 致命错误（连不上/注册失败）→ Fatal
+///   - 连不上或连着断开(连接/注册失败、协议错误、合成器重启)→ ConnLost(调用方退避重连)
 ///
-/// 收敛核心：mangowm 崩/重启或偶发协议错误时，不再让整个 kime 进程跟着死——
+/// 收敛核心：mangowm 崩/重启、合成器还没起来或偶发协议错误时，不让整个 kime 进程
+/// 跟着死——连接类失败一律「reset → 退避 → 重试」，进程只有 should_exit → Done
+/// 一条正常退出路（#101）。
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,
-        Err(e) => return RunOutcome::Fatal(e.into()),
+        Err(e) => {
+            log(&format!("connect: wayland 连不上({e}),转退避重连"));
+            return RunOutcome::ConnLost;
+        }
     };
     let (globals, mut event_queue) = match registry_queue_init::<AppState>(&conn) {
         Ok(x) => x,
-        Err(e) => return RunOutcome::Fatal(e.into()),
+        Err(e) => {
+            log(&format!("registry: wayland 全局注册失败({e}),转退避重连"));
+            return RunOutcome::ConnLost;
+        }
     };
     let qh: QueueHandle<AppState> = event_queue.handle();
     app.conn = Some(conn);
@@ -1941,7 +1947,8 @@ fn run_once(app: &mut AppState) -> RunOutcome {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return RunOutcome::Fatal(err.into());
+            log(&format!("poll: 事件循环出错({err}),转退避重连"));
+            return RunOutcome::ConnLost;
         }
         if pfd[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             // 只在 socket 确实可读时进 prepare_read().read()(它会阻塞等数据)。
@@ -1998,21 +2005,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Renderer 不持 wayland 对象,连 wayland 之前同步构造即可,不引线程/异步。
     let renderer = Renderer::new();
     let mut app = AppState::new(target_seat, renderer);
+    // 退避 1s 起、×2、30s 封顶；会话活满 60s 视为「曾健康运行」，下次断连复位回
+    // 1s 基准。规则与测试在 lib.rs 的 next_backoff_ms / tests/backoff.rs。
     let mut backoff_ms: u32 = 1_000;
 
     loop {
+        // 会话时长决定本次断连后是复位还是继续翻倍。
+        let session_started = std::time::Instant::now();
         match run_once(&mut app) {
             RunOutcome::Done => break,
             RunOutcome::ConnLost => {
-                // 复位旧连接上的 wayland 对象,退避后重连;进程保持存活,IME 不断。
+                let lived = session_started.elapsed();
+                // 复位旧连接上的 wayland 对象(连接没建立时是幂等空操作),睡当前退避
+                // 值后按本次会话时长算下次值;进程保持存活,IME 不断。
                 app.reset_wayland_objects();
                 log(&format!(
-                    "wayland 连接断开,{backoff_ms}ms 后重连(进程不退出,不靠外部循环反复杀/拉)"
+                    "wayland 连接断开,{backoff_ms}ms 后重连(进程不退出,退避重连保 IME)"
                 ));
                 std::thread::sleep(std::time::Duration::from_millis(u64::from(backoff_ms)));
-                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+                backoff_ms = next_backoff_ms(backoff_ms, lived);
             }
-            RunOutcome::Fatal(e) => return Err(e),
         }
     }
     Ok(())
