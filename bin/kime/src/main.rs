@@ -4,6 +4,7 @@
 //!   kime build-dict --in <sqlite> --out <bin>
 //!   kime config <list|get KEY|set KEY VALUE>
 //!   kime english [--dict <path>] <字母串>...
+//!   kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]
 //!   kime mine-lm [--dict <path>] [--jev] [--jev-endpoint <url>] [--jev-key <key>]
 //!   kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
@@ -58,6 +59,186 @@ fn handle_english_cmd(args: &[String]) -> ExitCode {
             .collect::<Vec<_>>()
             .join(" ");
         println!("{w}: {line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// evdev 码——与壳层同值。debug 子命令用。
+const DBG_KEY_SPACE: u32 = 57;
+const DBG_KEY_ENTER: u32 = 28;
+const DBG_KEY_BACKSPACE: u32 = 14;
+const DBG_KEY_DELETE: u32 = 11;
+const DBG_KEY_SHIFT: u32 = 42;
+
+fn dbg_key(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool) -> Key {
+    Key {
+        ch,
+        code,
+        shift,
+        ctrl,
+        alt,
+    }
+}
+
+/// 一个键 token → 引擎 Key。
+/// 前缀 C-（Ctrl）/A-（Alt）；命名键 SHIFT/SPACE/ENTER/BACKSPACE/DELETE/ESC；
+/// 其余当单个字符（字母/标点/数字）。SHIFT 走 evdev 42 + shift 位，
+/// 命中引擎 Shift 分支（轻点切中/英 / 有组合冲刷切英）。
+fn dbg_token_to_key(tok: &str) -> Key {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut rest = tok;
+    if let Some(r) = rest.strip_prefix("C-") {
+        ctrl = true;
+        rest = r;
+    }
+    if let Some(r) = rest.strip_prefix("A-") {
+        alt = true;
+        rest = r;
+    }
+    match rest {
+        "SHIFT" => dbg_key(DBG_KEY_SHIFT, None, false, false, true),
+        "SPACE" => dbg_key(DBG_KEY_SPACE, None, ctrl, alt, false),
+        "ENTER" | "RET" => dbg_key(DBG_KEY_ENTER, None, ctrl, alt, false),
+        "BACKSPACE" | "BSP" => dbg_key(DBG_KEY_BACKSPACE, None, ctrl, alt, false),
+        "DELETE" | "DEL" => dbg_key(DBG_KEY_DELETE, None, ctrl, alt, false),
+        "ESC" => dbg_key(KEY_ESC, None, ctrl, alt, false),
+        _ => {
+            let c = rest.chars().next().unwrap_or('a');
+            dbg_key(0, Some(c), ctrl, alt, false)
+        }
+    }
+}
+
+/// 内置场景（不依赖用户词库）：上屏后退格 / Shift 切英文 / 标点直出。
+fn dbg_builtin_scenario(name: &str) -> Vec<String> {
+    match name {
+        "commit-backspace" => {
+            // 打 nihao 上屏「你好」→ 连按两次退格：修复后应为 Ignored（应用删字），
+            // 不再把拼音弹回组合、不再弹候选面板。
+            vec!["n", "i", "h", "a", "o", "SPACE", "BACKSPACE", "BACKSPACE"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        "shift-mode" => {
+            // 轻点 Shift 切英文（a/b/c 直通）→ 再轻点切回中文（nihao 重新组拼音）→ 上屏。
+            vec![
+                "SHIFT", "a", "b", "c", "SHIFT", "n", "i", "h", "a", "o", "SPACE",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        }
+        "punct-idle-backspace" => {
+            // 中文模式下打「。」（. 转换上屏）→ 退格 = Ignored 放行应用删全角字符。
+            vec![".", "BACKSPACE", "BACKSPACE"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        other => {
+            eprintln!(
+                "unknown scenario '{other}': use commit-backspace | shift-mode | punct-idle-backspace"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// `kime debug` —— 无头面板调试：喂键序列驱动 Engine，逐键打印
+/// 候选/preedit/模式/撤销深度，不启动 IME server，不碰桌面与 fcitx5。
+///
+/// 用法：
+///   kime debug --scenario <commit-backspace|shift-mode|punct-idle-backspace>
+///   kime debug tok1 tok2 ...            （自定义键序列）
+///   cat keys.txt | kime debug           （每 token 一个，空白分隔）
+fn handle_debug_cmd(args: &[String]) -> ExitCode {
+    let mut dict_path: Option<PathBuf> = None;
+    let mut scenario: Option<String> = None;
+    let mut tokens: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dict" => dict_path = it.next().map(PathBuf::from),
+            "--scenario" => scenario = it.next().cloned(),
+            other => tokens.push(other.to_string()),
+        }
+    }
+    if let Some(name) = &scenario {
+        tokens = dbg_builtin_scenario(name);
+    }
+    if tokens.is_empty() {
+        eprintln!("no tokens: pass key tokens or --scenario; 见 --help");
+        return ExitCode::from(2);
+    }
+
+    // 词库：指定则用；否则临时词库（可被选词 learn 改动，不落用户库）
+    let dict = match dict_path {
+        Some(p) => match Dict::open(&p) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("failed to open dict {}: {e}", p.display());
+                return ExitCode::from(1);
+            }
+        },
+        None => {
+            let dir = std::env::temp_dir().join(format!(
+                "kime_debug_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).ok();
+            let db = dir.join("dict.sqlite3");
+            let mut d = match Dict::open(&db) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("failed to open temp dict {}: {e}", db.display());
+                    return ExitCode::from(1);
+                }
+            };
+            // 固定 fixture 词：nihao→你好 首候选，保证场景可复现
+            let yml = dir.join("fx.yaml");
+            std::fs::write(
+                &yml,
+                "...\n你好\tni hao\t5000\n泥猴\tni hou\t100\n世界\tshi jie\t9999\n安\ta\t8000\n",
+            )
+            .ok();
+            match d.import(&yml) {
+                Ok(n) => eprintln!("fixture dict: {} rows @ {}", n, db.display()),
+                Err(e) => {
+                    eprintln!("fixture import failed: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            d
+        }
+    };
+
+    let mut engine = Engine::new(dict, Config::load());
+    eprintln!(
+        "debug: {} keys, chinese={} | mode 中=Chinese 英=English | cands=当前页候选",
+        tokens.len(),
+        engine.chinese()
+    );
+    for (i, tok) in tokens.iter().enumerate() {
+        let outcome = engine.key(dbg_token_to_key(tok));
+        let cands: Vec<String> = engine.candidates().iter().map(|c| c.text.clone()).collect();
+        let preview = cands.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
+        println!(
+            "[{:>2}] {:<10} => {:?} | mode={} preedit={:?} cands[{}]= {} undo={}",
+            i + 1,
+            tok,
+            outcome,
+            if engine.chinese() { "中" } else { "英" },
+            engine.preedit(),
+            cands.len(),
+            preview,
+            engine.undo_depth()
+        );
     }
     ExitCode::SUCCESS
 }
@@ -177,6 +358,10 @@ fn main() -> ExitCode {
         Some("english") => {
             let sub_args: Vec<String> = args_iter.collect();
             return handle_english_cmd(&sub_args);
+        }
+        Some("debug") => {
+            let sub_args: Vec<String> = args_iter.collect();
+            return handle_debug_cmd(&sub_args);
         }
         Some("mine-lm") => {
             let mut dict_path: Option<PathBuf> = None;
@@ -320,7 +505,7 @@ fn main() -> ExitCode {
             }
             "--help" => {
                 println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
+                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]（无头面板调试：逐键打印候选/模式，不启动 IME）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
                 );
                 return ExitCode::SUCCESS;
             }

@@ -181,16 +181,6 @@ impl Shell {
                 self.forwarded.push((code, false));
                 self.swallowed.consume(code);
             }
-            // #79 撤销选词：物理退格 press 转发（release 走记账放行 = 第 1 击），
-            // 再补 extra 对合成退格（每对 = 1 击），删掉上屏字数。
-            PressAction::Undo(extra) => {
-                self.swallowed.forward(code);
-                self.forwarded.push((code, true));
-                for _ in 0..extra {
-                    self.forwarded.push((code, true));
-                    self.forwarded.push((code, false));
-                }
-            }
         }
         outcome
     }
@@ -583,67 +573,56 @@ fn modifiers_only_ctrl_reaches_engine_without_key_events() {
     sh.release(KEY_A);
     fs::remove_dir_all(dir).unwrap();
 }
-/// #79 统一 undo（全量选词）：退格弹整词 = 物理退格转发 + 1 对合成退格
-/// （你好 = 2 上屏字 = 2 击），拼音还原进组合。
+/// #80 上屏 = 撤销链死亡：选词 Commit 后 undo_consumed 被 `release_words` 清空；
+/// 此后退格走空闲路径 = Ignored（应用删字），不再弹词还原拼音。
 #[test]
-fn backspace_full_selection_undoes_with_app_deletes() {
+fn backspace_after_commit_releases_to_app() {
     let (mut sh, dir) = Shell::new("undo_full");
     sh.type_str("nihao");
     // 全覆盖选词 = 立即上屏（fcitx5 语义）
     assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
     assert!(sh.engine.letters().is_empty());
-    // 第一下退格 = 撤销整词：拼音还原 + 删 2 个上屏字
-    assert_eq!(
-        sh.press(KEY_BACKSPACE),
-        Outcome::UndoApp(1),
-        "弹整词：物理 1 击 + 合成 1 击"
-    );
-    assert_eq!(sh.engine.letters(), "nihao", "整词拼音弹回组合");
-    // 物理 press 已转发 + 合成 1 对；release 放行 = 第 2 击
-    assert_eq!(
-        sh.forwarded,
-        vec![
-            (KEY_BACKSPACE, true),
-            (KEY_BACKSPACE, true),
-            (KEY_BACKSPACE, false)
-        ]
-    );
+    // 上屏后键槽已空：退格 = Ignored，应用删 1 字
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::Ignored);
+    assert_eq!(sh.engine.letters(), "");
+    // press 转发 `(KEY_BACKSPACE, true)`；release 放行 `(KEY_BACKSPACE, false)`
+    assert_eq!(sh.forwarded, vec![(KEY_BACKSPACE, true)]);
     sh.release(KEY_BACKSPACE);
     assert_eq!(
         sh.forwarded,
-        vec![
-            (KEY_BACKSPACE, true),
-            (KEY_BACKSPACE, true),
-            (KEY_BACKSPACE, false),
-            (KEY_BACKSPACE, false)
-        ],
-        "共 2 击 = 删 2 个上屏字"
+        vec![(KEY_BACKSPACE, true), (KEY_BACKSPACE, false)],
+        "应用级 1 click = 删 1 字"
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// #79 LIFO（上屏后）：连续选词（你好 + 安，各自全覆盖立即上屏）后退格
-/// 逐条弹——先弹最近的安（1 上屏字 = 只转发物理退格、无合成），再弹你好
-/// （2 字 = 物理 + 1 合成）。
+/// #80 上屏 = 撤销链死亡：连续 Commit 后链已清空；各次退格各自 = Ignored
+/// （应用删 1 字），无弹词。
 #[test]
-fn backspace_chains_pop_in_lifo_order() {
+fn backspace_after_commits_releases_to_app() {
     let (mut sh, dir) = Shell::new("undo_lifo");
     sh.type_str("nihao");
     // 全覆盖选词 = 立即上屏
     assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("你好".into()));
     sh.type_str("an");
     assert_eq!(sh.press(KEY_SPACE), Outcome::Commit("安".into()));
-    // 退格 #1 = 撤安：拼音弹回，物理退格转发
-    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(0));
-    assert_eq!(sh.engine.letters(), "an", "弹词拼音可重组");
+    // 链清：退格 #1 = Ignored，应用删 1 字
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::Ignored);
+    assert_eq!(sh.engine.letters(), "", "链清后无拼音还原");
     sh.release(KEY_BACKSPACE);
-    // 退格 #2 = 撤（你好）：整串还原
-    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::UndoApp(1));
+    // 退格 #2 = 也 Ignored（链已空，第二下照样放行应用）
+    assert_eq!(sh.press(KEY_BACKSPACE), Outcome::Ignored);
+    assert_eq!(sh.engine.letters(), "", "链清后无拼音还原");
+    sh.release(KEY_BACKSPACE);
+    // 每次 press 都转发 1 click；每次 release 补 1 click
     assert_eq!(
-        sh.engine.letters(),
-        "nihaoan",
-        "整串还原可重新组词（你好 + 安）"
+        sh.forwarded,
+        vec![
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, false),
+            (KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, false)
+        ]
     );
-    sh.release(KEY_BACKSPACE);
     let _ = fs::remove_dir_all(&dir);
 }

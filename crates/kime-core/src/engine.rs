@@ -51,19 +51,6 @@ pub enum Outcome {
     Ignored,
     /// 上屏该文本
     Commit(String),
-    /// 撤销选词（#79）：被弹条目消耗的拼音已还原进组合；壳须把这次物理退格
-    /// 转发给应用，并再补发 `usize` 对合成退格点击——把该次选词上屏的字符
-    /// 从应用文本里逐个删掉（物理退格删第 1 个，合成点击删其余）。
-    UndoApp(usize),
-    /// 智能标点撤销（#85，对齐 fcitx5 cancelLast）：空闲态退格撤销刚上屏的智能标点——
-    /// 壳删除应用文本里的 `fullwidth`（已上屏全角字符）并上屏 `original`（原半角按键串）。
-    /// 一次性：引擎发出后即清撤销状态，紧接着的第二次退格落 `Ignored`，不连环撤销。
-    PuncCancel {
-        /// 原半角按键串（如 "."）
-        original: String,
-        /// 已上屏的全角字符（如 "。"）
-        fullwidth: String,
-    },
 }
 
 pub struct Engine {
@@ -113,14 +100,15 @@ pub struct Engine {
     /// 上一次 kime 上屏的 (text, reading)，bigram 挖掘的「上文」。
     /// 比 surrounding_text 可靠：恒为 kime 自己的提交，不含粘贴/启动前的文本。
     last_commit: Option<(String, String)>,
-    /// fcitx5 式词级撤销（#79 统一 undo）：最近若干次「选词」各自消耗的
-    /// 拼音键串 + 上屏字符数（LIFO；全拼 = 消耗字母、双拼 = 消耗键位）。
-    /// 生命周期 = 一条输入串（用户 09-28 裁定）：选词 push（cap 64），
-    /// 只死在硬终结点——标点上屏 / Enter 原样 / Shift-flush / 切应用 / Esc。
-    /// **全量选词上屏与 C-h 删空都不清链**（#76「面板关=链死」与 #77「删空
-    /// 清栈」作废）：上屏的字必须能靠退格弹回（弹栈 + 壳补发应用退格删除）。
-    /// 退格：栈非空 = 撤销最近选词（拼音还原 + UndoApp(n) 让壳删上屏字）；
-    /// 栈净 = 逐字删拼音；双空 = 放行应用。
+    /// 词级撤销栈：每次选词记下消耗的拼音键串 + 该词字符数（全拼 =
+    /// 消耗字母、双拼 = 消耗键位，与 [`Self::stage_candidate`] 的消耗
+    /// 口径一致），cap 64。生命周期 = **未释放**：条目与
+    /// [`Self::pending_words`] 配对入栈；释放前退格 = 弹最近预选词回
+    /// 组合并成对弹出栈条目；任何 pending 整段上屏的出口都经
+    /// [`Self::release_words`] 把整条链清空——**上屏 = 撤销链死亡**，
+    /// 已上屏的字不再靠退格弹回面板，空闲态退格归应用（Ignored）。
+    /// #76「面板关=链死」、#77「删空清栈」、#79/#80「跨上屏 LIFO 弹回」
+    /// 三代语义全部作废，以本条为准。
     undo_consumed: Vec<(String, usize)>,
     /// 预选缓冲（#81）：已选但**尚未释放**的词（LIFO；释放 = 拼音选完后的
     /// 空格 / 标点 / Enter / Shift-flush，整段一次性上屏）。上屏前退格
@@ -130,12 +118,6 @@ pub struct Engine {
     /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
     /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
     preedit_display: String,
-    /// 智能标点撤销状态（#85）：`Some((原半角按键串, 上屏全角字符))`。智能标点
-    /// 上屏（中文模式 `map_punct` 命中转换，如 "."→"。"）后置位；下一键为
-    /// 退格且空闲态（letters / pending / 候选全空）→ [`Outcome::PuncCancel`]，
-    /// 发出即清。turn 化（对齐 fcitx5 lastIsPunc 的 3s 窗）：除退格外任何键
-    /// 进 [`Self::key`] 入口即清除，过期态不会漏进删拼音 / 删词路径。
-    last_punc: Option<(String, String)>,
 }
 
 impl Engine {
@@ -164,17 +146,13 @@ impl Engine {
         self.undo_consumed.last()
     }
 
-    /// 诊断/测试用：最近一次智能标点撤销状态（#85，(原半角按键串, 上屏全角字符)）。
-    pub fn last_punc(&self) -> Option<&(String, String)> {
-        self.last_punc.as_ref()
-    }
-
     /// 清空词级撤销栈。
     ///
-    /// 壳在「真实切应用 / IM 重连」（全新输入串开始）时调用：旧 burst 的
-    /// 撤销历史不得跨应用边界存活——否则用户没输入任何键，退格就把旧词
-    /// 弹进面板（v0.19.68 回归，投诉 2）。Esc / 同实例焦点抖动走
-    /// [`Self::clear_composition`]（#77 起同样清栈，不再保留）。
+    /// 壳在「真实切应用 / IM 重连」（全新输入串开始）时调用：栈条目只与
+    /// 未释放的预选词配对存活，跨连接/跨应用边界后旧条目失去意义，必须
+    /// 随之作废，不得把旧 burst 的撤销历史带进新会话（v0.19.68 回归，
+    /// 投诉 2）。Esc / 同实例焦点抖动走 [`Self::clear_composition`]
+    /// （连同组合一起清）。
     pub fn clear_undo(&mut self) {
         self.undo_consumed.clear();
     }
@@ -223,12 +201,17 @@ impl Engine {
             after_digit: false,
             context: None,
             last_commit: None,
-            last_punc: None,
         }
     }
     /// 中/英文模式（英文模式所有键 Ignored 直通）
     pub fn chinese(&self) -> bool {
         self.chinese
+    }
+
+    /// 中/英文模式写入口：壳层模式同步用。Shift 键内翻转不走这里——
+    /// 翻转/冲刷的完整语义挂在 [`Self::key`] 的 Shift 分支。
+    pub fn set_chinese(&mut self, v: bool) {
+        self.chinese = v;
     }
 
     /// 当前 preedit 显示串（#81：预选词拼接 + 未上屏拼音，如 "你好niha"）
@@ -359,12 +342,24 @@ impl Engine {
         self.cursor = self.letters.len();
     }
 
+    /// pending 整段释放上屏：拼出文本、清空 pending，并把撤销链整条清空——
+    /// **上屏 = 撤销链死亡**（#96）：已上屏的字不再靠退格弹回面板，之后的
+    /// 空闲态退格归应用（Ignored）。所有「pending 上屏」的出口（选词全覆盖
+    /// / 空格释放 / Enter 释放 / 标点情况 A 带 pending）都必须经它，保证
+    /// 没有 Commit 路径漏清栈。
+    fn release_words(&mut self) -> String {
+        let text = self.pending_words.join("");
+        self.pending_words.clear();
+        self.undo_consumed.clear();
+        text
+    }
+
     /// 选词（#81）：learn + 清空候选/页码，但**只消耗被选候选覆盖的
     /// 音节**，剩余字母重组回 letters 继续组词。词先入 pending_words：
     /// 部分覆盖时留在缓冲等整串覆盖一起上屏（与 fcitx5 的 preedit 留
     /// 词同构）；**全覆盖时立即上屏**（fcitx5 语义，本函数内直接
-    /// Commit）。撤销栈条目同步入栈：退格弹 pending 成对弹出；上屏
-    /// 后退格走 #80 LIFO。
+    /// Commit）。撤销栈条目同步入栈：退格弹 pending 成对弹出；上屏即
+    /// 整链清空（#96：上屏 = 撤销链死亡）。
     ///
     /// 候选自带读音（pinyin 按 `'` 切分）：打长串 `womendoubuzhidao`
     /// 翻页选了「我」后剩余音节拼回字母串，refresh_candidates 重新
@@ -380,9 +375,8 @@ impl Engine {
         // 「选中没有上屏」的真正来源。部分覆盖时词留 pending 继续组句
         // （与 fcitx5 的 preedit 留词同构），等整串覆盖时一起上屏。
         if self.letters.is_empty() {
-            let committed = std::mem::take(&mut self.pending_words).join("");
-            // 组合态清场，但**保留 undo_consumed**：上屏后退格走 #80
-            // LIFO 撤销（应用侧删字 + 拼音恢复）。
+            // 上屏 = 撤销链死亡（#96）：release_words 连 pending 带栈一起清
+            let committed = self.release_words();
             self.letters.clear();
             self.candidates.clear();
             self.last_reading.clear();
@@ -404,12 +398,6 @@ impl Engine {
     /// 唯一入口。字母累积（光标处插入）/ 退格删光标前字符 / 组合内光标编辑（C-b/C-f/C-h）
     /// / 数字选词 / 空格首选 / shift 中英切换
     pub fn key(&mut self, k: Key) -> Outcome {
-        // #85 标点撤销 turn 化：除退格外任何键进入口即清 last_punc（字母入组合 /
-        // 数字选词 / 空格释放 / 再标点 / Esc / Shift-flush / 翻页…全覆盖），
-        // 过期撤销态不会漏进后续删除路径。
-        if k.code != KEY_BACKSPACE {
-            self.last_punc = None;
-        }
         // 数字标志：数字键无论 outcome（选词命中/放行）都置位，其余任何键清零。
         let after_digit = std::mem::replace(
             &mut self.after_digit,
@@ -424,10 +412,11 @@ impl Engine {
         if quote_key != self.quote_open {
             self.quote_open = None;
         }
-        // Shift 单独按下（#83 起无持久模式）：无组合 = 空操作（轻点锁死根子
-        // 已删：英文字母靠「按住 Shift 打字」临时透传表达，壳层手势裁决层
-        // 也不再补交切模式）；有组合 = 上屏原字母串（输入串结束，撤销链
-        // 随组合消亡），模式不变。
+        // Shift 单独按下（rime ascii_composer 持久模式语义）：无组合（letters 与
+        // pending 皆空）= 翻转中/英模式——壳层把「轻点」裁决成 Toggle 后在 release
+        // 时补交这一次 Shift（platform-wayland repeat.rs ShiftComposer）；有组合 =
+        // pending + 原字母串整段原样上屏并切入英文。本键 ch=None、code≠Backspace，
+        // 入口已统一重置配对引号态，切英文不会带着开引号过去。
         if k.ch.is_none()
             && k.shift
             && !k.ctrl
@@ -438,16 +427,20 @@ impl Engine {
             // 预选词与撤销栈，输入串结束）
             let pending_text = self.pending_words.join("");
             if self.letters.is_empty() && pending_text.is_empty() {
+                // 空组合翻转（中↔英双向）= 话题切换：不上屏、不动撤销栈
+                // （栈生死归硬终结点管，空闲翻转不终结任何东西）。
+                self.chinese = !self.chinese;
                 return Outcome::Consumed;
             }
             let text = format!("{pending_text}{}", self.letters);
-            // 清组合（#77 起同步清撤销栈）：Shift-flush 原样上屏 = 输入串结束。
+            // 清组合（#77 起同步清撤销栈）+ 切英文：Shift-flush 原样上屏 =
+            // 输入串结束，撤销链随组合消亡。
             self.clear_composition();
+            self.chinese = false;
             return Outcome::Commit(text);
         }
 
-        // 英文模式（#83 起休眠：chinese 恒 true，本分支不可达；保留待后续
-        // 模式系统清理）：其余键一律放行。
+        // 英文模式：除上面已处理的 Shift 外，其余键一律放行。
         if !self.chinese {
             self.quote_open = None;
             return Outcome::Ignored;
@@ -457,17 +450,15 @@ impl Engine {
         // （fcitx5 useBackSpaceToUnselect 对齐）：撤销栈非空（无论 letters 空否）
         // → 弹栈顶还原最近选词消耗的拼音（letters = 消耗段 + 剩余，光标归尾，
         // 候选重建，可再选词、也可继续组词）；栈净后才删光标**前**一个字符
-        // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态：#85
-        // 标点撤销（last_punc 在 → PuncCancel，一次性）否则 Ignored 放行给应用。
+        // （组合内光标语义），删空即清栈（#77 不变式）；双空 = 空闲态 Ignored
+        // 放行给应用删字符。
         // 长按的自动重复按 press 逐次到达，与引擎无状态假设一致。
         if k.ch.is_none() && k.code == KEY_BACKSPACE {
-            // #81 pending 弹词最优先：释放前退格 = 弹最近预选词（纯内部，
-            // 应用零删除），并成对弹出该词在 undo_consumed 里的无效条目；
-            // pending 弹空后才进 #80 释放后 LIFO（undo_consumed / UndoApp）。
-            // 非空闲退格是消费键：清掉过期标点撤销态（#85）；双空（空闲态）
-            // 不在此清，留给下面的 PuncCancel 消费。
+            // 优先级：pending 非空 → 弹最近预选词回组合（纯内部，应用零
+            // 删除）；否则 letters 非空 → 删光标**前**一个字符；双空 =
+            // 空闲态 Ignored 放行给应用。已上屏的词不弹回——任何 Commit
+            // 出口都清掉了撤销栈（#96：上屏 = 撤销链死亡），栈净落不到这里。
             if !self.pending_words.is_empty() {
-                self.last_punc = None;
                 self.pending_words.pop();
                 // 该词消耗的拼音弹回组合（可重新选词/组词），成对弹出
                 // undo_consumed 里该词的无效条目
@@ -480,19 +471,7 @@ impl Engine {
                 self.rebuild_preedit_display();
                 return Outcome::Consumed;
             }
-            // 撤销优先（#77 起）+ #79 统一 undo：栈非空（无论 letters 空否）
-            // = 撤销最近选词：拼音还原进组合（消耗段 + 剩余）
-            if let Some((consumed, app_chars)) = self.undo_consumed.pop() {
-                self.last_punc = None;
-                let remaining = std::mem::take(&mut self.letters);
-                self.letters = format!("{consumed}{remaining}");
-                self.cursor = self.letters.len();
-                self.page_index = 0;
-                self.refresh_candidates();
-                return Outcome::UndoApp(app_chars.saturating_sub(1));
-            }
             if !self.letters.is_empty() {
-                self.last_punc = None;
                 if self.cursor > 0 {
                     self.letters.remove(self.cursor - 1);
                     self.cursor -= 1;
@@ -500,15 +479,6 @@ impl Engine {
                 self.refresh_candidates();
                 self.page_index = 0;
                 return Outcome::Consumed;
-            }
-            // 双空 = 空闲态：#85 智能标点撤销（对齐 fcitx5 cancelLast，一次性）——
-            // 最近一次智能标点上屏记录在 last_punc → 发 PuncCancel（壳删全角
-            // 上屏 original），发出即清；无记录 → Ignored 放行给应用删字符。
-            if let Some((original, fullwidth)) = self.last_punc.take() {
-                return Outcome::PuncCancel {
-                    original,
-                    fullwidth,
-                };
             }
         }
 
@@ -520,8 +490,7 @@ impl Engine {
                 return Outcome::Ignored;
             }
             // #81：Esc = 整句取消——预选词 + 剩余拼音全清，不上屏；
-            // 已释放词的撤销链（undo_consumed）不动。clear_composition
-            // 同时清 pending 与显示串。
+            // 链随组合一并清（#96）。clear_composition 同时清 pending 与显示串。
             self.clear_composition();
             return Outcome::Consumed;
         }
@@ -581,8 +550,8 @@ impl Engine {
                     return Outcome::Consumed;
                 }
                 Some('h') => {
-                    // #79：删空不清撤销链（#77 不变式作废）——部分选词后 C-h
-                    // 删净剩余拼音，退格仍可逐条弹上屏字，回退统一。
+                    // C-h 只删剩余拼音，不动 pending 与其配对的撤销条目
+                    //（链生命周期 = 未释放，见 undo_consumed 字段注释）。
                     if self.cursor > 0 {
                         self.letters.remove(self.cursor - 1);
                         self.cursor -= 1;
@@ -624,7 +593,7 @@ impl Engine {
         // 空格 — 有候选 = 选当前页首候选（select_candidate：全覆盖立即上屏，
         // 部分覆盖入 pending 继续组句）；无候选且有 pending = 空格提交
         // preedit 全部（fcitx5 语义）：选中词 + 残留拼音原样一起上屏、组合
-        // 结束（撤销链保留，退格走 #80）；无候选无 pending 但残留拼音 =
+        // 结束（#96：上屏即撤销链死亡）；无候选无 pending 但残留拼音 =
         // 原样上屏收尾；全空 = 放行。
         if k.ch.is_none() && k.code == KEY_SPACE {
             if !self.candidates.is_empty() {
@@ -632,18 +601,10 @@ impl Engine {
                 return self.select_candidate(&top);
             }
             if !self.pending_words.is_empty() {
-                let mut text = self.pending_words.join("");
+                // fcitx5 语义：选中词 + 残留拼音原样一起上屏，组合结束；
+                // release_words 一并清栈（#96：上屏即链死，残留段也不再入链）。
+                let mut text = self.release_words();
                 text.push_str(&self.letters);
-                self.pending_words.clear();
-                // 残留拼音（原样上屏部分）也入撤销链：退格逐条 LIFO 撤回，
-                // 先撤原样段再撤词条目，整串回组合（fcitx5 撤销语义）。
-                if !self.letters.is_empty() {
-                    self.undo_consumed
-                        .push((self.letters.clone(), self.letters.chars().count()));
-                    if self.undo_consumed.len() > 64 {
-                        self.undo_consumed.remove(0);
-                    }
-                }
                 self.letters.clear();
                 self.preedit.clear();
                 self.page_index = 0;
@@ -693,29 +654,18 @@ impl Engine {
                     ('\'', true) => "’",
                     _ => mapped,
                 };
-                // #85 标点撤销：实际转换（上屏 "。" 等全角字符）时置撤销状态——
-                // 空闲态退格发 PuncCancel，壳删 `mapped` 上屏原 `c`。自映射
-                // 条目（mapped == c，无转换）不置。
-                let converted = *mapped != c.to_string();
                 if self.letters.is_empty() {
                     // 情况 A：无预编辑串。有 pending = 释放 pending + 标点；
                     // 无 pending = 直接上屏标点。标点 = 输入串结束（硬终结点）：
-                    // 撤销链随 burst 终止（全覆盖选词刚上屏时链可能非空）。
+                    // 栈随 burst 终止（全覆盖选词 Commit 已清栈（#96：上屏即链死），
+                    // 此处再清一遍保底）。
                     if self.pending_words.is_empty() {
                         self.undo_consumed.clear();
-                        if converted {
-                            self.last_punc = Some((c.to_string(), mapped.to_string()));
-                        }
                         return Outcome::Commit(mapped.to_string());
                     }
-                    let text = self.pending_words.join("");
-                    self.pending_words.clear();
+                    // pending 释放：经 release_words 连 pending 带栈一起清（#96）
+                    let text = self.release_words();
                     self.preedit_display.clear();
-                    // 标点上屏 = 输入串结束：清空撤销栈
-                    self.undo_consumed.clear();
-                    if converted {
-                        self.last_punc = Some((c.to_string(), mapped.to_string()));
-                    }
                     return Outcome::Commit(format!("{text}{mapped}"));
                 } else if !self.candidates.is_empty() {
                     // 情况 B（fcitx5 顶字）：标点前先上屏当前页首候选；候选
@@ -728,9 +678,6 @@ impl Engine {
                     text.push_str(mapped);
                     self.pending_words.clear();
                     self.clear_composition();
-                    if converted {
-                        self.last_punc = Some((c.to_string(), mapped.to_string()));
-                    }
                     return Outcome::Commit(text);
                 } else {
                     // 情况 C：无候选词，字母串（连同 pending 整段）+ 标点
@@ -738,9 +685,6 @@ impl Engine {
                     let pending_text = self.pending_words.join("");
                     let text = format!("{pending_text}{}", self.letters);
                     self.clear_composition();
-                    if converted {
-                        self.last_punc = Some((c.to_string(), mapped.to_string()));
-                    }
                     return Outcome::Commit(format!("{text}{mapped}"));
                 }
             }
@@ -786,10 +730,9 @@ impl Engine {
                 return Outcome::Commit(text);
             }
             if !self.pending_words.is_empty() {
-                // 无字母有 pending（#81）：Enter = 整段释放，撤销链存活
-                // （释放后 LIFO 可退格弹回）
-                let text = self.pending_words.join("");
-                self.pending_words.clear();
+                // 无字母有 pending（#81）：Enter = 整段释放；release_words
+                // 连 pending 带栈一起清（#96：上屏即链死）。
+                let text = self.release_words();
                 self.preedit_display.clear();
                 return Outcome::Commit(text);
             }
@@ -1077,7 +1020,7 @@ impl Engine {
                     // 长串降级（与全拼路径同约）：整句/长组合词占满但不足一页时，
                     // 首音节单字候选追加到末尾，翻页翻得到「我」。全拼重试已经跑过
                     // 这条路径时结果已在列表里，按文本去重后是空操作。
-                    // 双拼降级：整句/组合词占满但不足一页时追加首音节单字。
+                    // 双拼降级：整句/长组合词占满但不足一页时追加首音节单字。
                     // 双拼一个键对就是一个音节，≥2 音节即可能是「漏了第二个拼音」
                     // （nimf 想打 ni 但被解成 nimen）——用户要的是先选「你」再继续，
                     // 不是被锁在「你们」整句里。末键半截（has_pending）时同样强制。
@@ -1089,6 +1032,7 @@ impl Engine {
                             &syllables,
                             self.config.candidate_limit,
                             true,
+                            has_pending,
                         );
                     }
                 }
@@ -1328,6 +1272,7 @@ impl Engine {
                     full,
                     self.config.candidate_limit,
                     false,
+                    false,
                 );
             }
         }
@@ -1379,6 +1324,7 @@ impl Engine {
         syllables: &[String],
         limit: usize,
         force: bool,
+        has_pending: bool,
     ) {
         if !force && syllables.len() < 3 || limit == 0 || syllables.is_empty() {
             return;
@@ -1391,8 +1337,20 @@ impl Engine {
             return;
         }
         // 保护首段：整串全覆盖的候选（整句 / 精确词）置顶，单字不得越过。
+        // has_pending 时保护键需覆盖组合词区间——半截键场景 syllables 是
+        // 完整音节、组合词 pinyin "bian'hua" 与精确键 "bian" 不匹配；
+        // 用 `full_joined + "'"` 前缀保护这些消耗了 pending 音节的组合词，
+        // 否则单字（边 244 万）会把组合词（变化 50 万）压到首屏之外。
         let full_joined = syllables.join("'");
-        let head = cands.iter().take_while(|c| c.pinyin == full_joined).count();
+        let head = if has_pending {
+            let prefix = format!("{full_joined}'");
+            cands
+                .iter()
+                .take_while(|c| c.pinyin == full_joined || c.pinyin.starts_with(&prefix))
+                .count()
+        } else {
+            cands.iter().take_while(|c| c.pinyin == full_joined).count()
+        };
         // 预算独立于主查询的 candidate_limit：候选总量可远超一页，首音节单字
         // 全量进同一列表，翻页在平台层做。extra 已被 lookup 的 limit 约束为
         // eff 降序的前 limit 条；双列稳定合并（池内序原样保留，#87 交错）。
@@ -1739,14 +1697,17 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #83：双拼模式下空组合 Shift = 空操作（无持久模式），拼音照常可打
-    /// （旧用例断言「Shift 切英文后双拼停用」——模式已删）。
+    /// 双拼模式下轻点 Shift 切英文：字母/数字全 Ignored 直通，组合与候选清空。
     #[test]
-    fn shift_empty_is_noop_shuangpin() {
+    fn english_mode_disables_shuangpin() {
         let (mut e, db, yaml) = engine_with_shuangpin_fixture();
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(e.chinese());
-        assert_eq!(e.key(k('n')), Outcome::Consumed, "双拼音照常累积");
+        // 英文模式下所有按键 Ignored，组合/候选为空
+        assert!(!e.chinese());
+        assert!(e.preedit().is_empty());
+        assert!(e.candidates().is_empty());
+        assert_eq!(e.key(k('a')), Outcome::Ignored, "英文模式字母直通");
+        assert_eq!(e.key(k('1')), Outcome::Ignored, "英文模式数字直通");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -1890,10 +1851,11 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #79：全量选词上屏后撤销链**保留**（#76 规则作废）——退格弹整词：
-    /// 拼音还原进组合 + UndoApp(n-1) 让壳删掉上屏的 n 个字，回退统一。
+    /// #80 上屏 = 撤销链死亡：全量选词 Commit 出口经 `release_words`
+    /// 清 `undo_consumed`（#79 跨上屏 LIFO 语义作废）；此后空闲退格
+    /// = Ignored 放行应用删字，不再弹词还原拼音。
     #[test]
-    fn full_selection_keeps_undo_chain() {
+    fn full_selection_commit_kills_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1903,23 +1865,18 @@ mod tests {
             other => panic!("expected Commit, got {:?}", other),
         }
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 1, "全量选词上屏，撤销链跨上屏存活");
-        // 退格 = 弹整词：拼音还原 + 壳删 2 个上屏字（物理 1 + 合成 1）
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihao", "整词弹回组合，可重新选词/组词");
-        assert_eq!(e.undo_depth(), 0);
-        // 栈净后逐字删拼音
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.letters, "niha");
+        assert_eq!(e.undo_depth(), 0, "Commit 出口清链：上屏即撤销链死亡");
+        // 上屏后退格 = Ignored 放行应用，不弹拼音、不消费栈
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert!(e.letters.is_empty(), "链死亡后无拼音弹回");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #81 预选 + fcitx5 单步上屏：连选两词（你好 部分覆盖入 pending +
-    /// 泥猴 全覆盖）→ 整串覆盖时两词一起上屏；上屏后退格 = LIFO 逐词
-    /// 弹回（拼音还原 + 应用级删除）。
+    /// #80 上屏 = 撤销链死亡：连选两词（你好、泥猴各自全覆盖立即上屏），
+    /// 每次 Commit 出口即清链——任意退格 = Ignored 放行应用，无 LIFO 弹回。
     #[test]
-    fn two_word_chain_commits_together_pops_lifo() {
+    fn two_word_commit_kills_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
@@ -1936,21 +1893,20 @@ mod tests {
             Outcome::Commit(t) => assert_eq!(t, "泥猴"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        assert_eq!(e.undo_depth(), 2, "两次上屏 = 两条撤销条目");
-        // 上屏后 LIFO：先撤泥猴（壳删 2 字 + 拼音弹回）
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihou", "最近词拼音弹回组合");
-        // 再撤你好：整串还原
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihaonihou", "整串可重新组词");
-        assert_eq!(e.undo_depth(), 0);
+        assert_eq!(e.undo_depth(), 0, "链死亡：上屏即撤销终结");
+        // 退格 1 与退格 2 都是 Ignored——链已死亡，应用自己删字
+        for _ in 0..2 {
+            assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+            assert!(e.letters.is_empty(), "链死亡后无拼音弹回");
+            assert_eq!(e.undo_depth(), 0);
+        }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #77 撤销优先 + #79 统一 undo：部分选词后第一下退格 = 撤销最近
-    /// 选词（消耗拼音 + 剩余整串还原，UndoApp 删上屏字），不删拼音；
-    /// 栈净后逐字删拼音，双空放行应用。
+    /// #77 撤销优先：pending 未释放时退格 = 弹词（消耗拼音 + 剩余整串还原），
+    /// 不删拼音；栈净后逐字删拼音，双空放行应用。（#80：上屏后链死亡与本路径无关——
+    /// 本测试全程 pending 未提交，弹词是 pending 内部的「未上屏幕词」撤回。）
     #[test]
     fn backspace_partial_selection_undoes_in_order() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -1979,13 +1935,11 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #77 撤销优先 + #79：双拼部分选词，撤销弹回的是**键位串**（非拼音），
-    /// 壳按上屏字数（你好 = 2）补发合成退格；栈净后逐键删除，删到键位串
-    /// （nihc）后双拼解码重建 preedit。尾段 zz 无 fixture 词 → 候选只有你好。
-    /// fcitx5 语义：空格提交 preedit 全部（你好 + 原样 zz 一起上屏），
-    /// 原样段也入撤销链——退格先撤 zz 再撤词条目，整串回组合。
+    /// #77 撤销优先：双拼部分选词弹回**键位串**（非拼音），不删除上屏字。
+    /// #80：Commit 出口清链后，上屏内容不可退格弹回——应用自己删字。
+    /// fcitx5 语义：空格提交 preedit 全部（你好 + 原样 zz 一起上屏）。
     #[test]
-    fn shuangpin_backspace_undo_restores_keys() {
+    fn shuangpin_backspace_after_commit_releases_to_app() {
         let (mut e, db, yaml) = engine_with_shuangpin_fixture();
         for c in "nihczz".chars() {
             e.key(k(c));
@@ -2006,17 +1960,10 @@ mod tests {
             Outcome::Commit(t) => assert_eq!(t, "你好zz"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        // 上屏后 LIFO：先撤原样段 zz（壳删 2 字），再撤词条目（你好）
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "zz", "原样段先弹回");
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihczz", "双拼撤销弹回键位串");
-        assert_eq!(e.undo_depth(), 0);
-        // 栈净 → 逐键删到 nihc，双拼解码重建 preedit
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        assert_eq!(e.letters, "nihc");
-        assert_eq!(e.preedit(), "nihao", "弹回后按双拼解码重建 preedit");
+        assert_eq!(e.undo_depth(), 0, "Commit 出口清链：上屏即撤销链死亡");
+        // 上屏后空闲退格 = Ignored：应用删字，引擎不弹词
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert_eq!(e.letters, "", "链死亡后无拼音弹回");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
@@ -2044,10 +1991,11 @@ mod tests {
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #79：C-h 把剩余拼音删空**不清**撤销链（#77 不变式作废）——
-    /// 删空后链仍在，退格照样弹上屏字，回退统一。
+    /// #80 上屏 = 撤销链死亡：C-h 删空剩余拼音不经 Commit 出口，链保留；
+    /// 空格释放整段后链死亡（#79「删空后仍可弹上屏字」语义作废），
+    /// 此后退格 = Ignored 放行应用。
     #[test]
-    fn ctrl_h_delete_to_empty_keeps_undo_chain() {
+    fn ctrl_h_delete_to_empty_then_commit_kills_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihaoni".chars() {
             e.key(k(c));
@@ -2056,29 +2004,30 @@ mod tests {
         assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "ni");
         assert_eq!(e.undo_depth(), 1);
-        // C-h 逐字删（光标在尾）：删空也不清链
+        // C-h 逐字删（光标在尾）：删空不清链（#77：链在组合非空时存活）
         assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
         assert_eq!(e.letters, "n");
         assert_eq!(e.key(ctrl_h_k()), Outcome::Consumed);
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 1, "删空不清链（#79）");
-        // 空格释放整段
+        assert_eq!(e.undo_depth(), 1, "删空不清链（链在组合非空时存活）");
+        // 空格释放整段 = Commit 出口，清链：上屏即链死
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected 释放 Commit, got {:?}", other),
         }
-        // 释放后退格 = 弹词：拼音还原 + 壳删 2 字
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihao");
+        assert_eq!(e.undo_depth(), 0, "Commit 出口清链：上屏即撤销链死亡");
+        // 释放后退格 = Ignored 放行应用，不再弹词
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
+        assert!(e.letters.is_empty(), "链死亡后无拼音弹回");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// Shift-flush 路径（#83 起不切模式）：letters 非空时 Shift 走
-    /// Commit(**原字母**) + 清组合——输入串随原样上屏结束，词级撤销链
-    /// 随 burst 终止；模式保持中文，退格放行给应用，不再弹回旧选词拼音
+    /// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合
+    /// + 切英文——输入串随原样上屏结束，词级撤销链随 burst 终止；
+    /// 退格放行给应用（英文模式同样 Ignored），不再弹回旧选词拼音
     /// （v0.19.68 前语义是保留，3eb8279 的 `shift_flush_keeps_undo_stack`
-    /// 语义反转；#83 再删掉切英文半边）。
+    /// 语义反转）。
     #[test]
     fn shift_flush_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
@@ -2089,108 +2038,126 @@ mod tests {
         assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Consumed);
         assert_eq!(e.letters, "ni", "部分选词剩拼音");
         assert_eq!(e.undo_depth(), 1);
-        // 剩余组合在、直接 Shift：pending + 原字母整段上屏 + 清组合，burst 结束
+        // 剩余组合在、直接 Shift：pending + 原字母整段上屏 + 清组合 + 切英文，burst 结束
         match e.key(shift_k(KEY_LEFTSHIFT)) {
             Outcome::Commit(t) => assert_eq!(t, "你好ni", "shift-flush 连 pending 冲刷"),
             other => panic!("expected Commit(你好ni), got {:?}", other),
         }
-        assert!(e.chinese(), "#83 起 Shift 不切模式");
+        assert!(!e.chinese(), "Shift-flush 切英文（输入串结束）");
         assert!(e.letters.is_empty());
         assert_eq!(
             e.undo_depth(),
             0,
             "shift-flush 上屏即输入串结束，撤销链终止"
         );
-        // 退格放行，不再弹旧词
+        // 退格放行，不再弹旧词（英文模式同样 Ignored）
         assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// 标点上屏 = 输入串结束：nihao 全覆盖选词已立即上屏（fcitx5 语义），
-    /// 组合空后标点直接上屏；#85：智能标点转换后退格 = PuncCancel 还原原键。
+    /// 标点上屏 = 输入串结束：组合空后标点直接上屏；空闲退格放行应用删全角。
     #[test]
     fn punct_commit_ends_undo_chain() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
         }
-        // 空格：候选覆盖全部输入 → 立即上屏（撤销链跨上屏存活）
+        // 空格：候选覆盖全部输入 → 立即上屏（#80：Commit 出口即清链）
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        assert_eq!(e.undo_depth(), 1);
+        assert_eq!(e.undo_depth(), 0, "上屏即链死");
         // 组合已空：标点直接上屏（原样上屏 = 输入串结束，撤销链终止）
         match e.key(k('.')) {
             Outcome::Commit(t) => assert_eq!(t, "。"),
             other => panic!("expected Commit, got {:?}", other),
         }
         assert_eq!(e.undo_depth(), 0, "标点 Commit 即输入串结束，撤销链终止");
-        // #85：空闲退格先消费「末次标点撤销」，不直接放行应用
-        assert_eq!(
-            e.key(code_k(KEY_BACKSPACE)),
-            Outcome::PuncCancel {
-                original: ".".into(),
-                fullwidth: "。".into()
-            },
-            "栈已清，退格先撤销智能标点转换"
-        );
+        // 空闲退格 = Ignored 放行应用删全角字符
         assert_eq!(
             e.key(code_k(KEY_BACKSPACE)),
             Outcome::Ignored,
-            "撤销已消费，再退格放行"
+            "组合空后退格放行应用删全角"
         );
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
-    /// 弹选词删净剩余拼音后撤销链自净（#80 LIFO）；#83 起空组合
-    /// Shift = 无动作（无翻转、不清栈、不切模式），拼音照常可打。
+    /// #96 起 burst 结束（选词上屏即输入串结束）——撤销链立即死。
+    /// 轻点 Shift = 翻转中/英模式（头段后两段不变）。
     #[test]
-    fn backspace_to_empty_no_mode_path() {
+    fn english_toggle_after_burst_end() {
         let (mut e, db, yaml) = engine_with_fixture();
         for c in "nihao".chars() {
             e.key(k(c));
         }
-        // 全覆盖选词 = 立即上屏（fcitx5 语义）
+        // 全覆盖选词 = 立即上屏（fcitx5 语义）；#96：上屏即撤销链死亡
         match e.key(code_k(KEY_SPACE)) {
             Outcome::Commit(t) => assert_eq!(t, "你好"),
             other => panic!("expected Commit, got {:?}", other),
         }
-        // #77 撤销优先 + #79：第一下退格弹选词（还原原串、栈净、删上屏字）
-        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::UndoApp(1));
-        assert_eq!(e.letters, "nihao", "弹选词还原原串");
-        for _ in 0..5 {
-            assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Consumed);
-        }
+        // 空闲退格放行应用，不再弹词还原拼音（#79/#80 跨上屏撤销作废）
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         assert!(e.letters.is_empty());
-        assert_eq!(e.undo_depth(), 0, "链已随弹栈净");
-        // 空 letters：Shift 无动作（#83：无持久模式），拼音照常可打
+        assert_eq!(e.undo_depth(), 0, "上屏即链死（#96）");
+        // 空 letters：轻点 Shift 切英文，字母/退格一律直通
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        assert!(e.chinese(), "无路径能切英文模式");
+        assert!(!e.chinese());
+        assert_eq!(e.key(k('n')), Outcome::Ignored, "英文模式不组拼音");
+        assert_eq!(
+            e.key(code_k(KEY_BACKSPACE)),
+            Outcome::Ignored,
+            "英文模式退格放行给应用"
+        );
+        // 切回中文：退格放行不弹旧词，拼音照常
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(code_k(KEY_BACKSPACE)), Outcome::Ignored);
         assert_eq!(e.key(k('n')), Outcome::Consumed, "中文模式照常吃拼音");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// #83：空组合 Shift = 空操作（轻点锁死根子删除）——模式恒中文。
+    /// 空闲轻点 Shift = 翻转中/英模式（壳层把轻点裁决成 Toggle 后补交这一次
+    /// Shift）：中→英→中逐次断言。
     #[test]
-    fn shift_tap_is_noop() {
+    fn shift_toggles_to_english() {
         let (mut e, db, yaml) = engine_with_fixture();
         assert!(e.chinese());
-        for _ in 0..3 {
-            assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
-        }
-        assert!(e.chinese(), "轻点 Shift 不切模式");
-        assert_eq!(e.key(k('n')), Outcome::Consumed, "拼音照常");
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(!e.chinese());
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
 
-    /// Shift 冲刷（原串上屏）后模式保持中文，后续按键照常进拼音
-    /// （旧断言「切英文后字母 Ignored」已随 #83 删除）。
+    /// 英文模式字母/数字/空格/标点全 Ignored 直通，preedit 恒空；
+    /// 再轻点切回中文后拼音照常进组合。
     #[test]
-    fn shift_with_active_composition_commits_raw() {
+    fn english_mode_passes_keys_through() {
+        let (mut e, db, yaml) = engine_with_fixture();
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed); // → english
+        assert!(!e.chinese());
+        assert_eq!(e.key(k('a')), Outcome::Ignored);
+        assert_eq!(e.key(k('1')), Outcome::Ignored);
+        assert!(e.preedit().is_empty());
+        assert_eq!(e.key(code_k(KEY_SPACE)), Outcome::Ignored);
+        assert_eq!(e.key(k('.')), Outcome::Ignored);
+        // 切回中文：组合照常
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(k('n')), Outcome::Consumed);
+        assert_eq!(e.preedit(), "n");
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(&yaml);
+    }
+
+    /// Shift-flush = 原字母整串上屏 + 清组合 + 切英文；之后字母直通，
+    /// 再轻点 Shift 切回中文（拼音照常）
+    #[test]
+    fn shift_with_active_composition_commits_raw_and_switches() {
         let (mut e, db, yaml) = engine_with_fixture();
         e.key(k('n'));
         let mut alt_n = k('n');
@@ -2200,9 +2167,14 @@ mod tests {
         e.key(k('h'));
         assert!(e.chinese());
         assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Commit("nh".into()));
-        assert!(e.chinese(), "#83 起冲刷不切模式");
+        assert!(!e.chinese(), "冲刷后切英文");
         assert!(e.preedit().is_empty());
-        assert_eq!(e.key(k('a')), Outcome::Consumed, "仍是中文拼音");
+        assert_eq!(e.key(k('a')), Outcome::Ignored, "英文模式字母直通");
+        // 切回中文：拼音照常进组合
+        assert_eq!(e.key(shift_k(KEY_LEFTSHIFT)), Outcome::Consumed);
+        assert!(e.chinese());
+        assert_eq!(e.key(k('a')), Outcome::Consumed);
+        assert_eq!(e.preedit(), "a");
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
     }
