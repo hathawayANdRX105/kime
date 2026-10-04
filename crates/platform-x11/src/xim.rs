@@ -12,7 +12,7 @@ use std::sync::Arc;
 use kime_core::{Engine, Key, Outcome};
 use parking_lot::Mutex;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, KeyButMask, KeyPressEvent};
+use x11rb::protocol::xproto::{KeyButMask, KeyPressEvent};
 use x11rb::rust_connection::RustConnection;
 use xim::{
     x11rb::X11rbServer, Server, ServerError, ServerHandler, UserInputContext, XimConnections,
