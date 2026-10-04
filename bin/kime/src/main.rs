@@ -1,8 +1,9 @@
 //! kime CLI 入口：吞 stdin 拼音串、出候选列表。
 //!
 //! 用法（M9 起）：
-//!   kime build-dict --in <sqlite> --out <bin>
+//!   kime status
 //!   kime config <list|get KEY|set KEY VALUE>
+//!   kime build-dict --in <sqlite> --out <bin>
 //!   kime english [--dict <path>] <字母串>...
 //!   kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]
 //!   kime mine-lm [--dict <path>] [--jev] [--jev-endpoint <url>] [--jev-key <key>]
@@ -10,10 +11,15 @@
 //!   kime repl
 //!
 //! 配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit
+//!
+//! `status` 与 `config` 已迁到 clap（见 [`Cli`]），其余子命令仍走
+//! [`legacy_main`] 的手写解析。
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use clap::{Parser, Subcommand, ValueEnum};
 
 use kime_core::builder::build;
 use kime_core::config::Config;
@@ -28,6 +34,144 @@ const KEY_ESC: u32 = 1;
 fn default_dict_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".local/share/kime/dict.sqlite3")
+}
+
+/// kime 输入法引擎：构建词库、查询候选、读写配置。
+///
+/// 迁移期说明（面向开发者，非用户帮助）：本阶段只建模 `status` 与 `config`
+/// 两个子命令，其余仍走 [`legacy_main`] 的手写解析——未迁移的子命令与裸
+/// flag（`--dict` / `--import` / `--shuangpin` / `repl` / `build-dict` /
+/// `english` / `debug` / `mine-lm`）行为不变。
+#[derive(Debug, Parser)]
+#[command(name = "kime", version, long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// 已迁移到 clap 的子命令。`None` = 裸 flag 模式，转 [`legacy_main`]。
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// 打印当前生效的模式与双拼方案
+    Status,
+    /// 读取或修改配置文件
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+}
+
+/// `kime config` 的子命令。省略时等价于 `list`。
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// 打印配置文件路径与全部内容
+    List,
+    /// 读取单个字段的当前值
+    Get { key: ConfigKey },
+    /// 写入单个字段并落盘
+    Set { key: ConfigKey, value: String },
+}
+
+/// `kime config` 可读写的字段。键名非法由 clap 在解析期拒绝（旧实现是
+/// 运行时 `未知字段` 报错）。
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigKey {
+    /// 双拼方案
+    #[value(name = "shuangpin")]
+    Shuangpin,
+    /// 每页候选数
+    #[value(name = "page_size")]
+    PageSize,
+    /// 单页候选上限
+    #[value(name = "candidate_limit")]
+    CandidateLimit,
+    /// 词库路径（只读）
+    #[value(name = "dict_path")]
+    DictPath,
+    /// 模糊音替换对（只读）
+    #[value(name = "fuzzy")]
+    Fuzzy,
+    /// 标点模式
+    #[value(name = "punct_mode")]
+    PunctMode,
+}
+
+impl ConfigKey {
+    /// 配置键的规范拼写（与 [`ConfigKey`] 的 `value(name)` 一致）。
+    ///
+    /// 下划线而非 clap 默认的 kebab-case：历史 CLI 一律用下划线，
+    /// `candidate_limit` 不能被改写成 `candidate-limit`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shuangpin => "shuangpin",
+            Self::PageSize => "page_size",
+            Self::CandidateLimit => "candidate_limit",
+            Self::DictPath => "dict_path",
+            Self::Fuzzy => "fuzzy",
+            Self::PunctMode => "punct_mode",
+        }
+    }
+}
+
+/// `kime config set` 的取值：校验通过后得到的类型化字段集合。
+///
+/// 只有与 [`ConfigKey`] 对应的字段被填写，其余保持「当前配置值」，由
+/// [`parse_config_value`] 保证不会串味。
+#[derive(Debug, Clone)]
+pub struct ConfigValue {
+    /// 原始输入，供回显
+    pub raw: String,
+    /// `key = shuangpin` 时有效
+    pub shuangpin: Option<Scheme>,
+    /// `key = page_size` 时有效
+    pub page_size: usize,
+    /// `key = candidate_limit` 时有效
+    pub candidate_limit: usize,
+    /// `key = punct_mode` 时有效
+    pub punct_mode: kime_core::config::PunctMode,
+}
+
+/// 按目标键校验取值并完成类型转换。
+///
+/// clap 无法在两个兄弟参数（key / value）间传递关联，故取值域的判定只能
+/// 在拿到两者之后做。键名本身仍由 clap 的 `ValueEnum` 在解析期拒绝——
+/// `kime config get nope` 不会再走到运行时。
+fn parse_config_value(key: ConfigKey, raw: &str, config: &Config) -> Result<ConfigValue, String> {
+    let mut value = ConfigValue {
+        raw: raw.to_string(),
+        shuangpin: config.shuangpin,
+        page_size: config.page_size,
+        candidate_limit: config.candidate_limit,
+        punct_mode: config.punct_mode,
+    };
+    let invalid = |expect: &str| format!("无效值: {raw} (期望 {expect})");
+    match key {
+        ConfigKey::Shuangpin => {
+            value.shuangpin = match raw {
+                "xiaohe" => Some(Scheme::Xiaohe),
+                "ziranma" => Some(Scheme::Ziranma),
+                "none" => None,
+                _ => return Err(invalid("xiaohe | ziranma | none")),
+            };
+        }
+        ConfigKey::PageSize => {
+            value.page_size = raw.parse().map_err(|_| invalid("正整数"))?;
+        }
+        ConfigKey::CandidateLimit => {
+            value.candidate_limit = raw.parse().map_err(|_| invalid("正整数"))?;
+        }
+        ConfigKey::PunctMode => {
+            value.punct_mode = match raw {
+                "chinese" => kime_core::config::PunctMode::Chinese,
+                "english" => kime_core::config::PunctMode::English,
+                _ => return Err(invalid("chinese | english")),
+            };
+        }
+        ConfigKey::DictPath | ConfigKey::Fuzzy => {
+            return Err(format!("字段 {} 只读，不支持 set", key.as_str()))
+        }
+    }
+    Ok(value)
 }
 
 /// `kime english hello` → 直查英文表，一行一个输入串。
@@ -243,72 +387,50 @@ fn handle_debug_cmd(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn handle_config_cmd(args: &[String]) -> Result<String, String> {
-    let config_path = if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
-        std::path::PathBuf::from(p)
-    } else {
-        match std::env::var("HOME") {
-            Ok(home) => std::path::PathBuf::from(home)
-                .join(".config")
-                .join("kime")
-                .join("config.toml"),
-            Err(_) => return Err("HOME 未设置".to_string()),
-        }
-    };
+/// 配置文件路径：`$KIME_CONFIG_PATH` 优先，否则 `~/.config/kime/config.toml`。
+fn resolve_config_path() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("KIME_CONFIG_PATH") {
+        return Ok(PathBuf::from(p));
+    }
+    match std::env::var("HOME") {
+        Ok(home) => Ok(PathBuf::from(home)
+            .join(".config")
+            .join("kime")
+            .join("config.toml")),
+        Err(_) => Err("HOME 未设置".to_string()),
+    }
+}
+
+/// `kime config <list|get KEY|set KEY VALUE>` —— 读配置与写配置。
+///
+/// 键名由 clap 的 `ValueEnum` 在解析期校验，取值域由 [`parse_config_value`]
+/// 按目标键判定；此处只做落盘。
+fn handle_config_cmd(action: Option<ConfigAction>) -> Result<String, String> {
+    let config_path = resolve_config_path()?;
     let mut config = Config::load_from_path(&config_path);
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    match sub {
-        "list" => {
+    match action.unwrap_or(ConfigAction::List) {
+        ConfigAction::List => {
             let toml_str =
                 toml::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
             Ok(format!("{}\n\n{}", config_path.display(), toml_str))
         }
-        "get" => {
-            let key = args
-                .get(1)
-                .ok_or_else(|| "用法: kime config get <KEY>".to_string())?;
-            match key.as_str() {
-                "shuangpin" => Ok(format!("{:?}", config.shuangpin)),
-                "page_size" => Ok(config.page_size.to_string()),
-                "candidate_limit" => Ok(config.candidate_limit.to_string()),
-                "dict_path" => Ok(config.dict_path.clone()),
-                "fuzzy" => Ok(format!("{:?}", config.fuzzy)),
-                "punct_mode" => Ok(format!("{:?}", config.punct_mode)),
-                other => Err(format!("未知字段: {}", other)),
-            }
-        }
-        "set" => {
-            let key = args
-                .get(1)
-                .ok_or_else(|| "用法: kime config set <KEY> <VALUE>".to_string())?;
-            let val = args.get(2).ok_or_else(|| "缺少 VALUE".to_string())?;
-            match key.as_str() {
-                "shuangpin" => {
-                    config.shuangpin = match val.as_str() {
-                        "xiaohe" => Some(kime_shuangpin::Scheme::Xiaohe),
-                        "ziranma" => Some(kime_shuangpin::Scheme::Ziranma),
-                        "none" => None,
-                        other => return Err(format!("无效值: {} (xiaohe|ziranma|none)", other)),
-                    };
-                }
-                "page_size" => {
-                    config.page_size = val
-                        .parse()
-                        .map_err(|_| "page_size 必须是正整数".to_string())?;
-                }
-                "candidate_limit" => {
-                    config.candidate_limit = val
-                        .parse()
-                        .map_err(|_| "candidate_limit 必须是正整数".to_string())?;
-                }
-                "punct_mode" => {
-                    config.punct_mode = match val.as_str() {
-                        "chinese" => kime_core::config::PunctMode::Chinese,
-                        "english" => kime_core::config::PunctMode::English,
-                        other => return Err(format!("无效值: {} (chinese|english)", other)),
-                    };
-                }
-                other => return Err(format!("未知字段: {}", other)),
+        ConfigAction::Get { key } => Ok(match &key {
+            ConfigKey::Shuangpin => format!("{:?}", config.shuangpin),
+            ConfigKey::PageSize => config.page_size.to_string(),
+            ConfigKey::CandidateLimit => config.candidate_limit.to_string(),
+            ConfigKey::DictPath => config.dict_path.clone(),
+            ConfigKey::Fuzzy => format!("{:?}", config.fuzzy),
+            ConfigKey::PunctMode => format!("{:?}", config.punct_mode),
+        }),
+        ConfigAction::Set { key, value } => {
+            let value = parse_config_value(key, &value, &config)?;
+            match key {
+                ConfigKey::Shuangpin => config.shuangpin = value.shuangpin,
+                ConfigKey::PageSize => config.page_size = value.page_size,
+                ConfigKey::CandidateLimit => config.candidate_limit = value.candidate_limit,
+                ConfigKey::PunctMode => config.punct_mode = value.punct_mode,
+                // 只读字段在 parse_config_value 内已提前返回。
+                ConfigKey::DictPath | ConfigKey::Fuzzy => unreachable!(),
             }
             if let Some(parent) = config_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -316,35 +438,40 @@ fn handle_config_cmd(args: &[String]) -> Result<String, String> {
             let toml_str =
                 toml::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
             std::fs::write(&config_path, toml_str).map_err(|e| format!("写入失败: {}", e))?;
-            Ok(format!("已更新 {} = {}", key, val))
+            Ok(format!("已更新 {} = {}", key.as_str(), value.raw))
         }
-        other => Err(format!(
-            "未知子命令: {} (list|get KEY|set KEY VALUE)",
-            other
-        )),
     }
 }
 
 fn main() -> ExitCode {
-    let mut args_iter = std::env::args().skip(1).peekable();
-    let first = args_iter.next();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
 
-    // 子命令分派
-    match first.as_deref() {
-        Some("config") => {
-            let sub_args: Vec<String> = args_iter.collect();
-            return match handle_config_cmd(&sub_args) {
-                Ok(s) => {
-                    println!("{}", s);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("config error: {}", e);
-                    ExitCode::from(2)
-                }
-            };
-        }
-        Some("status") => {
+    // 迁移期闸门：只有已迁移的子命令交给 clap，其余（含裸 flag 与 REPL）
+    // 仍走 legacy 解析，行为不变。下一步把 `english` / `debug` /
+    // `mine-lm` / `build-dict` 加进这个 match，最后连 legacy 一并删掉。
+    //
+    // `--help` / `--version` 一并交给 clap：它们描述的是顶层命令面，
+    // 由 legacy 那份手写字符串继续答会与已迁移子命令脱节（`status`
+    // 就不在 legacy help 里）。legacy 的 `--help` 分支随最后一批迁移删除。
+    if argv.first().is_some_and(|head| {
+        matches!(
+            head.as_str(),
+            "status" | "config" | "--help" | "-h" | "--version" | "-V"
+        )
+    }) {
+        return match Cli::parse().command {
+            Some(command) => run_migrated(command),
+            // 闸门已保证 command 必为 Some；留作 clap 行为变化时的兜底。
+            None => ExitCode::from(2),
+        };
+    }
+    legacy_main(&argv)
+}
+
+/// 已迁移子命令的执行体。
+fn run_migrated(command: Command) -> ExitCode {
+    match command {
+        Command::Status => {
             let config = Config::load();
             let mode = if config.punct_mode == kime_core::config::PunctMode::Chinese {
                 "chinese"
@@ -353,14 +480,34 @@ fn main() -> ExitCode {
             };
             let scheme = format!("{:?}", config.shuangpin);
             println!("mode: {}, scheme: {}", mode, scheme);
-            return ExitCode::SUCCESS;
+            ExitCode::SUCCESS
         }
+        Command::Config { action } => match handle_config_cmd(action) {
+            Ok(s) => {
+                println!("{}", s);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("config error: {}", e);
+                ExitCode::from(2)
+            }
+        },
+    }
+}
+
+/// 迁移期 legacy 解析：未迁移子命令 + 裸 flag + REPL。行为与迁移前逐字一致。
+fn legacy_main(argv: &[String]) -> ExitCode {
+    let mut args_iter = argv.iter().peekable();
+    let first = args_iter.next();
+
+    // 子命令分派
+    match first.map(|s| s.as_str()) {
         Some("english") => {
-            let sub_args: Vec<String> = args_iter.collect();
+            let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
             return handle_english_cmd(&sub_args);
         }
         Some("debug") => {
-            let sub_args: Vec<String> = args_iter.collect();
+            let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
             return handle_debug_cmd(&sub_args);
         }
         Some("mine-lm") => {
@@ -371,13 +518,13 @@ fn main() -> ExitCode {
             let mut sub_args = args_iter.peekable();
             while let Some(arg) = sub_args.next() {
                 match arg.as_str() {
-                    "--dict" => dict_path = sub_args.next().map(PathBuf::from),
+                    "--dict" => dict_path = sub_args.next().map(|s| PathBuf::from(s)),
                     // jev 语义门控（#88）：准入候选先过 jev 判定再学库；
                     // 端点 = CLI 覆盖 > config.jev_endpoint；key = CLI > KIME_JEV_KEY
                     // 环境变量（凭据不落 config/词库/任何提交文件）
                     "--jev" => jev_enabled = true,
-                    "--jev-endpoint" => jev_endpoint = sub_args.next().map(String::from),
-                    "--jev-key" => jev_key = sub_args.next().map(String::from),
+                    "--jev-endpoint" => jev_endpoint = sub_args.next().cloned(),
+                    "--jev-key" => jev_key = sub_args.next().cloned(),
                     _ => {}
                 }
             }
@@ -438,25 +585,25 @@ fn main() -> ExitCode {
     // `Dict::import_english` 灌 `english`（原始按键串索引）。喂错表会污染中文候选。
     let mut import_english_paths: Vec<PathBuf> = Vec::new();
     let mut shuangpin: Option<Option<Scheme>> = None;
-    let mut args_iter = std::env::args().skip(1).peekable();
+    let mut args_iter = argv.iter().peekable();
 
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--dict" => {
-                dict_path = args_iter.next().map(PathBuf::from);
+                dict_path = args_iter.next().map(|s| PathBuf::from(s));
             }
             "--import" => {
-                if let Some(p) = args_iter.next().map(PathBuf::from) {
+                if let Some(p) = args_iter.next().map(|s| PathBuf::from(s)) {
                     import_paths.push(p);
                 }
             }
             "--import-english" => {
-                if let Some(p) = args_iter.next().map(PathBuf::from) {
+                if let Some(p) = args_iter.next().map(|s| PathBuf::from(s)) {
                     import_english_paths.push(p);
                 }
             }
             "--shuangpin" => {
-                let s = args_iter.next().unwrap_or_default();
+                let s = args_iter.next().cloned().unwrap_or_default();
                 shuangpin = Some(match s.as_str() {
                     "xiaohe" => Some(Scheme::Xiaohe),
                     "ziranma" => Some(Scheme::Ziranma),
@@ -473,8 +620,8 @@ fn main() -> ExitCode {
                 let mut out_path = None;
                 while let Some(sub_arg) = args_iter.next() {
                     match sub_arg.as_str() {
-                        "--in" => in_path = args_iter.next().map(PathBuf::from),
-                        "--out" => out_path = args_iter.next().map(PathBuf::from),
+                        "--in" => in_path = args_iter.next().map(|s| PathBuf::from(s)),
+                        "--out" => out_path = args_iter.next().map(|s| PathBuf::from(s)),
                         _ => {}
                     }
                 }
@@ -502,12 +649,6 @@ fn main() -> ExitCode {
                         return ExitCode::from(1);
                     }
                 }
-            }
-            "--help" => {
-                println!(
-                    "用法：\n  kime build-dict --in <sqlite> --out <bin>\n  kime config <list|get KEY|set KEY VALUE>\n  kime english [--dict <path>] <字母串>...（直查英文词表）\n  kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]（无头面板调试：逐键打印候选/模式，不启动 IME）\n  kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]（两个 --import 都可重复）\n  kime repl\n\n  配置字段: shuangpin(xiaohe|ziranma|none), page_size, candidate_limit"
-                );
-                return ExitCode::SUCCESS;
             }
             other => {
                 eprintln!("unknown arg: {other}");
