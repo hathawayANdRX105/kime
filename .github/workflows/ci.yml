@@ -50,6 +50,10 @@ jobs:
             libfontconfig1-dev \
             libxcb1-dev \
             pkg-config
+      # .cargo/config.toml 配了 rustc-wrapper = sccache，runner 上没装会直接失败
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets
   test:
@@ -67,6 +71,10 @@ jobs:
             libfontconfig1-dev \
             libxcb1-dev \
             pkg-config
+      # .cargo/config.toml 配了 rustc-wrapper = sccache，runner 上没装会直接失败
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - uses: Swatinem/rust-cache@v2
       - name: Run workspace tests
         # 全部测试均为离线（xkb 文本直喂、内存字典），无需 Wayland/X 显示。
@@ -89,6 +97,10 @@ jobs:
             libfontconfig1-dev \
             libxcb1-dev \
             pkg-config
+      # .cargo/config.toml 配了 rustc-wrapper = sccache，runner 上没装会直接失败
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: cargo build --release -p kime -p platform-wayland -p platform-x11
@@ -110,6 +122,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # .cargo/config.toml 配了 rustc-wrapper = sccache，runner 上没装会直接失败
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - uses: Swatinem/rust-cache@v2
       - name: Generate synthetic dict (100k unique pinyin/text pairs)
         run: |

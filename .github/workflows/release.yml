@@ -19,6 +19,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # .cargo/config.toml 配了 rustc-wrapper = sccache，runner 上没装会直接失败
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - uses: Swatinem/rust-cache@v2
 
       # platform-x11 需要 libxcb；platform-wayland 的 xkb 解码测试需要 libxkbcommon
