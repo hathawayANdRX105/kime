@@ -1,6 +1,6 @@
 # kime
 
-个人向 Rust 拼音/双拼输入法。Linux Wayland 优先（mangowm 实机验证），Windows/macOS 靠平台壳后补。
+个人向 Rust 拼音/双拼输入法：Wayland（input-method-v2）与 X11/XIM（XWayland 光标跟随，如微信）双前端；核心 = Word Lattice 整句联想（k-best + 种子先验）、上下文感知、用户调频、邻键纠错、小鹤/自然码双拼、AI 候选。
 
 ## 架构
 
@@ -24,7 +24,7 @@ platform-mac/         （规划中）macOS IMKit 壳
 - **邻键纠错（第七轮）**：直查候选不足时按编辑距离 1（QWERTY 邻键替换 + 相邻转位）重查，`xain`→「先/现/线」、`zhant`→zhang 词；纠错候选永远排在精确结果之后，`correction = false` 可关
 - **双拼半截键补全**：零声母半截键（y/w/元音，公共前缀塌缩为空）枚举完整音节、末音节匹配的词优先——ziranma `ke`+`y` → 「可以」类 ke'yi 词置顶，单键 `y` → yi 系词在前；有公共前缀的键（u→sh）行为不变
 
-### 上下文感知（第六轮）
+### 上下文感知
 - **surrounding_text 捕获**：input-method-v2 四事件（surrounding_text / text_change_cause / content_type / done）双缓冲批处理，done 才提交
 - **回声过滤**：`cause=INPUT_METHOD`（自己上屏）不推引擎，防自激循环
 - **种子先验**：上文末词经 `readings_of_text` 反查读音，作 lattice 虚拟起点参与联合概率（不进产出文本）
@@ -41,15 +41,20 @@ platform-mac/         （规划中）macOS IMKit 壳
 - **剪贴板候选**（M16）：`C-;` 呼出复制历史（会话级 64 条去重）+ deskctl 预设（`~/.config/deskctl/snippets/` 只读同源），j/k 选、Enter 上屏；内容不落日志，单条 4k 字符封顶
 - **已知边界**（详见 `todo/HANDOFF.md`）：`place_sentences`/engine 去重合并与 top_user 列表仍按裸 freq 比较（boost 不跨列、不入个性化列表）；常驻进程跨天不刷新 `today` 缓存 → 当晚 boost 少衰减 ≤1 天；升级前老用户词无使用计数（n 从 1 重计）
 
-## 性能指标（192 万词条实测）
+## 性能指标（93 万词条词库，2026-10-06 实测）
 
-| 指标 | SQLite 基线 (M1-M6) | 内存排序索引 (M6.5) | FST 二进制词库 (M7) |
+| 指标 | SQLite 基线 (M1-M6) | 内存排序索引 (M6.5) | FST 复合词库 (M7, 当前) |
 |---|---|---|---|
-| **词库内存** | 185MB (磁盘) | **228.8MB** (堆) | **41.7MB** (mmap，按需驻留) |
-| **词库载入** | 0.05s | 2.86s | **0.55s** |
+| **词库体积** | 137MB (sqlite 磁盘) | 228.8MB (堆) | **53.5MB** (dict.bin, mmap 按需驻留) |
+| **词库载入** | 0.05s | 2.86s | **0.303s** |
 | `ni'hao` 前缀查询 | 41.66ms | 0.007ms | **0.015ms** |
-| `shen'me` 前缀查询 | 32.54ms | 0.305ms | **0.438ms** |
-| `nh` 声母缩写查询 | ~20ms | 0.089ms | **0.0002ms** |
+| `shen'me` 前缀查询 | 32.54ms | 0.305ms | **0.215ms** |
+| `nh` 声母缩写查询 | ~20ms | 0.089ms | **0.065ms** |
+| 整句联想 Viterbi（18 音节） | — | — | **0.230ms** |
+| 引擎按键热路径（逐键 `Engine::key`） | — | — | **0.649ms/键** |
+
+当前列：本地无 CPU 限制全速跑 `cargo bench`（1 轮预热 + 5 轮取 median，release/fat LTO），
+词库 930,894 条（sqlite 137MB / FST 53.5MB）；M1-M6.5 列为历史里程碑基线。
 
 ## 快速开始
 
@@ -87,7 +92,7 @@ bench 为零依赖 `fn main`（`harness = false`）：预热 + 每指标 5 轮�
 ## 开发约定
 
 - **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；装二进制从 CI 的 `kime-binaries` artifact 下载到 `~/.local/bin/`）；本地唯一允许 `cargo bench`（套 `systemd-run --user --scope -p CPUQuota=70% --`）
-- 测试放 `tests/` 目录；src 内新增 `#[cfg(test)]` 严禁（githook 增量强制）；仅依赖私有数据的白盒不变量测试（码表不变式 / 内存索引一致性，模块头注明理由）可留在 src
+- 测试放 `tests/` 目录；src 内 `#[cfg(test)]` 严禁（githook 增量强制）
 - 依赖单向：`bin/kime -> platform-wayland -> kime-core -> kime-shuangpin -> kime-pinyin`
 - core 不碰任何显示/UI；壳只做「按键进、候选出、上屏提交」
 
