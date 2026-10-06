@@ -5,8 +5,9 @@
 
 use kime_pinyin::Reading;
 
-mod xiaohe;
-mod ziranma;
+// 码表模块公开，供 tests 数据不变式测试与词表工具对表；生产入口仍是 Table::new。
+pub mod xiaohe;
+pub mod ziranma;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
