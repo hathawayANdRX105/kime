@@ -38,9 +38,6 @@
 //! 撞键排除：`lo`（啰）——rime algebra 把 lo 与 luo 都派生成键 `lo`，本表一键一音节，
 //! `lo` 键让给常用字所在的 luo；lo 音节在双拼下退全拼兜底。fixture 同步注明。
 
-#[cfg(test)]
-use kime_pinyin::Reading;
-
 pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("a", *b"aa"),
     ("ang", *b"ah"),
@@ -496,31 +493,8 @@ pub(crate) fn decode(a: u8, b: u8) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-/// 把整串双拼键切成音节序列。长度非偶数 / 任何一对不合法 → `Err`。
-pub(crate) fn to_syllables(keys: &str) -> Result<Reading, String> {
-    if keys.len() % 2 != 0 {
-        return Err(format!("odd key length: {}", keys.len()));
-    }
-    let bytes = keys.as_bytes();
-    if !bytes.iter().all(|b| b.is_ascii_lowercase()) {
-        return Err("non a-z key".into());
-    }
-    let mut out = Reading::with_capacity(keys.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        match decode(pair[0], pair[1]) {
-            Some(s) => out.push(s.to_string()),
-            None => {
-                return Err(format!(
-                    "bad key pair: {}{}",
-                    pair[0] as char, pair[1] as char
-                ))
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
+// 码表数据不变式（round-trip / 键对唯一 / 26×26 密度）依赖私有 TABLE/encode/decode，
+// 白盒测试无法经公共 API 触达，故留 src；行为测试在 tests/ziranma.rs。
 mod tests {
     use super::*;
 
@@ -572,27 +546,5 @@ mod tests {
             }
         }
         assert_eq!(hits, TABLE.len());
-    }
-
-    /// 自然码里 "hao" 的末键是 k（不是 c），所以 "nihao" = "nihk"。
-    /// ponytail: 任务原例 `nihk→[ni,hao]` 实际上配的是自然码，小鹤是 "nihc"。
-    #[test]
-    fn nihao_ziranma() {
-        assert_eq!(to_syllables("nihk").unwrap(), vec!["ni", "hao"]);
-    }
-
-    #[test]
-    fn odd_length_err() {
-        // 单字符 / 3 字符：非偶数 → Err；空串 0%2=0 视为「无输入」不报错。
-        assert!(to_syllables("n").is_err());
-        assert!(to_syllables("nih").is_err());
-    }
-
-    #[test]
-    fn invalid_key_err() {
-        // "ab" 不在表里
-        assert!(to_syllables("ab").is_err());
-        // 大写不允许
-        assert!(to_syllables("Ni").is_err());
     }
 }
