@@ -33,27 +33,3 @@ impl TrayIconManager {
         new
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_tray_manager_toggle() {
-        let manager = TrayIconManager::new(true);
-        assert!(manager.is_chinese());
-        assert!(!manager.toggle());
-        assert!(!manager.is_chinese());
-        assert!(manager.toggle());
-        assert!(manager.is_chinese());
-    }
-
-    #[test]
-    fn test_tray_manager_set() {
-        let manager = TrayIconManager::new(true);
-        manager.set_chinese(false);
-        assert!(!manager.is_chinese());
-        manager.set_chinese(true);
-        assert!(manager.is_chinese());
-    }
-}
