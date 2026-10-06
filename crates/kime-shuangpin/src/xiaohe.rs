@@ -40,7 +40,7 @@
 /// 把 415 音节里属于本方案的「音节→键对」从 rime algebra 机械展开出来。
 /// 编码 = `声母键 + 韵母键`；零声母单韵母双写（如 `a→aa`）。
 
-pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
+pub const TABLE: &[(&str, [u8; 2])] = &[
     ("a", *b"aa"),
     ("ao", *b"ac"),
     ("ai", *b"ad"),
@@ -468,16 +468,16 @@ pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("zou", *b"zz"),
 ];
 
-#[cfg(test)]
 /// 415 音节 → 2 字节键。返回 `None` 表示非本方案可表示音节或编码冲突（lo 除外）。
-pub(crate) fn encode(syll: &str) -> Option<[u8; 2]> {
+/// 测试/词表工具对表用；生产路径只走 decode。
+pub fn encode(syll: &str) -> Option<[u8; 2]> {
     // ponytail: linear scan over 425 entries is faster than the binary search
     // we'd need if we kept two sort orders; the hot path here is decode, not encode.
     TABLE.iter().find(|&&(k, _)| k == syll).map(|&(_, v)| v)
 }
 
 /// 反向查表：键对 → 音节。`(a, b)` 必须都是小写 a-z；其它（含 `Err` 哨兵）→ `None`。
-pub(crate) fn decode(a: u8, b: u8) -> Option<&'static str> {
+pub fn decode(a: u8, b: u8) -> Option<&'static str> {
     if !a.is_ascii_lowercase() || !b.is_ascii_lowercase() {
         return None;
     }
@@ -493,63 +493,4 @@ pub(crate) fn decode(a: u8, b: u8) -> Option<&'static str> {
         }
     }
     None
-}
-
-#[cfg(test)]
-// 码表数据不变式（round-trip / 键对唯一 / 26×26 密度）依赖私有 TABLE/encode/decode，
-// 白盒测试无法经公共 API 触达，故留 src；行为测试在 tests/xiaohe.rs。
-mod tests {
-    use super::*;
-    /// 全表 round-trip：每个键（含别名键）解回本音节；encode() 取表内首键（规范码），
-    /// 对每个音节 编码→解码→编码 必须稳定。
-    #[test]
-    fn round_trip_all() {
-        for &(syl, key) in TABLE {
-            assert_eq!(decode(key[0], key[1]), Some(syl), "decode({key:?})");
-        }
-        // 同一音节的多行（rime derive 别名）键互不相同，首行为规范码
-        let mut seen = std::collections::HashSet::new();
-        for &(syl, key) in TABLE {
-            if !seen.insert(syl) {
-                continue;
-            }
-            assert_eq!(encode(syl), Some(key), "encode({syl}) 应为表内首键");
-            let decoded = decode(key[0], key[1]).unwrap();
-            assert_eq!(
-                encode(decoded),
-                Some(key),
-                "encode∘decode({syl}) round-trip"
-            );
-        }
-        assert_eq!(
-            seen.len(),
-            415,
-            "音节数应为 415（425 行 = 415 音节 + 10 别名；lo 与 luo 撞键未收录）"
-        );
-    }
-
-    /// 解码唯一性：任何两行不共享同一键对（别名是同一音节的不同键，不违反此断言；
-    /// 二分查找的正确性依赖键互异）。
-    #[test]
-    fn decode_unique() {
-        for i in 0..TABLE.len() {
-            for j in (i + 1)..TABLE.len() {
-                assert_ne!(TABLE[i].1, TABLE[j].1, "{} and {}", TABLE[i].0, TABLE[j].0);
-            }
-        }
-    }
-
-    /// 解码密度：26×26 全表扫描，命中数应 = TABLE.len()。
-    #[test]
-    fn decode_density() {
-        let mut hits = 0;
-        for a in b'a'..=b'z' {
-            for b in b'a'..=b'z' {
-                if decode(a, b).is_some() {
-                    hits += 1;
-                }
-            }
-        }
-        assert_eq!(hits, TABLE.len());
-    }
 }

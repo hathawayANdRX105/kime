@@ -691,6 +691,11 @@ impl Dict {
         self.store.is_some()
     }
 
+    /// 内存排序索引只读视图（诊断/测试用）。
+    pub fn index(&self) -> &[IndexEntry] {
+        &self.index
+    }
+
     fn query_total_freq(conn: &Connection) -> u64 {
         // rusqlite 不为 u64 实现 FromSql，SUM 只能按 i64 取
         conn.query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
@@ -1469,101 +1474,5 @@ impl Dict {
             .and_then(|m| m.get(c.pinyin.as_str()))
             .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
             .unwrap_or(0)
-    }
-}
-
-/// 白盒不变量测试：读私有字段 `index`（内存序 / sqlite 双写一致性），
-/// 集成测试无法触达，故留 src。
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn tmp_db(suffix: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "kime_dict_lp_{}_{}_{}.sqlite",
-            suffix,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_file(&path);
-        path
-    }
-
-    fn seed_yaml(content: &str) -> std::path::PathBuf {
-        let yaml = std::env::temp_dir().join(format!(
-            "kime_dict_yaml_{}_{}.yaml",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&yaml, content).unwrap();
-        yaml
-    }
-
-    #[test]
-    fn import_rebuild_keeps_order() {
-        let db = tmp_db("import");
-        let yaml = seed_yaml("...\nZ\tZ\t100\nA\tA\t200\n");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        let sorted = d
-            .index
-            .iter()
-            .map(|e| (e.pinyin.clone(), e.freq))
-            .collect::<Vec<_>>();
-        assert_eq!(sorted[0], ("A".to_string(), 200));
-        assert_eq!(sorted[1], ("Z".to_string(), 100));
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn memory_vs_sql_consistency() {
-        let db = tmp_db("consistency");
-        let yaml = seed_yaml("...\n你好\tni hao\t5\n泥猴\tni hou\t3\n");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
-        d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
-        d.learn(&["ni".into(), "hou".into()], "泥猴").unwrap();
-        let conn2 = Connection::open(&db).unwrap();
-        let mut stmt = conn2
-            .prepare(
-                "SELECT text, pinyin, freq FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC",
-            )
-            .unwrap();
-        let sql_rows: Vec<_> = stmt
-            .query_map(params![], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let mem_rows: Vec<_> = d
-            .index
-            .iter()
-            .map(|e| (e.text.clone(), e.pinyin.clone(), e.freq))
-            .collect();
-        assert_eq!(sql_rows.len(), mem_rows.len());
-        for ((sql_text, sql_pinyin, sql_freq), (mem_text, mem_pinyin, mem_freq)) in
-            sql_rows.iter().zip(mem_rows.iter())
-        {
-            assert_eq!(sql_text, mem_text);
-            assert_eq!(sql_pinyin, mem_pinyin);
-            assert_eq!(sql_freq, mem_freq);
-        }
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
     }
 }
