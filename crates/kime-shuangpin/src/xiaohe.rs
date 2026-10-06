@@ -39,8 +39,6 @@
 
 /// 把 415 音节里属于本方案的「音节→键对」从 rime algebra 机械展开出来。
 /// 编码 = `声母键 + 韵母键`；零声母单韵母双写（如 `a→aa`）。
-#[cfg(test)]
-use kime_pinyin::Reading;
 
 pub(crate) const TABLE: &[(&str, [u8; 2])] = &[
     ("a", *b"aa"),
@@ -498,31 +496,8 @@ pub(crate) fn decode(a: u8, b: u8) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-/// 把整串双拼键切成音节序列。长度非偶数 / 任何一对不合法 → `Err`。
-pub(crate) fn to_syllables(keys: &str) -> Result<Reading, String> {
-    if keys.len() % 2 != 0 {
-        return Err(format!("odd key length: {}", keys.len()));
-    }
-    let bytes = keys.as_bytes();
-    if !bytes.iter().all(|b| b.is_ascii_lowercase()) {
-        return Err("non a-z key".into());
-    }
-    let mut out = Reading::with_capacity(keys.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        match decode(pair[0], pair[1]) {
-            Some(s) => out.push(s.to_string()),
-            None => {
-                return Err(format!(
-                    "bad key pair: {}{}",
-                    pair[0] as char, pair[1] as char
-                ))
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
+// 码表数据不变式（round-trip / 键对唯一 / 26×26 密度）依赖私有 TABLE/encode/decode，
+// 白盒测试无法经公共 API 触达，故留 src；行为测试在 tests/xiaohe.rs。
 mod tests {
     use super::*;
     /// 全表 round-trip：每个键（含别名键）解回本音节；encode() 取表内首键（规范码），
@@ -576,27 +551,5 @@ mod tests {
             }
         }
         assert_eq!(hits, TABLE.len());
-    }
-
-    /// 任务里给的典型示例：标准小鹤 `nihc` → `["ni","hao"]`。
-    /// ponytail: 任务原文写成 `nihk`，那是 typo（k 是 ing 不是 ao）。
-    #[test]
-    fn nihao_xiaohe() {
-        assert_eq!(to_syllables("nihc").unwrap(), vec!["ni", "hao"]);
-    }
-
-    #[test]
-    fn odd_length_err() {
-        // 单字符 / 3 字符：非偶数 → Err；空串 0%2=0 视为「无输入」不报错。
-        assert!(to_syllables("n").is_err());
-        assert!(to_syllables("nih").is_err());
-    }
-
-    #[test]
-    fn invalid_key_err() {
-        // "ab" 不在表里（a 后面跟 b 不是任何合法音节键对）
-        assert!(to_syllables("ab").is_err());
-        // 大写不允许
-        assert!(to_syllables("Ni").is_err());
     }
 }

@@ -686,6 +686,11 @@ impl Dict {
         self.total_freq
     }
 
+    /// 是否挂载了 FST 复合层（诊断/测试用）。
+    pub fn has_fst_store(&self) -> bool {
+        self.store.is_some()
+    }
+
     fn query_total_freq(conn: &Connection) -> u64 {
         // rusqlite 不为 u64 实现 FromSql，SUM 只能按 i64 取
         conn.query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
@@ -1467,6 +1472,8 @@ impl Dict {
     }
 }
 
+/// 白盒不变量测试：读私有字段 `index`（内存序 / sqlite 双写一致性），
+/// 集成测试无法触达，故留 src。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1498,105 +1505,6 @@ mod tests {
         ));
         fs::write(&yaml, content).unwrap();
         yaml
-    }
-
-    /// `lookup` 是精确查询：只返回该读音自己的词。
-    /// （曾用 `lookup_prefix(.., "", ..)` 实现，那是前缀区间，见
-    /// `tests/lookup_exact_test.rs`。）
-    #[test]
-    fn lookup_returns_only_the_exact_reading() {
-        let yaml = seed_yaml("...\n你好\tni hao\t5000\n我们\two men\t4000\n");
-        let db = tmp_db("seed");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        let exact = d.lookup(&["ni".into(), "hao".into()], 10).unwrap();
-        assert_eq!(exact.len(), 1, "另一读音的词不应混入");
-        assert_eq!(exact[0].text, "你好");
-        assert_eq!(exact[0].pinyin, "ni'hao");
-        assert_eq!(exact[0].freq, 5000);
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn lookup_prefix_partial_tail_returns_prefix_matches() {
-        let yaml = seed_yaml("...\n你好\tni hao\t5000\n泥猴\tni hou\t100\n");
-        let db = tmp_db("seed");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        let hits = d.lookup_prefix(&["ni".into()], "h", 10).unwrap();
-        let texts: Vec<&str> = hits.iter().map(|c| c.text.as_str()).collect();
-        assert!(texts.contains(&"你好"));
-        assert!(texts.contains(&"泥猴"));
-        let hits2 = d.lookup_prefix(&["ni".into()], "ha", 10).unwrap();
-        assert_eq!(hits2.len(), 1);
-        assert_eq!(hits2[0].text, "你好");
-        let hits3 = d.lookup_prefix(&["ni".into()], "z", 10).unwrap();
-        assert!(hits3.is_empty());
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn lookup_prefix_respects_limit() {
-        let yaml = seed_yaml("...\nA\tha\t50\nB\tha\t40\nC\tha\t30\n");
-        let db = tmp_db("seed");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        let all = d.lookup_prefix(&["ha".into()], "", 10).unwrap();
-        assert_eq!(all.len(), 3);
-        let two = d.lookup_prefix(&["ha".into()], "", 2).unwrap();
-        assert_eq!(two.len(), 2);
-        assert_eq!(two[0].text, "A");
-        assert_eq!(two[1].text, "B");
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn lookup_abbrev_prefix() {
-        let yaml = seed_yaml("...\n你好\tni hao\t5000\nabc\tABC\t100\n");
-        let db = tmp_db("seed");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        let nh = d.lookup_abbrev("nh", 10).unwrap();
-        assert_eq!(nh.len(), 1);
-        assert_eq!(nh[0].text, "你好");
-        let a = d.lookup_abbrev("a", 10).unwrap();
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].text, "abc");
-        let z = d.lookup_abbrev("z", 10).unwrap();
-        assert!(z.is_empty());
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn top_user_works() {
-        let yaml = seed_yaml("...\n你好\tni hao\t5000\n");
-        let db = tmp_db("seed");
-        let mut d = Dict::open(&db).unwrap();
-        d.import(&yaml).unwrap();
-        d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
-        d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
-        let top = d.top_user(5).unwrap();
-        assert_eq!(top.len(), 1);
-        assert_eq!(top[0].text, "你好");
-        assert_eq!(top[0].freq, 5002);
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn learn_immediate_reflection() {
-        let db = tmp_db("learn");
-        let mut d = Dict::open(&db).unwrap();
-        d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
-        let cand = d.lookup(&["ni".into(), "hao".into()], 1).unwrap();
-        assert_eq!(cand.len(), 1);
-        assert_eq!(cand[0].text, "你好");
-        assert_eq!(cand[0].freq, 1);
-        let _ = fs::remove_file(&db);
     }
 
     #[test]
@@ -1657,48 +1565,5 @@ mod tests {
         }
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(&yaml);
-    }
-
-    #[test]
-    fn test_fst_store_composite_overlay() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("dict.sqlite3");
-        let bin_path = dir.path().join("dict.bin");
-        let yaml_path = dir.path().join("test.yaml");
-
-        // 1. 初始化 SQLite 词库并导入基础数据
-        fs::write(&yaml_path, "...\n你好\tni hao\t100\n拟好\tni hao\t50\n").unwrap();
-        let mut seed_dict = Dict::open(&db_path).unwrap();
-        seed_dict.import(&yaml_path).unwrap();
-        drop(seed_dict);
-
-        // 2. 编译出 dict.bin
-        let count = crate::builder::build(&db_path, &bin_path).unwrap();
-        assert_eq!(count, 2);
-
-        // 3. 打开复合 Dict，此时应该自动发现并挂载 FST
-        let mut dict = Dict::open(&db_path).unwrap();
-        assert!(dict.store.is_some(), "应当成功加载 FST store");
-
-        // 初始查询：你好 (100) > 拟好 (50)
-        let init_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
-        assert_eq!(init_hits.len(), 2);
-        assert_eq!(init_hits[0].text, "你好");
-
-        // 4. 用户学习：将拟好调频到高频，并新增未录入生词“妮好”
-        for _ in 0..200 {
-            dict.learn(&["ni".into(), "hao".into()], "拟好").unwrap();
-        }
-        dict.learn(&["ni".into(), "hao".into()], "妮好").unwrap();
-
-        // 5. 复合查询：拟好被用户高频置顶，妮好被作为新词查出
-        let updated_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
-        assert_eq!(updated_hits.len(), 3);
-        assert_eq!(updated_hits[0].text, "拟好");
-        assert!(updated_hits.iter().any(|c| c.text == "妮好"));
-
-        // 6. lookup 精确查询也支持覆盖
-        let exact = dict.lookup(&["ni".into(), "hao".into()], 10).unwrap();
-        assert_eq!(exact[0].text, "拟好");
     }
 }

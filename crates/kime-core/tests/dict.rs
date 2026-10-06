@@ -319,3 +319,135 @@ fn dict_lookup_abbrev_empty_or_non_a_z_returns_empty() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn lookup_prefix_partial_tail_returns_prefix_matches() {
+    let path = tmp_db_path("seed");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+
+    let dir = std::env::temp_dir();
+    let yaml = dir.join(format!(
+        "kime_dict_seed_{}_{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&yaml, "...\n你好\tni hao\t5000\n泥猴\tni hou\t100\n").unwrap();
+    d.import(&yaml).expect("import");
+
+    let hits = d.lookup_prefix(&["ni".into()], "h", 10).unwrap();
+    let texts: Vec<&str> = hits.iter().map(|c| c.text.as_str()).collect();
+    assert!(texts.contains(&"你好"));
+    assert!(texts.contains(&"泥猴"));
+    let hits2 = d.lookup_prefix(&["ni".into()], "ha", 10).unwrap();
+    assert_eq!(hits2.len(), 1);
+    assert_eq!(hits2[0].text, "你好");
+    let hits3 = d.lookup_prefix(&["ni".into()], "z", 10).unwrap();
+    assert!(hits3.is_empty());
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&yaml);
+}
+
+#[test]
+fn lookup_prefix_respects_limit() {
+    let path = tmp_db_path("seed");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+
+    let dir = std::env::temp_dir();
+    let yaml = dir.join(format!(
+        "kime_dict_seed_{}_{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&yaml, "...\nA\tha\t50\nB\tha\t40\nC\tha\t30\n").unwrap();
+    d.import(&yaml).expect("import");
+
+    let all = d.lookup_prefix(&["ha".into()], "", 10).unwrap();
+    assert_eq!(all.len(), 3);
+    let two = d.lookup_prefix(&["ha".into()], "", 2).unwrap();
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].text, "A");
+    assert_eq!(two[1].text, "B");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&yaml);
+}
+
+#[test]
+fn lookup_abbrev_prefix() {
+    let path = tmp_db_path("seed");
+    let _ = fs::remove_file(&path);
+    let mut d = Dict::open(&path).unwrap();
+
+    let dir = std::env::temp_dir();
+    let yaml = dir.join(format!(
+        "kime_dict_seed_{}_{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&yaml, "...\n你好\tni hao\t5000\nabc\tABC\t100\n").unwrap();
+    d.import(&yaml).expect("import");
+
+    let nh = d.lookup_abbrev("nh", 10).unwrap();
+    assert_eq!(nh.len(), 1);
+    assert_eq!(nh[0].text, "你好");
+    let a = d.lookup_abbrev("a", 10).unwrap();
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].text, "abc");
+    let z = d.lookup_abbrev("z", 10).unwrap();
+    assert!(z.is_empty());
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&yaml);
+}
+
+#[test]
+fn test_fst_store_composite_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("dict.sqlite3");
+    let bin_path = dir.path().join("dict.bin");
+    let yaml_path = dir.path().join("test.yaml");
+
+    // 1. 初始化 SQLite 词库并导入基础数据
+    fs::write(&yaml_path, "...\n你好\tni hao\t100\n拟好\tni hao\t50\n").unwrap();
+    let mut seed_dict = Dict::open(&db_path).unwrap();
+    seed_dict.import(&yaml_path).unwrap();
+    drop(seed_dict);
+
+    // 2. 编译出 dict.bin
+    let count = kime_core::builder::build(&db_path, &bin_path).unwrap();
+    assert_eq!(count, 2);
+
+    // 3. 打开复合 Dict，此时应该自动发现并挂载 FST
+    let mut dict = Dict::open(&db_path).unwrap();
+    assert!(dict.has_fst_store(), "应当成功加载 FST store");
+
+    // 初始查询：你好 (100) > 拟好 (50)
+    let init_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
+    assert_eq!(init_hits.len(), 2);
+    assert_eq!(init_hits[0].text, "你好");
+
+    // 4. 用户学习：将拟好调频到高频，并新增未录入生词“妮好”
+    for _ in 0..200 {
+        dict.learn(&["ni".into(), "hao".into()], "拟好").unwrap();
+    }
+    dict.learn(&["ni".into(), "hao".into()], "妮好").unwrap();
+
+    // 5. 复合查询：拟好被用户高频置顶，妮好被作为新词查出
+    let updated_hits = dict.lookup_prefix(&["ni".into()], "hao", 10).unwrap();
+    assert_eq!(updated_hits.len(), 3);
+    assert_eq!(updated_hits[0].text, "拟好");
+    assert!(updated_hits.iter().any(|c| c.text == "妮好"));
+
+    // 6. lookup 精确查询也支持覆盖
+    let exact = dict.lookup(&["ni".into(), "hao".into()], 10).unwrap();
+    assert_eq!(exact[0].text, "拟好");
+}
