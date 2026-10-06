@@ -7,12 +7,13 @@
 ```
 bin/kime/             CLI 入口（REPL、词库编译）
 crates/kime-core/     引擎核心：状态机、持久化、FST/内存索引、上下文通道
-crates/kime-pinyin/   纯拼音音节切分（404 音节表，零依赖）
+crates/kime-pinyin/   纯拼音音节切分（416 音节表，零依赖）
 crates/kime-shuangpin/双拼码表（小鹤/自然码，纯查表）
+crates/kime-render/   候选窗渲染共享内核（cosmic-text 排版/光栅，双平台前端共用）
 crates/platform-wayland/ input-method-v2 客户端 + input-popup 候选窗（进程内渲染）
+crates/platform-x11/  XIM 协议前端（X11/XWayland 光标跟随，如微信）
 platform-win/         （规划中）Windows TSF 壳
 platform-mac/         （规划中）macOS IMKit 壳
-```
 
 ## 功能
 
@@ -74,15 +75,19 @@ kime-switch fcitx   # 切回 fcitx5
 kime-switch status
 ```
 
-### 4. 运行性能基准测试（本地唯一允许的 cargo，套 cpulimit）
+### 4. 运行性能基准测试（本地唯一允许的 cargo，套 CPU 配额）
 ```bash
-cpulimit -l 65 -i -- cargo bench --bench kime_bench
+systemd-run --user --scope -p CPUQuota=70% -- cargo bench --bench kime_bench
 ```
+
+bench 为零依赖 `fn main`（`harness = false`）：预热 + 每指标 5 轮独立计时取 best/median，
+覆盖词库载入、前缀/缩写查询、FST、Viterbi 整句与引擎按键热路径（`Engine::key`）；
+可用 `KIME_BENCH_DB` / `KIME_BENCH_BIN` 指向其它词库。
 
 ## 开发约定
 
-- **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；装二进制从 CI 的 `kime-binaries` artifact 下载到 `~/.local/bin/`）；本地唯一允许 `cargo bench`（套 `cpulimit -l 65 -i --`）
-- 测试放 `tests/` 目录，src 内严禁 `#[cfg(test)]`（githook 强制）
+- **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；装二进制从 CI 的 `kime-binaries` artifact 下载到 `~/.local/bin/`）；本地唯一允许 `cargo bench`（套 `systemd-run --user --scope -p CPUQuota=70% --`）
+- 测试放 `tests/` 目录；src 内新增 `#[cfg(test)]` 严禁（githook 增量强制）；仅依赖私有数据的白盒不变量测试（码表不变式 / 内存索引一致性，模块头注明理由）可留在 src
 - 依赖单向：`bin/kime -> platform-wayland -> kime-core -> kime-shuangpin -> kime-pinyin`
 - core 不碰任何显示/UI；壳只做「按键进、候选出、上屏提交」
 
