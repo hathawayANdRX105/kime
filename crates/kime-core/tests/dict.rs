@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use kime_core::dict::Dict;
 
+use rusqlite::{params, Connection};
+
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -450,4 +452,82 @@ fn test_fst_store_composite_overlay() {
     // 6. lookup 精确查询也支持覆盖
     let exact = dict.lookup(&["ni".into(), "hao".into()], 10).unwrap();
     assert_eq!(exact[0].text, "拟好");
+}
+
+#[test]
+fn dict_import_rebuild_keeps_order() {
+    let db = tmp_db_path("import_rebuild");
+    let _ = fs::remove_file(&db);
+    let dir = std::env::temp_dir();
+    let yaml = dir.join(format!(
+        "kime_dict_import_rebuild_{}_{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&yaml, "...\nZ\tZ\t100\nA\tA\t200\n").unwrap();
+    let mut d = Dict::open(&db).unwrap();
+    d.import(&yaml).unwrap();
+    let sorted = d
+        .index()
+        .iter()
+        .map(|e| (e.pinyin.clone(), e.freq))
+        .collect::<Vec<_>>();
+    assert_eq!(sorted[0], ("A".to_string(), 200));
+    assert_eq!(sorted[1], ("Z".to_string(), 100));
+    let _ = fs::remove_file(&db);
+    let _ = fs::remove_file(&yaml);
+}
+
+#[test]
+fn dict_memory_vs_sql_consistency() {
+    let db = tmp_db_path("consistency");
+    let _ = fs::remove_file(&db);
+    let dir = std::env::temp_dir();
+    let yaml = dir.join(format!(
+        "kime_dict_consistency_{}_{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&yaml, "...\n你好\tni hao\t5\n泥猴\tni hou\t3\n").unwrap();
+    let mut d = Dict::open(&db).unwrap();
+    d.import(&yaml).unwrap();
+    d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
+    d.learn(&["ni".into(), "hao".into()], "你好").unwrap();
+    d.learn(&["ni".into(), "hou".into()], "泥猴").unwrap();
+    let conn2 = Connection::open(&db).unwrap();
+    let mut stmt = conn2
+        .prepare("SELECT text, pinyin, freq FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC")
+        .unwrap();
+    let sql_rows: Vec<_> = stmt
+        .query_map(params![], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mem_rows: Vec<_> = d
+        .index()
+        .iter()
+        .map(|e| (e.text.clone(), e.pinyin.clone(), e.freq))
+        .collect();
+    assert_eq!(sql_rows.len(), mem_rows.len());
+    for ((sql_text, sql_pinyin, sql_freq), (mem_text, mem_pinyin, mem_freq)) in
+        sql_rows.iter().zip(mem_rows.iter())
+    {
+        assert_eq!(sql_text, mem_text);
+        assert_eq!(sql_pinyin, mem_pinyin);
+        assert_eq!(sql_freq, mem_freq);
+    }
+    let _ = fs::remove_file(&db);
+    let _ = fs::remove_file(&yaml);
 }
