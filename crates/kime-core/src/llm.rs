@@ -48,6 +48,11 @@ impl LlmClient {
         }
     }
 
+    /// 构建时指定的模型名（诊断/测试用）。
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// 设置 API key（每次请求带 `Authorization: Bearer` 头）；None = 无鉴权头。
     /// jev 门控的 key 只从 CLI `--jev-key` / KIME_JEV_KEY 传入，不落 config。
     pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
@@ -146,8 +151,8 @@ fn build_prompt(syllables: &[String], context: Option<&str>) -> String {
         ),
     }
 }
-/// 解析 LLM 返回的文本为候选列表
-fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
+/// 解析 LLM 响应文本为候选：逐行读文本，跳过空行，最多收前 3 行（超出截断）。
+pub fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| Candidate {
@@ -186,37 +191,5 @@ impl Debouncer {
                 true
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_llm_client_new() {
-        let client = LlmClient::new(
-            "http://localhost:3000/v1/chat/completions".to_string(),
-            "test-model".to_string(),
-        );
-        assert_eq!(client.model, "test-model");
-    }
-
-    #[test]
-    fn test_parse_candidates() {
-        let text = "第一行\n第二行\n第三行\n第四行";
-        let candidates = parse_candidates(text, &["test".to_string()]);
-        assert_eq!(candidates.len(), 3); // take(3)
-        assert_eq!(candidates[0].text, "第一行");
-        assert!(candidates[0].ai);
-        assert_eq!(candidates[0].freq, 1);
-    }
-
-    #[tokio::test]
-    async fn test_debouncer_async() {
-        let d = Debouncer::new(std::time::Duration::from_millis(200));
-        assert!(d.should_fire().await);
-        // 200ms 内不应再触发
-        assert!(!d.should_fire().await);
     }
 }
