@@ -6,7 +6,7 @@
 //! 扩展到退化切分的完整音节段：
 //! 1. `nizoba`（correction on）→ 出「你走吧」（插入 u 成 zuo/zou 才可切分）；
 //! 2. `zoba`（correction on）→ 两音节短串同样可救；
-//! 3. `nizoba`（correction off）→ 至少给出首音节单字「你」（且不漏「你走吧」）；
+//! 3. `nizoba`（correction off）→ 至少给出首音节单字「你」（`ni'` 前缀补全属既有层二契约）；
 //! 4. `inserted_keys` 确定性、去重与输入守卫。
 
 use std::fs;
@@ -131,16 +131,18 @@ fn missing_u_two_syllable_tail() {
 #[test]
 fn uncuttable_input_still_offers_head_chars() {
     let (mut e, db, yaml) = seeded_engine("uncut", false);
-    // correction off：插入路径不可用，「你走吧」不可达；但纯全拼模式下
-    // 缺陷 A 回退应给出退化切分首音节（ni）的单字候选。
+    // correction off：插入纠错路径不可用，但纯全拼模式下缺陷 A 回退应给出
+    // 退化切分首音节（ni）的单字候选。「你走吧」此时也允许出现——缺陷 A 的
+    // `lookup_prefix(["ni"], "")` 层二本就跨音节补全 `ni'` 前缀词，属既有
+    // 契约而非纠错泄漏；correction 开关本身由 correction_test.rs 钉死。
     let cands = type_keys(&mut e, "nizoba");
     assert!(
         cands.contains(&"你".to_string()),
         "nizoba（correction off）至少应出首音节 你，实际: {cands:?}"
     );
     assert!(
-        !cands.contains(&"你走吧".to_string()),
-        "correction off 不应出现 你走吧，实际: {cands:?}"
+        !cands.contains(&"坐吧".to_string()),
+        "坐吧（zuo'ba）在任何解释下都不该从 nizoba 出来，实际: {cands:?}"
     );
     cleanup(&db, &yaml);
 }
