@@ -1193,7 +1193,7 @@ impl Engine {
             }
         }
         // 邻键纠错：直查（主路径/模糊/多切分）候选不足时，对按键串生成编辑距离 1
-        // 变体（邻键替换 + 相邻转位）重查。变体复用整条现有管线（segment →
+        // 变体（邻键替换 + 相邻转位 + 单字母插入）重查。变体复用整条现有管线（segment →
         // lookup_prefix）；纠错候选续在精确结果之后（seen_at 去重，不抢精确的位）。
         // correction=false 或候选充足时零开销。放在 abbrev 兜底之前：先纠错、
         // 纠不中再落缩写垃圾。
@@ -1207,7 +1207,11 @@ impl Engine {
             let mut corrected_seen: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             let baseline = segs.first().cloned().unwrap_or_default();
-            for fixed in crate::correction::corrected_keys(&self.letters) {
+            let mut variants = crate::correction::corrected_keys(&self.letters);
+            // 替换/转位在前、缺字母插入在后：插入是更大偏离，纠错候选
+            // 名次靠后（两 vec 合成一个再进循环，循环体不变）
+            variants.extend(crate::correction::inserted_keys(&self.letters));
+            for fixed in variants {
                 // 廉价预筛（qingjian 同款）：变体绝大多数仍是非法串，先用零分配
                 // 可达性 DP 挡掉，幸存的极少数才进完整 segment + lookup。
                 if !kime_pinyin::is_fully_segmentable(&fixed) {
@@ -1275,9 +1279,24 @@ impl Engine {
             Self::place_sentences(&mut cands, sentences, &joined);
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
-        // 用**整串的首切分**音节序列（= 用户敲出的完整读音），无完整切分则无回退空间。
+        // 用**整串的首切分**音节序列（= 用户敲出的完整读音）。segs 为空时
+        // （整串切不出，如 "nizoba" 的 `zo` 非合法音节），纯全拼模式
+        // （fallback_sentences=true）退回退化切分的完整音节段 `reading`，
+        // 至少给用户首音节单字候选（"ni"）。仅 fallback_sentences=true 时
+        // 扩展：双拼分支的「查无词全拼重试」（fallback_sentences=false）里，
+        // 该回退会让全拼解释在双拼半截键场景（aaj）抢答——选词消耗从
+        // 2 键/音节 错变 1 键/字母，顶掉正确的双拼解释（同上方 Viterbi
+        // 回退注释的消费语义约束）。
         if cands.is_empty() {
-            if let Some(fb) = segs.first().and_then(|f| self.longest_prefix_candidates(f)) {
+            let src = segs.first().cloned().or_else(|| {
+                fallback_sentences
+                    .then(|| reading.clone())
+                    .filter(|r| !r.is_empty())
+            });
+            if let Some(fb) = src
+                .as_deref()
+                .and_then(|s| self.longest_prefix_candidates(s))
+            {
                 cands = fb;
             }
         }
