@@ -35,6 +35,7 @@ fn tmp_db(suffix: &str) -> PathBuf {
 /// 词库种子（真实词库频率，拼音空格分隔音节）：ni / zou / zuo / ba 单字
 /// + 两音节、三音节组合词，缺字母插入与缺陷 A 回退各有断言落点。
 const SEED: &str = "\
+...
 你\tni\t1422456
 尼\tni\t80000
 呢\tni\t70000
@@ -113,6 +114,7 @@ fn missing_u_recovers_word_from_uncuttable_input() {
 
 #[test]
 fn missing_u_two_syllable_tail() {
+    let (mut e, db, yaml) = seeded_engine("zoba", true);
     // 两音节短串：`zoba` 插入 u 得 zuoba（坐吧/作罢）与 zouba（走吧）。
     let cands = type_keys(&mut e, "zoba");
     assert!(
