@@ -19,6 +19,7 @@
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::engine::{Engine, Key};
+use kime_pinyin::segment as pinyin_segment;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -198,6 +199,13 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
             .collect::<Vec<_>>()
     );
     let mut e = engine(&db);
+    for probe in ["shen", "shenm", "shenme", "shenmey"] {
+        eprintln!(
+            "[kime-diag-FALLTAIL] segment({:?}) = {:?}",
+            probe,
+            pinyin_segment(probe)
+        );
+    }
     // BEGIN
     for c in "shenmey".chars() {
         let out = e.key(Key {
