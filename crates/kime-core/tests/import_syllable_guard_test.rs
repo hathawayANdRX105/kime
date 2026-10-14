@@ -64,14 +64,14 @@ fn import_keeps_gap_rows_in_dict_so_the_warning_never_blocks() {
         "两行都入库（import 计数 = 本次新增行数，幂等重导返回 0）"
     );
 
-    // 前缀查 ni 命中「你好」：表内读音的对照组，主路径不受守门影响。
-    let hits = d.lookup(&["ni".into()], 10).unwrap();
+    // 表内读音的对照组（lookup 是整读法精确匹配，「你好」= ni+hao 两音节）：
+    let hits = d.lookup(&["ni".into(), "hao".into()], 10).unwrap();
     assert!(
         hits.iter().any(|c| c.text == "你好"),
-        "ni 前缀查应命中 你好，实际 {:?}",
+        "ni+hao 整读法查应命中 你好，实际 {:?}",
         hits.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
     );
-    // 查 sei 命中「甲」：缺口行入库且可被全拼查到的可观察面。
+    // 缺口行 sei（表外音节）入库且整读法可查到的可观察面：
     let hits = d.lookup(&["sei".into()], 10).unwrap();
     assert!(
         hits.iter().any(|c| c.text == "甲"),
