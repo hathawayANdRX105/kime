@@ -1237,32 +1237,59 @@ impl Engine {
         }
         // 句级联想（M8/Task 5）：有完整音节切分且长度 >= 2 时 Viterbi 构词成句。
         // segment 只收「全部音节合法」的路径——尾巴敲一半（shenmey 的 y）时整串
-        // 切不出任何路径，segs 为空，若依赖 segs.first() 句候选会整个消失
-        // （用户实测「偶数键位长句在第一、奇数键位掉队/消失」）。此时退回
-        // fallback 切分的完整音节 reading 组句：fcitx5 语义 = 句候选按已敲完
-        // 的音节计算，半截尾巴不参与、也不影响句位。
-        let viterbi_sylls: Option<Vec<String>> = match segs.first() {
-            Some(full) if full.len() >= 2 => Some(full.clone()),
+        // 切不出任何路径，segs 为空，句候选不能消失（用户实测「偶数键位长句在
+        // 第一、奇数键位掉队/消失」）：退回 fallback 切分的完整音节 reading 组句，
+        // fcitx5 语义 = 句候选按已敲完的音节计算，半截尾巴不参与、也不影响句位。
+        // 参与组句的切分集合：**每条**长度 >= 2 的完整切分各跑一次 Viterbi，
+        // 首切分（segment 的 DFS 展开序第一条）在前。
+        let mut viterbi_inputs: Vec<&[String]> = segs
+            .iter()
+            .filter(|s| s.len() >= 2)
+            .map(|s| s.as_slice())
+            .collect();
+        if viterbi_inputs.is_empty() {
             // 整串无合法切分（半截尾巴）时退回完整音节组句——但仅限纯全拼
             // 模式。双拼分支的「查无词全拼重试」也走这里：那种串多半是双拼
             // 半截键（aaj），fallback 句会把「安安」这类误组句抢进候选、
             // 顶掉正确的双拼解释（安+残键），必须保持保守。
-            _ if fallback_sentences && reading.len() >= 2 => Some(reading.clone()),
-            _ => None,
-        };
-        if let Some(viterbi_sylls) = viterbi_sylls {
+            if fallback_sentences && reading.len() >= 2 {
+                viterbi_inputs.push(&reading);
+            }
+        }
+        if let Some((primary, rest)) = viterbi_inputs.split_first() {
             let seed = self.context_seed();
             let sentences = crate::lattice::viterbi_sentences_seeded(
                 &self.dict,
-                &viterbi_sylls,
-                seed,
+                primary,
+                seed.clone(),
                 &mut self.span_cache,
             );
             // 落位 key = 句子覆盖的读音（完整音节 join）。尾巴半截时带尾的
             // last_joined（shen'me'y）与句读音（shen'me）不匹配，句会被误判
             // 「未覆盖全输入」挂到列表尾部——按不含尾巴的 join 落补开区。
-            let joined = joined_key(&viterbi_sylls, "");
+            let joined = joined_key(primary, "");
             Self::place_sentences(&mut cands, sentences, &joined);
+            // 其余切分的句候选**追加到末尾**并按文本去重：只查首切分会漏掉整个
+            // 正确切分——「dangao」贪心切成 [dang,ao]，真词「蛋糕」只在
+            // [dan,gao] 里，first() 一次 Viterbi 永远组不出它。去重让同文本保留
+            // 先出现的（= 更优先切分的），追加让后续切分既不插到首切分段之前、
+            // 也不抢层一精确命中词的位置。
+            //
+            // 前提：切分数有界（实测 ≤12 字母 2–4 条，Fibonacci 级），组句调用
+            // 次数 = 合格切分数，同一 SpanCache 复用跨切分共有的跨度查词；故不为
+            // 无限切分做额外防御。
+            let mut seen: std::collections::HashSet<String> =
+                cands.iter().map(|c| c.text.clone()).collect();
+            for extra in rest {
+                let mut extra_sents = crate::lattice::viterbi_sentences_seeded(
+                    &self.dict,
+                    extra,
+                    seed.clone(),
+                    &mut self.span_cache,
+                );
+                extra_sents.retain(|s| seen.insert(s.text.clone()));
+                cands.extend(extra_sents);
+            }
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
         // 用**整串的首切分**音节序列（= 用户敲出的完整读音），无完整切分则无回退空间。
