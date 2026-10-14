@@ -100,9 +100,13 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
     for c in "womendoubuzhidao".chars() {
         e.key(k(c));
     }
-    assert_eq!(e.page(), (0, 2));
+    // 6 条候选 / page_size 2 = 3 页：第 1 页整句，第 2 页同音整句变体，
+    // 第 3 页才是追加的首音节单字（B1 多候选边带来的新页）。
+    assert_eq!(e.page(), (0, 3));
     assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
-    assert_eq!(e.page(), (1, 2), "末页应只剩追加的首音节单字");
+    assert_eq!(e.page(), (1, 3));
+    assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
+    assert_eq!(e.page(), (2, 3), "末页应只剩追加的首音节单字");
     match e.key(k('1')) {
         Outcome::Consumed => {}
         other => panic!("expected pending Consumed, got {:?}", other),
