@@ -143,10 +143,12 @@ fn partial_placeholder_path_yields_only_clean_segment() {
            ('zzz','啊',1,'z',0);",
     );
     let got = viterbi_sentences(&dict, &reading(&["ni", "hao", "zzz"]));
+    // 每个音节都有词条：ni→你 / hao→好 / zzz→啊，唯一组合是 你好啊。
+    // 无占位混入（否则会出现拼音字母文本）。
     assert_eq!(
         texts(&got),
-        vec!["你好".to_string(), "好啊".to_string()],
-        "干净路径全部输出，且不含拼音字母文本：实际 {got:?}"
+        vec!["你好啊".to_string()],
+        "全音节有词时按词图组合输出：实际 {got:?}"
     );
     let _ = fs::remove_file(&db);
 }
