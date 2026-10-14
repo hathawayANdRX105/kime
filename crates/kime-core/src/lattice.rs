@@ -61,6 +61,11 @@ struct Path {
     pinyin: String,
     ln_freq_sum: f64,
     words: usize,
+    /// 路径是否含占位边（词库无该音节的条目，用音节字母顶替）。
+    /// 占位句的 text 含拼音字母，不是可上屏的中文，故不作为候选输出
+    /// （qingjian 的 `has_placeholder` 同款门禁）；占位边只在路径内传递，
+    /// 保证「有未收录音节时句子仍能拼出来供诊断」，不进 `Candidate`。
+    placeholder: bool,
 }
 
 /// 每个音节节点保留的最优路径数（k-best 束宽，qingjian BEAM_WIDTH=8 同款思路）。
@@ -206,6 +211,9 @@ pub fn viterbi_sentences_seeded(
     };
     finals
         .into_iter()
+        // 占位句的 text 混着拼音字母（如「在shuo」），不是可上屏的中文，
+        // 不作为候选输出；路径里保留占位只为让跨越未收录音节的组合仍算得出代价。
+        .filter(|p| !p.placeholder)
         .map(|p| {
             let score = sentence_score(p.ln_freq_sum, p.words, total);
             Candidate {
@@ -229,6 +237,7 @@ fn start_path(seed: Option<Seed>, total: f64) -> Path {
             pinyin: String::new(),
             ln_freq_sum: 0.0,
             words: 0,
+            placeholder: false,
         };
     };
     let eff = seed.freq.max(1) as f64;
@@ -239,6 +248,7 @@ fn start_path(seed: Option<Seed>, total: f64) -> Path {
         pinyin: String::new(),
         ln_freq_sum: eff.ln(),
         words: 1,
+        placeholder: false,
     }
 }
 
@@ -327,7 +337,7 @@ fn grow_with_words(
         for prev in prevs {
             insert_path(
                 target,
-                append(prev, &word.text, &word.pinyin, edge_cost, ln_freq),
+                append(prev, &word.text, &word.pinyin, edge_cost, ln_freq, false),
             );
         }
     }
@@ -351,20 +361,29 @@ fn grow_with_placeholder(prevs: &[Path], syllable: &str, target: &mut Vec<Path>)
     for prev in prevs {
         insert_path(
             target,
-            append(prev, syllable, syllable, edge_cost, UNKNOWN_LOG_PROB),
+            append(prev, syllable, syllable, edge_cost, UNKNOWN_LOG_PROB, true),
         );
     }
 }
 
 /// 把一个词（或占位音节）接到部分路径末尾。种子起点 pinyin 为空串时，
-/// 拼接天然丢弃种子部分（不变量 a）。
-fn append(prev: &Path, text: &str, pinyin: &str, edge_cost: f64, ln_freq: f64) -> Path {
+/// 拼接天然丢弃种子部分（不变量 a）。`placeholder` 标记这条边是否占位，
+/// 随路径向下传递。
+fn append(
+    prev: &Path,
+    text: &str,
+    pinyin: &str,
+    edge_cost: f64,
+    ln_freq: f64,
+    placeholder: bool,
+) -> Path {
     Path {
         cost: prev.cost + edge_cost,
         text: format!("{}{}", prev.text, text),
         pinyin: join_pinyin(&prev.pinyin, pinyin),
         ln_freq_sum: prev.ln_freq_sum + ln_freq,
         words: prev.words + 1,
+        placeholder: prev.placeholder || placeholder,
     }
 }
 

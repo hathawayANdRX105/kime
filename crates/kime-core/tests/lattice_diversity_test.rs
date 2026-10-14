@@ -6,13 +6,15 @@
 //! （place_sentences）不在此文件范围内。
 //!
 //! 本文件同时承接原 lattice.rs 内联测试（canon 约定：测试统一放 tests/）：
-//! 其中两条旧行为测试（无词 → 空）被 B4 占位节点推翻，改按新语义重写。
+//! 原内联测试里两条「无词 → 空」的行为由 B4 占位节点 + 占位句门禁后
+//! 变回空返回，按当前语义重钉。
 //!
 //! 行为变化（改前 → 改后）：
 //! - 2+2 切分：束宽 3 时第四便宜的组合被剪掉；8 后完整现身；
 //! - 同格同音词：只出最高频那一个；现在全部成边、全部现身；
-//! - 缺音节：穿过该音节的所有路径断掉、整句落空；现在占位边兜底，
-//!   候选非空且含该音节的字面文本；
+//! - 缺音节：穿过该音节的所有路径断掉、整句落空；现在占位边兜底让路径
+//!   算得出代价，但占位句 text 含拼音字母、不可上屏，故不进候选列
+//!   （qingjian has_placeholder 同款门禁）；
 //! - 束宽上限：文本互异的切分多于 8 条时仍按代价升序截到 8 条。
 
 use std::fs;
@@ -111,10 +113,10 @@ fn homophone_words_all_become_edges() {
 // ── B4：缺音节占位节点 ─────────────────────────────────────────────────
 
 #[test]
-fn missing_syllable_gets_placeholder_edge() {
-    // zzz 在词库中无任何条目（连单字都没有）：旧行为穿过 zzz 的所有路径断掉，
-    // 整句落空（返回空）；改后插占位边，候选非空且含该音节的字面文本，
-    // 分数落地板（sentence_score 下界 1）不抢名次。
+fn placeholder_sentence_is_not_offered_as_candidate() {
+    // zzz 在词库中无任何条目（连单字都没有）：穿过 zzz 的路径由占位边兜底
+    // 仍拼得出文本，但占位句 text 混着拼音字母（「你好zzz」）、不可上屏，
+    // 不得作为候选输出（qingjian has_placeholder 同款门禁）。
     let (dict, db) = open_dict(
         "placeholder",
         "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
@@ -122,20 +124,37 @@ fn missing_syllable_gets_placeholder_edge() {
            ('hao','好',900,'h',0);",
     );
     let got = viterbi_sentences(&dict, &reading(&["ni", "hao", "zzz"]));
-    assert_eq!(
-        texts(&got),
-        vec!["你好zzz".to_string()],
-        "缺音节必须产出占位候选而非整句落空：实际 {got:?}"
+    assert!(
+        got.is_empty(),
+        "含未收录音节的占位句不得进候选列：实际 {got:?}"
     );
-    assert_eq!(got[0].pinyin, "ni'hao'zzz");
-    assert_eq!(got[0].freq, 1, "占位句分数应落地板：{got:?}");
     let _ = fs::remove_file(&db);
 }
 
 #[test]
-fn placeholder_reaches_final_from_seed() {
-    // 占位路径在 Some(seed) 时也必须能产出候选（seed 占 dp[0]，扩展逻辑
-    // 与普通起点同一套），且 text/pinyin 恒不含种子音节（不变量 a）。
+fn partial_placeholder_path_yields_only_clean_segment() {
+    // 混合场景：zzz 本身有词条，但另有路径干净（ni+hao）。
+    // 只有干净路径可作候选；穿过 zzz 词条的路径不受占位影响。
+    let (dict, db) = open_dict(
+        "mixed",
+        "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
+           ('ni','你',1000,'n',0),
+           ('hao','好',900,'h',0),
+           ('zzz','啊',1,'z',0);",
+    );
+    let got = viterbi_sentences(&dict, &reading(&["ni", "hao", "zzz"]));
+    assert_eq!(
+        texts(&got),
+        vec!["你好".to_string(), "好啊".to_string()],
+        "干净路径全部输出，且不含拼音字母文本：实际 {got:?}"
+    );
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn seed_does_not_leak_into_clean_sentence() {
+    // 不变量 a 的占位场景投影：seed 占 dp[0] 时，干净路径（ni+hao）仍可作候选，
+    // 且 text/pinyin 恒不含种子部分；穿过未收录音节的占位句仍不得输出。
     let (dict, db) = open_dict(
         "seed",
         "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
@@ -146,16 +165,26 @@ fn placeholder_reaches_final_from_seed() {
         reading: "wo'men".to_string(),
         freq: 509405,
     };
-    let got = viterbi_sentences_seeded(
+    let blocked = viterbi_sentences_seeded(
         &dict,
         &reading(&["ni", "hao", "zzz"]),
+        Some(seed.clone()),
+        &mut SpanCache::default(),
+    );
+    assert!(
+        blocked.is_empty(),
+        "唯一路径穿过未收录音节，占位句不得输出：实际 {blocked:?}"
+    );
+    let got = viterbi_sentences_seeded(
+        &dict,
+        &reading(&["ni", "hao"]),
         Some(seed),
         &mut SpanCache::default(),
     );
     assert_eq!(
         texts(&got),
-        vec!["你好zzz".to_string()],
-        "seed 起点不得吞掉占位路径：{got:?}"
+        vec!["你好".to_string()],
+        "干净路径在 seed 下仍须可输出：实际 {got:?}"
     );
     assert!(
         !got[0].pinyin.contains("wo"),
@@ -287,33 +316,25 @@ fn single_syllable_input_yields_no_sentence() {
 }
 
 #[test]
-fn all_syllables_missing_now_yields_placeholder_sentence() {
-    // 旧语义：词库全 miss → 返回空（原内联测试 test_viterbi_no_match_fallback）。
-    // B4 之后：占位边兜底，必须出含音节字面文本的候选。
+fn all_syllables_missing_yields_no_candidate() {
+    // 词库全 miss：所有路径都得靠占位边兜底，而占位句 text 是拼音字母、
+    // 不可上屏，故候选列为空（等价于旧 test_viterbi_no_match_fallback 的空返回）。
     let (dict, db) = open_dict("nomatch", "");
     let got = viterbi_sentences(&dict, &reading(&["xxx", "yyy"]));
-    assert_eq!(
-        texts(&got),
-        vec!["xxxyyy".to_string()],
-        "全 miss 也须有占位候选：实际 {got:?}"
-    );
+    assert!(got.is_empty(), "全 miss 的占位句不得进候选列：实际 {got:?}");
     let _ = fs::remove_file(&db);
 }
 
 #[test]
-fn partial_missing_syllable_fills_with_placeholder() {
-    // 旧语义：前段有词、末音节全 miss → 整句落空（原内联测试
-    // test_viterbi_partial_match）。B4 之后：末音节由占位边顶替。
+fn partial_missing_syllable_yields_no_candidate() {
+    // 前段有词、末音节全 miss：唯一路径需占位边补末音节，占位句不可上屏，
+    // 候选列为空（等价于旧 test_viterbi_partial_match 的空返回）。
     let (dict, db) = open_dict(
         "partial",
         "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
            ('ni''hao','你好',1000,'nh',0);",
     );
     let got = viterbi_sentences(&dict, &reading(&["ni", "hao", "xxx"]));
-    assert_eq!(
-        texts(&got),
-        vec!["你好xxx".to_string()],
-        "缺末音节必须占位而非整句落空：实际 {got:?}"
-    );
+    assert!(got.is_empty(), "缺末音节的占位句不得进候选列：实际 {got:?}");
     let _ = fs::remove_file(&db);
 }
