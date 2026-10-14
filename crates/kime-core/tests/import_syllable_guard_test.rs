@@ -49,14 +49,20 @@ fn import_keeps_gap_rows_in_dict_so_the_warning_never_blocks() {
         "kime_import_guard_yaml_{}.yaml",
         std::process::id()
     ));
+    // rime-ice 源 yaml 的 pinyin 列是空格分隔音节（import 逐行 split_whitespace
+    // 再 join 成 '）。而 ni'hao 里的 ' 会被 import 的 ascii 过滤（dict.rs:743）
+    // 整行丢弃——对照行必须写空格分隔的 ni hao。
     fs::write(
         &yaml,
-        "---\nname: guardtest\nsort: by_weight\n...\n你好\tni'hao\t1000\n甲\tsei\t1\n",
+        "---\nname: guardtest\nsort: by_weight\n...\n你好\tni hao\t1000\n甲\tsei\t1\n",
     )
     .unwrap();
 
-    let n = d.import(&yaml).expect("import");
-    assert_eq!(n, 2, "缺口行（sei）也照旧入库：告警不阻塞 import");
+    let n = d.import(&yaml).expect("import 不阻塞：缺口行照旧入库");
+    assert_eq!(
+        n, 2,
+        "两行都入库（import 计数 = 本次新增行数，幂等重导返回 0）"
+    );
 
     // 前缀查 ni 命中「你好」：表内读音的对照组，主路径不受守门影响。
     let hits = d.lookup(&["ni".into()], 10).unwrap();
