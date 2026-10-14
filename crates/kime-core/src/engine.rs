@@ -1091,6 +1091,13 @@ impl Engine {
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
     fn refresh_full_pinyin(&mut self, fallback_sentences: bool) {
+        eprintln!(
+            "[kime-diag] ENTER refresh_full_pinyin tid={:?} letters={:?} fallback={} sp_active={}",
+            std::thread::current().id(),
+            self.letters,
+            fallback_sentences,
+            self.sp_active
+        );
         // 全拼候选按拼音字母消耗键串（双拼解码失败回退全拼时也走这里）。
         self.sp_active = false;
         let segs = segment(&self.letters);
