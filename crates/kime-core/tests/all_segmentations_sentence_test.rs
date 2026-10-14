@@ -139,7 +139,7 @@ fn same_text_from_two_segmentations_is_deduplicated() {
     let mut e = engine(&db);
     keys(&mut e, "dangao");
     let got = texts(&e);
-    let hits = got.iter().filter(|t| t == "蛋糕").count();
+    let hits = got.iter().filter(|t| *t == "蛋糕").count();
     assert_eq!(
         hits, 1,
         "两条切分组出同文本「蛋糕」时只许出现一次（保留更优先切分的），实际 {got:?}"
