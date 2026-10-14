@@ -104,7 +104,7 @@ pub fn is_syllable(s: &str) -> bool {
 pub fn unknown_syllables(pinyin: &str) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
     for s in pinyin.split('\'') {
-        if !s.is_empty() && !is_syllable(s) && !out.contains(s) {
+        if !s.is_empty() && !is_syllable(s) && !out.contains(&s) {
             out.push(s);
         }
     }
