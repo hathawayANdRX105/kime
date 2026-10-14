@@ -1261,6 +1261,15 @@ impl Engine {
                 viterbi_inputs.push(&reading);
             }
         }
+        eprintln!(
+            "[kime-diag] VI-BUILD tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} inputs={:?}",
+            std::thread::current().id(),
+            self.letters,
+            segs,
+            reading,
+            tail,
+            viterbi_inputs
+        );
         if let Some((primary, rest)) = viterbi_inputs.split_first() {
             eprintln!(
                 "[kime-diag] tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} primary={:?} rest={:?} cands={:?}",
