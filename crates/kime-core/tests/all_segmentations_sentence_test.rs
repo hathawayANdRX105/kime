@@ -186,7 +186,13 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
     );
     let mut e = engine(&db);
     for c in "shenmey".chars() {
-        let out = e.key(k(c));
+        let out = e.key(Key {
+            ch: Some(c),
+            code: 0,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
         eprintln!(
             "[kime-diag] key {c:?} -> {out:?} letters={:?} cands={:?}",
             e.letters(),
