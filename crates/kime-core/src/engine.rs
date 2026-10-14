@@ -1262,13 +1262,14 @@ impl Engine {
             }
         }
         eprintln!(
-            "[kime-diag] VI-BUILD tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} inputs={:?}",
+            "[kime-diag] VI-BUILD tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} inputs={:?} cands={:?}",
             std::thread::current().id(),
             self.letters,
             segs,
             reading,
             tail,
-            viterbi_inputs
+            viterbi_inputs,
+            cands.iter().map(|c| (c.text.clone(), c.pinyin.clone(), c.freq)).collect::<Vec<_>>()
         );
         if let Some((primary, rest)) = viterbi_inputs.split_first() {
             eprintln!(
