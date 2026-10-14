@@ -4,8 +4,10 @@
 //! "xian" → [["xian"], ["xi","an"]]；"nihao" → [["ni","hao"], ["ni","ha","o"]]；
 //! 空串 / 非 a-z 字符 / 无法切分 → 空 vec。
 //!
-//! 只认标准普通话无调音节表（401 条，含 a/o/e 单字）；声母缩写（nh）由
-//! dict 层的 abbrev 列承担，不在此处。
+//! 只认无调音节表（416 条 = 401 标准 + 15 个词库在册罕见音节：
+//! biang cei den dia fiao kei lo nia nou nun rua tei ya yo zuan）；全集依据
+//! 见 [`SYLLABLES`] 表头注释（线上词库 phrase.pinyin 去重 416，逐条核对为
+//! rime-luna-pinyin 424 音节集子集）。声母缩写（nh）由 dict 层的 abbrev 列承担。
 
 /// 一次切分：音节序列，如 ["ni","hao"]
 pub type Reading = Vec<String>;
@@ -95,6 +97,18 @@ pub const SYLLABLES: &[&str] = &[
 /// 二分查表：416 条 → log2 ≈ 9 次比较，零运行时分配。
 pub fn is_syllable(s: &str) -> bool {
     SYLLABLES.binary_search(&s).is_ok()
+}
+
+/// 读音串（音节 `'` 连接，如 "ni'zhei"）里不在音节表内的音节，去重保首次出现序。
+/// 词库导入期用它做全拼可达性守门（dict import 的 stderr 告警）；返回项借用输入串。
+pub fn unknown_syllables(pinyin: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for s in pinyin.split('\'') {
+        if !s.is_empty() && !is_syllable(s) && !out.contains(s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// 一维可达性 DP：判断按键串能否被完整切分成合法音节（不产出任何切分、零分配）。
