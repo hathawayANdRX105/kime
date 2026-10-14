@@ -28,9 +28,9 @@ fn tmp_db_path(suffix: &str) -> std::path::PathBuf {
 
 #[test]
 fn unknown_syllables_dedupes_and_keeps_first_occurrence_order() {
-    assert_eq!(unknown_syllables("ni'hao"), Vec::new());
+    assert_eq!(unknown_syllables("ni'hao"), Vec::<&str>::new());
     assert_eq!(unknown_syllables("ni'sei"), vec!["sei"]);
-    assert_eq!(unknown_syllables(""), Vec::new());
+    assert_eq!(unknown_syllables(""), Vec::<&str>::new());
     assert_eq!(
         unknown_syllables("sei'sei"),
         vec!["sei"],
