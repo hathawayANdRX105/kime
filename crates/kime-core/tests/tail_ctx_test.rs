@@ -8,6 +8,11 @@
 //! - 无尾旧行维持 ctx_id 链行为（旧数据被新路径误删 → 红）
 //! - ctx_id NULL 且有尾的行参与挖掘（被 C2 删除 → 红）
 //! 外加：既有库（无 tail_ctx 列）开库自动 ALTER 补列不崩（#89 验收 4）。
+//!
+//! 分段容错（放宽整行完整覆盖为「逐汉字段独立切分」）：
+//! - 非汉字字符（标点/数字/latin/空格）作分隔符，不使整行返回 None
+//! - 取最靠末尾的可行段末词作前词；末段不可切分时退回前段末词
+//! - 无汉字段（纯数字/latin）仍不参与挖掘；段内多方案仍取总频最高
 
 use kime_core::dict::Dict;
 use kime_core::lm;
@@ -203,5 +208,135 @@ fn legacy_db_without_tail_ctx_column_migrates() {
         )
         .unwrap();
     assert_eq!(tail2, Some("项目".into()), "迁移后带尾提交照常落列");
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn tail_with_comma_splits_last_run() {
+    let db = tmp_db("comma");
+    let mut d = Dict::open(&db).unwrap();
+    seed_phrase(&d, "ni'hao", "你好", 5000);
+    seed_phrase(&d, "shi'jie", "世界", 4000);
+    seed_phrase(&d, "jin'du", "进度", 4000);
+    // 中文逗号分隔两段 [你好]、[世界]：取最靠末尾的可行段 → 前词 = 世界
+    for _ in 0..2 {
+        d.log_commit(
+            None,
+            &["jin".into(), "du".into()],
+            "进度",
+            Some("你好，世界"),
+        );
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(
+        bigram_count(&d, "世界", "进度"),
+        2,
+        "逗号后的末段切出末词（改前整行返回 None）"
+    );
+    assert_eq!(
+        bigram_count(&d, "你好", "进度"),
+        0,
+        "末段可行时前段不作前词"
+    );
+    assert_eq!(st.tail_mined, 1, "带尾挖掘对数统计");
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn tail_with_digit_and_latin_splits() {
+    let db = tmp_db("digitlatin");
+    let mut d = Dict::open(&db).unwrap();
+    // 数字/空格是分隔符；中间的汉字段独立切分，末词 = 显示
+    seed_phrase(&d, "ran'hou", "然后", 5000);
+    seed_phrase(&d, "yong", "用", 4000);
+    seed_phrase(&d, "an lv se", "暗绿色", 3000);
+    seed_phrase(&d, "xianshi", "显示", 5000);
+    seed_phrase(&d, "jin'du", "进度", 4000);
+    for _ in 0..2 {
+        d.log_commit(
+            None,
+            &["jin".into(), "du".into()],
+            "进度",
+            Some("2 然后用暗绿色显示"),
+        );
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(
+        bigram_count(&d, "显示", "进度"),
+        2,
+        "数字/空格隔开后的汉字段切出末词（改前进不了 DP）"
+    );
+    assert_eq!(st.tail_mined, 1);
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn last_run_unsplittable_falls_back_to_prev_run() {
+    let db = tmp_db("fallback");
+    let mut d = Dict::open(&db).unwrap();
+    seed_phrase(&d, "ni'hao", "你好", 5000);
+    seed_phrase(&d, "jin'du", "进度", 4000);
+    // 世界 不在词库 → 末段 [世界] 不可切分；前段 [你好] 可切 → 前词 = 你好
+    for _ in 0..2 {
+        d.log_commit(
+            None,
+            &["jin".into(), "du".into()],
+            "进度",
+            Some("你好，世界"),
+        );
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(
+        bigram_count(&d, "你好", "进度"),
+        2,
+        "末段切不出时退回前段末词（贴着本次提交的上文）"
+    );
+    assert_eq!(st.tail_mined, 1);
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn fully_unsplittable_tail_stays_out() {
+    let db = tmp_db("unsplittable");
+    let mut d = Dict::open(&db).unwrap();
+    seed_phrase(&d, "jin'du", "进度", 4000);
+    for _ in 0..2 {
+        d.log_commit(None, &["jin".into(), "du".into()], "进度", Some("12345"));
+    }
+    for _ in 0..2 {
+        d.log_commit(None, &["jin".into(), "du".into()], "进度", Some("http://x"));
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(st.tail_mined, 0, "纯数字/纯 latin 无汉字段，不进 tail 路径");
+    let remaining: i64 = d
+        .conn()
+        .query_row("SELECT count(*) FROM commit_log", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 4, "不可切分行全部保留供下轮累积");
+    let _ = fs::remove_file(&db);
+}
+
+#[test]
+fn multi_way_in_segmented_tail_still_picks_max_freq() {
+    let db = tmp_db("multiwayseg");
+    let mut d = Dict::open(&db).unwrap();
+    // 前导逗号 + 汉字段「天项目」：段内两种完整切分
+    //   [天项目]    总频 1
+    //   [天, 项目]  总频 1 + 5000 = 5001 ← 应取（末词 = 项目）
+    seed_phrase(&d, "tian xiang mu", "天项目", 1);
+    seed_phrase(&d, "tian", "天", 1);
+    seed_phrase(&d, "xiang'mu", "项目", 5000);
+    seed_phrase(&d, "jin'du", "进度", 4000);
+    for _ in 0..2 {
+        d.log_commit(None, &["jin".into(), "du".into()], "进度", Some("，天项目"));
+    }
+    let st = lm::mine(d.conn()).unwrap();
+    assert_eq!(
+        bigram_count(&d, "项目", "进度"),
+        2,
+        "分段上下文里段内多方案仍取总频最高"
+    );
+    assert_eq!(bigram_count(&d, "天项目", "进度"), 0, "低频方案不入选");
+    assert_eq!(st.tail_mined, 1);
     let _ = fs::remove_file(&db);
 }

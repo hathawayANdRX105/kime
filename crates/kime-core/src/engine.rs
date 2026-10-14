@@ -9,6 +9,7 @@
 // → 候选。不做任何 I/O；切分非法时保持旧状态（无声可打即无候选）。
 
 use crate::config::Config;
+use crate::context::append_tail;
 use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
 use crate::punct;
@@ -825,6 +826,16 @@ impl Engine {
             self.context.as_deref(),
         );
         self.last_commit = Some((cand.text.clone(), reading.join("'")));
+        // 上下文尾巴自持推进（为什么见 [`append_tail`] 模块文档）：壳层对 kime
+        // 自己的上屏回声（text_change_cause == INPUT_METHOD）不推引擎
+        // （platform-wayland context_batch.rs 的 Echo 裁决），除非引擎在每次
+        // 成功上屏后把本次词追加进 self.context，否则一场会话内 tail_ctx 冻结
+        // 在会话语前文本，离线挖掘从中切出错误相邻对。热路径 context_seed 组句
+        // 种子读同一份尾巴，一并受益。须在 enqueue_log_commit 之后：上面读到的
+        // self.context 是「上屏前」尾（本次落库用），追加后才是下次上屏前文。
+        let current = self.context.as_deref().unwrap_or("");
+        let advanced = append_tail(current, &cand.text);
+        self.context = Some(advanced);
         // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
         // 顺手检查世代号（离线挖掘跑过则重载缓存）；只读查询，miss 不写库。
         self.dict.set_lm_context(
