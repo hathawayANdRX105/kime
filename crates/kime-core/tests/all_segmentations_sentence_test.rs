@@ -198,7 +198,7 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
             .collect::<Vec<_>>()
     );
     let mut e = engine(&db);
-    eprintln!("[kime-diag-FALLTAIL] BEGIN fixture=什(shen)/么(me)");
+    // BEGIN
     for c in "shenmey".chars() {
         let out = e.key(Key {
             ch: Some(c),
@@ -208,11 +208,11 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
             alt: false,
         });
         eprintln!(
-            "[kime-diag] key {c:?} -> {out:?} letters={:?} cands={:?}",
+            "[kime-diag-FALLTAIL] key {c:?} -> {out:?} letters={:?} cands={:?}",
             e.letters(),
             e.candidates()
                 .iter()
-                .map(|x| x.text.clone())
+                .map(|x| (x.text.clone(), x.pinyin.clone(), x.freq, x.ai))
                 .collect::<Vec<_>>()
         );
     }
