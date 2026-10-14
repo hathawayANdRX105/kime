@@ -208,7 +208,8 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
             alt: false,
         });
         eprintln!(
-            "[kime-diag-FALLTAIL] key {c:?} -> {out:?} letters={:?} cands={:?}",
+            "[kime-diag-FALLTAIL] tid={:?} key {c:?} -> {out:?} letters={:?} cands={:?}",
+            std::thread::current().id(),
             e.letters(),
             e.candidates()
                 .iter()

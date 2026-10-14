@@ -310,7 +310,8 @@ fn extend_node(
     }
     if !any_hit && !any_failed {
         eprintln!(
-            "[kime-diag] PLACEHOLDER at i={} n={} reading={:?} prevs={:?}",
+            "[kime-diag] PLACEHOLDER tid={:?} i={} n={} reading={:?} prevs={:?}",
+            std::thread::current().id(),
             i,
             n,
             reading,

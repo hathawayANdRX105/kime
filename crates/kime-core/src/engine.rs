@@ -1263,7 +1263,8 @@ impl Engine {
         }
         if let Some((primary, rest)) = viterbi_inputs.split_first() {
             eprintln!(
-                "[kime-diag] letters={:?} segs={:?} reading={:?} tail={:?} primary={:?} rest={:?} cands={:?}",
+                "[kime-diag] tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} primary={:?} rest={:?} cands={:?}",
+                std::thread::current().id(),
                 self.letters,
                 segs,
                 reading,
