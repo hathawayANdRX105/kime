@@ -1262,6 +1262,16 @@ impl Engine {
             }
         }
         if let Some((primary, rest)) = viterbi_inputs.split_first() {
+            eprintln!(
+                "[kime-diag] letters={:?} segs={:?} reading={:?} tail={:?} primary={:?} rest={:?} cands={:?}",
+                self.letters,
+                segs,
+                reading,
+                tail,
+                primary,
+                rest.len(),
+                cands.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+            );
             let seed = self.context_seed();
             let sentences = crate::lattice::viterbi_sentences_seeded(
                 &self.dict,
