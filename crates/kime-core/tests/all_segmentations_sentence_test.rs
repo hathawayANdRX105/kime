@@ -185,7 +185,17 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
            ('me','么',8000,'m',0);",
     );
     let mut e = engine(&db);
-    keys(&mut e, "shenmey");
+    for c in "shenmey".chars() {
+        let out = e.key(k(c));
+        eprintln!(
+            "[kime-diag] key {c:?} -> {out:?} letters={:?} cands={:?}",
+            e.letters(),
+            e.candidates()
+                .iter()
+                .map(|x| x.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
     let got = texts(&e);
     assert!(
         got.contains(&"什么".to_string()),
