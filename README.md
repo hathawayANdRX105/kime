@@ -59,11 +59,16 @@ platform-mac/         （规划中）macOS IMKit 壳
 当前列：本地无 CPU 限制全速跑 `cargo bench`（1 轮预热 + 5 轮取 median，release/fat LTO），
 词库 930,894 条（sqlite 137MB / FST 53.5MB）；M1-M6.5 列为历史里程碑基线。
 
+「当前列」数字是词图多样性（#115）之前的口径。#115 后长输入组句慢约 3 倍
+（CI 合成 10 万词库对照：Viterbi 18 音节 0.0156→0.0433ms/次，按键热路径 0.33–0.40ms/键
+ 噪音内不变），仍在亚毫秒量级，不影响打字节奏。
+
 ## 快速开始
 
-### 1. 构建 FST 词库（一次性，将词库编译为 ~42MB 二进制）
+### 1. 构建 FST 词库（一次性，将词库编译为 ~53MB 二进制）
 ```bash
-# kime 二进制取自 PR CI（绿灯 run）的 kime-binaries artifact（本地不编译，见「开发约定」）
+# 二进制取自 GitHub Release 资源（kime-vX.Y.Z-linux-x86_64.tar.gz + SHA256SUMS.txt 校验）；
+# 开发中也可取 PR CI 绿灯 run 的 kime-binaries artifact（本地不编译，见「开发约定」）
 kime build-dict \
   --in ~/.local/share/kime/dict.sqlite3 \
   --out ~/.local/share/kime/dict.bin
@@ -94,7 +99,7 @@ bench 为零依赖 `fn main`（`harness = false`）：预热 + 每指标 5 轮�
 
 ## 开发约定
 
-- **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；装二进制从 CI 的 `kime-binaries` artifact 下载到 `~/.local/bin/`）；本地唯一允许 `cargo bench`（套 `systemd-run --user --scope -p CPUQuota=70% --`）
+- **本地禁止 `cargo build` / `cargo test` / `cargo run`**（编译/测试/装包全走 PR CI；二进制从 GitHub Release 资源下载到 `~/.local/bin/`，`SHA256SUMS.txt` 校验；开发中也可取 CI 的 `kime-binaries` artifact）；本地唯一允许 `cargo bench`（套 `systemd-run --user --scope -p CPUQuota=70% --`）
 - 测试放 `tests/` 目录；src 内 `#[cfg(test)]` 严禁（githook 增量强制）
 - 依赖单向：`bin/kime -> platform-wayland -> kime-core -> kime-shuangpin -> kime-pinyin`
 - core 不碰任何显示/UI；壳只做「按键进、候选出、上屏提交」
