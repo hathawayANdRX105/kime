@@ -9,6 +9,7 @@
 // → 候选。不做任何 I/O；切分非法时保持旧状态（无声可打即无候选）。
 
 use crate::config::Config;
+use crate::context::append_tail;
 use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
 use crate::punct;
@@ -846,6 +847,16 @@ impl Engine {
             self.context.as_deref(),
         );
         self.last_commit = Some((cand.text.clone(), reading.join("'")));
+        // 上下文尾巴自持推进（为什么见 [`append_tail`] 模块文档）：壳层对 kime
+        // 自己的上屏回声（text_change_cause == INPUT_METHOD）不推引擎
+        // （platform-wayland context_batch.rs 的 Echo 裁决），除非引擎在每次
+        // 成功上屏后把本次词追加进 self.context，否则一场会话内 tail_ctx 冻结
+        // 在会话语前文本，离线挖掘从中切出错误相邻对。热路径 context_seed 组句
+        // 种子读同一份尾巴，一并受益。须在 enqueue_log_commit 之后：上面读到的
+        // self.context 是「上屏前」尾（本次落库用），追加后才是下次上屏前文。
+        let current = self.context.as_deref().unwrap_or("");
+        let advanced = append_tail(current, &cand.text);
+        self.context = Some(advanced);
         // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
         // 顺手检查世代号（离线挖掘跑过则重载缓存）；只读查询，miss 不写库。
         self.dict.set_lm_context(
@@ -1028,7 +1039,12 @@ impl Engine {
                         // 用整音节 join 做落位 key：奇数 pending 时句仍按 freq
                         // 落进补全区头部，不会被误判「未覆盖全输入」而挂到尾部。
                         let full_joined = joined_key(&syllables, "");
-                        Self::place_sentences(&mut self.candidates, sentences, &full_joined);
+                        Self::place_sentences(
+                            &mut self.candidates,
+                            sentences,
+                            &full_joined,
+                            &full_joined,
+                        );
                     }
                     // 缺陷 A 回退：以上全部落空（整串无词条、Viterbi 拼不出全覆盖句）
                     // 时，砍末音节逐档重查，让候选列表非空——用户至少能选到首音节的字。
@@ -1251,32 +1267,61 @@ impl Engine {
         }
         // 句级联想（M8/Task 5）：有完整音节切分且长度 >= 2 时 Viterbi 构词成句。
         // segment 只收「全部音节合法」的路径——尾巴敲一半（shenmey 的 y）时整串
-        // 切不出任何路径，segs 为空，若依赖 segs.first() 句候选会整个消失
-        // （用户实测「偶数键位长句在第一、奇数键位掉队/消失」）。此时退回
-        // fallback 切分的完整音节 reading 组句：fcitx5 语义 = 句候选按已敲完
-        // 的音节计算，半截尾巴不参与、也不影响句位。
-        let viterbi_sylls: Option<Vec<String>> = match segs.first() {
-            Some(full) if full.len() >= 2 => Some(full.clone()),
+        // 切不出任何路径，segs 为空，句候选不能消失（用户实测「偶数键位长句在
+        // 第一、奇数键位掉队/消失」）：退回 fallback 切分的完整音节 reading 组句，
+        // fcitx5 语义 = 句候选按已敲完的音节计算，半截尾巴不参与、也不影响句位。
+        // 参与组句的切分集合：**每条**长度 >= 2 的完整切分各跑一次 Viterbi，
+        // 首切分（segment 的 DFS 展开序第一条）在前。
+        let mut viterbi_inputs: Vec<&[String]> = segs
+            .iter()
+            .filter(|s| s.len() >= 2)
+            .map(|s| s.as_slice())
+            .collect();
+        if viterbi_inputs.is_empty() {
             // 整串无合法切分（半截尾巴）时退回完整音节组句——但仅限纯全拼
             // 模式。双拼分支的「查无词全拼重试」也走这里：那种串多半是双拼
             // 半截键（aaj），fallback 句会把「安安」这类误组句抢进候选、
             // 顶掉正确的双拼解释（安+残键），必须保持保守。
-            _ if fallback_sentences && reading.len() >= 2 => Some(reading.clone()),
-            _ => None,
-        };
-        if let Some(viterbi_sylls) = viterbi_sylls {
+            if fallback_sentences && reading.len() >= 2 {
+                viterbi_inputs.push(&reading);
+            }
+        }
+        if let Some((primary, rest)) = viterbi_inputs.split_first() {
             let seed = self.context_seed();
             let sentences = crate::lattice::viterbi_sentences_seeded(
                 &self.dict,
-                &viterbi_sylls,
-                seed,
+                primary,
+                seed.clone(),
                 &mut self.span_cache,
             );
             // 落位 key = 句子覆盖的读音（完整音节 join）。尾巴半截时带尾的
             // last_joined（shen'me'y）与句读音（shen'me）不匹配，句会被误判
             // 「未覆盖全输入」挂到列表尾部——按不含尾巴的 join 落补开区。
-            let joined = joined_key(&viterbi_sylls, "");
-            Self::place_sentences(&mut cands, sentences, &joined);
+            let joined = joined_key(primary, "");
+            // 层一 key 取 last_joined（查词键），与 joined（句子覆盖键）在
+            // 歧义单音节输入下会脱钩，见 place_sentences 文档。
+            Self::place_sentences(&mut cands, sentences, &self.last_joined, &joined);
+            // 其余切分的句候选**追加到末尾**并按文本去重：只查首切分会漏掉整个
+            // 正确切分——「dangao」贪心切成 [dang,ao]，真词「蛋糕」只在
+            // [dan,gao] 里，first() 一次 Viterbi 永远组不出它。去重让同文本保留
+            // 先出现的（= 更优先切分的），追加让后续切分既不插到首切分段之前、
+            // 也不抢层一精确命中词的位置。
+            //
+            // 前提：切分数有界（实测 ≤12 字母 2–4 条，Fibonacci 级），组句调用
+            // 次数 = 合格切分数，同一 SpanCache 复用跨切分共有的跨度查词；故不为
+            // 无限切分做额外防御。
+            let mut seen: std::collections::HashSet<String> =
+                cands.iter().map(|c| c.text.clone()).collect();
+            for extra in rest {
+                let mut extra_sents = crate::lattice::viterbi_sentences_seeded(
+                    &self.dict,
+                    extra,
+                    seed.clone(),
+                    &mut self.span_cache,
+                );
+                extra_sents.retain(|s| seen.insert(s.text.clone()));
+                cands.extend(extra_sents);
+            }
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
         // 用**整串的首切分**音节序列（= 用户敲出的完整读音）。segs 为空时
@@ -1458,8 +1503,23 @@ impl Engine {
     /// 用户敲长串时第一位永远是当前已敲音节的最优句子，词条分数不该把句
     /// 压到中间（用户实测长句被高频单字挤下第一后打断组句流）。
     /// 没覆盖全输入的句子（半截尾巴）不参与落位，挂末尾。
-    fn place_sentences(cands: &mut Vec<Candidate>, sentences: Vec<Candidate>, joined: &str) {
-        let l1_end = cands.iter().take_while(|c| c.pinyin == joined).count();
+    ///
+    /// 两个键分开：`l1_key` 是候选列表层一精确块的 pinyin 键（查词用的
+    /// `joined`，即 `self.last_joined`），`coverage_key` 是句子自身覆盖的
+    /// 读音。多数输入下两者同值，但会脱钩：
+    /// - 半截尾巴（`shenmey`）：查词键带尾 `shen'me'y`，句读法不带尾
+    ///   `shen'me`。按前者数 `l1_end` 得 0、按后者比覆盖——句落补全区
+    ///   头部，正是 fcitx5 语义。
+    /// - 歧义单音节输入（`xian` → `[[xian],[xi,an]]`）：查词键是首切分
+    ///   `xian`，句来自后续切分 `xi'an`。两键混用会把 `l1_end` 算成 0，
+    ///   句子插到精确块**之前**顶掉「先」；分开后句落精确块之后。
+    fn place_sentences(
+        cands: &mut Vec<Candidate>,
+        sentences: Vec<Candidate>,
+        l1_key: &str,
+        coverage_key: &str,
+    ) {
+        let l1_end = cands.iter().take_while(|c| c.pinyin == l1_key).count();
         // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
         // 否则频率折算会把更优的切分反-sort 到后面。
         let mut cursor = l1_end;
@@ -1467,7 +1527,7 @@ impl Engine {
             if cands.iter().any(|c| c.text == sentence.text) {
                 continue;
             }
-            let pos = if sentence.pinyin == joined {
+            let pos = if sentence.pinyin == coverage_key {
                 // fcitx5 组句语义：句恒落层一精确块之后、其余候选之前，
                 // 词条分数不把句压到中间（用户实测长句被高频单字挤下第一）。
                 cursor

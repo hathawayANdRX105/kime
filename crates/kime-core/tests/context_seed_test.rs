@@ -223,15 +223,16 @@ fn invariant_c_score_dimension_unchanged() {
 #[test]
 fn chinese_context_reorders_sentence_candidates() {
     // 无上下文（= HEAD 行为，回归基线）：CI 实测 [在说, 在说话]。
-    // 注：viterbi 每跨度只取最优边（在 400000 > 再 350000），「再」的碎切
-    // 路径不进 lattice；zaishuo 下整词与碎切同文本被去重——种子在两音节
-    // 输入上不产生可观察重排（可观察断言在 lattice 层 invariant_c，三音节）。
+    // 注：viterbi 每个跨度保留多个候选词（zai 下的 在 400000 与 再 350000），
+    // 「再说」作为 再+说 的碎切句进候选列；zaishuo 下整词与碎切同文本被去重
+    // ——种子在两音节输入上不产生可观察重排（可观察断言在 lattice 层
+    // invariant_c，三音节）。
     let plain_dir = build_dict("s1_plain");
     let mut plain = engine_at(&plain_dir);
     type_letters(&mut plain, "zaishuo");
     assert_eq!(
         texts(plain.candidates()),
-        vec!["在说", "在说话"],
+        vec!["在说", "再说", "在说话"],
         "无上下文回归（HEAD 行为）"
     );
 
@@ -243,7 +244,7 @@ fn chinese_context_reorders_sentence_candidates() {
     type_letters(&mut ctx, "zaishuo");
     assert_eq!(
         texts(ctx.candidates()),
-        vec!["在说", "在说话"],
+        vec!["在说", "再说", "在说话"],
         "种子不破坏层序：层一精确命中与补全落位不变"
     );
     for c in ctx.candidates() {
@@ -287,9 +288,9 @@ fn english_context_never_seeds() {
     let plain_dir = build_dict("s3_plain");
     let mut plain = engine_at(&plain_dir);
     type_letters(&mut plain, "zaishuo");
-    // 基线 = CI 实测 HEAD 行为（「再说」不在候选，见场景 1 注）。
+    // 基线 = CI 实测 HEAD 行为（「再说」在候选，见场景 1 注）。
     let base = texts(plain.candidates());
-    assert_eq!(base, vec!["在说", "在说话"]);
+    assert_eq!(base, vec!["在说", "再说", "在说话"]);
     let ctx_dir = build_dict("s3_ctx");
     let mut ctx = engine_at(&ctx_dir);
     ctx.set_context(Some("hello world".to_string()));

@@ -3,7 +3,8 @@
 //! 三件事：
 //! 1. [`ContextTail::from_surrounding`] 的边界语义（中英混排、多字节截断）；
 //! 2. [`Engine::set_context`] / [`Engine::context_tail`] 往返；
-//! 3. 上下文与组合生命周期无关 —— commit / Esc 清组合后上下文仍在。
+//! 3. 上下文与组合生命周期无关 —— Esc 清组合后上下文仍在；commit 会追加
+//!    本次上屏词推进尾巴（tail_freshness_test.rs），不再是「仍在原处」。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};

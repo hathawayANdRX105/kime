@@ -402,69 +402,110 @@ fn apply_tail_plan(
 ///
 /// 词判定 = phrase 表有 `text = 词` 的行（等价 `Dict::lookup_prefix` 的 exact
 /// 块——词库有无该词）；词频率 = 该 text 所有行的 MAX(freq)（代表频率，与
-/// 拼音行无关）。「每个词都在词库」的可行切分中取**总频率最高**的方案（DP；
-/// 模型选方案是 #88 的活，本期不做）。无可行完整切分（标点/数字/未收字）
+/// 拼音行无关）。
+///
+/// 切分按**连续可切分字符段**做，不再要求整条 tail 被词库词完整覆盖：
+/// 非汉字字符（标点/数字/latin/空格）不作断链点，而是天然分隔符——它们不在
+/// phrase 表，把 tail 切成若干汉字段，每段独立跑前缀 DP（词长仍限
+/// `MAX_TAIL_WORD`）。任一段能**完整切出**词即算可行，取**最靠末尾的可行段**
+/// 的末词作前词：末词必须贴着本次提交的上文，越靠后的段越靠近落屏句词边界。
+/// 末段切不出（末字未收/正在打的残词）而前段能时，退回前段末词（仍贴着上文，
+/// 比整行丢弃更接近真实相邻对）。所有段都切不出（纯标点/数字/latin/未收字）
 /// → `None`，该行不参与挖掘。
-/// `cache` 跨行共享：同一词在不同尾里只查一次 phrase 表。
+/// 段内仍取**总频率最高**的完整切分方案（DP；模型选方案是 #88 的活，本期不做）。
+/// `cache` 跨段共享：同一词在不同段里只查一次 phrase 表。
 fn split_tail_by_dict(
     conn: &Connection,
     tail: &str,
     cache: &mut HashMap<String, Option<i64>>,
 ) -> rusqlite::Result<Option<Vec<String>>> {
     let chars: Vec<char> = tail.chars().collect();
-    let n = chars.len();
-    if n == 0 {
+    let runs = cjk_runs(&chars);
+    if runs.is_empty() {
         return Ok(None);
     }
     let mut stmt = conn.prepare("SELECT MAX(freq) FROM phrase WHERE text = ?1")?;
-    let mut dp: Vec<Option<i64>> = vec![None; n + 1];
-    let mut choice: Vec<Option<usize>> = vec![None; n + 1];
-    dp[0] = Some(0);
-    for i in 1..=n {
-        let mut best: Option<(i64, usize)> = None;
-        for j in (i.saturating_sub(MAX_TAIL_WORD))..i {
-            let Some(base) = dp[j] else {
-                continue;
-            };
-            let word: String = chars[j..i].iter().collect();
-            let freq: Option<i64> = match cache.get(&word) {
-                Some(f) => *f,
-                None => {
-                    let f: Option<i64> = stmt
-                        .query_row(params![word.as_str()], |r| r.get(0))
-                        .unwrap_or(None);
-                    cache.insert(word.clone(), f);
-                    f
+    // 从末段往回逐段前缀 DP：命中第一个可完整切分的段即停，其末词 = 前词。
+    for &(start, end) in runs.iter().rev() {
+        let run = &chars[start..end];
+        let n = run.len();
+        let mut dp: Vec<Option<i64>> = vec![None; n + 1];
+        let mut choice: Vec<Option<usize>> = vec![None; n + 1];
+        dp[0] = Some(0);
+        for i in 1..=n {
+            let mut best: Option<(i64, usize)> = None;
+            for j in (i.saturating_sub(MAX_TAIL_WORD))..i {
+                let Some(base) = dp[j] else {
+                    continue;
+                };
+                let word: String = run[j..i].iter().collect();
+                let freq: Option<i64> = match cache.get(&word) {
+                    Some(f) => *f,
+                    None => {
+                        let f: Option<i64> = stmt
+                            .query_row(params![word.as_str()], |r| r.get(0))
+                            .unwrap_or(None);
+                        cache.insert(word.clone(), f);
+                        f
+                    }
+                };
+                let Some(f) = freq else {
+                    continue;
+                };
+                let cand = base + f;
+                if best.map_or(true, |(b, _)| cand > b) {
+                    best = Some((cand, j));
                 }
-            };
-            let Some(f) = freq else {
-                continue;
-            };
-            let cand = base + f;
-            if best.map_or(true, |(b, _)| cand > b) {
-                best = Some((cand, j));
+            }
+            if let Some((cand, j)) = best {
+                dp[i] = Some(cand);
+                choice[i] = Some(j);
             }
         }
-        if let Some((cand, j)) = best {
-            dp[i] = Some(cand);
-            choice[i] = Some(j);
+        // 该段切不出 → 退回更前一段；能切 → 回溯词序列（末词 = 本行前词）
+        if dp[n].is_none() {
+            continue;
+        }
+        let mut words: Vec<String> = Vec::new();
+        let mut i = n;
+        while i > 0 {
+            let Some(j) = choice[i] else {
+                // dp[n] 已 Some，回溯链必然完整；此分支不可达，兜底防 unwrap
+                break;
+            };
+            words.push(run[j..i].iter().collect());
+            i = j;
+        }
+        words.reverse();
+        return Ok(Some(words));
+    }
+    Ok(None)
+}
+
+/// 把 `chars` 按「连续 CJK 汉字」切成 `(start, end)` 半开段。非汉字字符
+///（标点/数字/latin/空格）不入段、天然作分隔符。
+fn cjk_runs(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_cjk_word_char(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_cjk_word_char(chars[i]) {
+                i += 1;
+            }
+            runs.push((start, i));
+        } else {
+            i += 1;
         }
     }
-    if dp[n].is_none() {
-        return Ok(None);
-    }
-    // 回溯恢复词序列；末词 = 本行 text 的前词（真实落屏句的词边界）
-    let mut words: Vec<String> = Vec::new();
-    let mut i = n;
-    while i > 0 {
-        let Some(j) = choice[i] else {
-            return Ok(None);
-        };
-        words.push(chars[j..i].iter().collect());
-        i = j;
-    }
-    words.reverse();
-    Ok(Some(words))
+    runs
+}
+
+/// 判定字符是否可能是词库词的一部分（前缀切分的「可切分字符」）。生产词库的
+/// phrase text 全是汉字（标点/数字/latin/空格实测均不在表内），故按 Unicode
+/// CJK 统一表意文字区段判定：基本区 + 扩展 A。
+fn is_cjk_word_char(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }
 
 /// 纯词库词（带尾挖掘的前词）取（必要时建）vocab 行 id。

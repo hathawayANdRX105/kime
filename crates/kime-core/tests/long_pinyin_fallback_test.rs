@@ -76,23 +76,38 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
         e.key(k(c));
     }
     let cs: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
+    // 整句在前，随后是首音节 wo 的同音切分（我们都/握们/窝们），
+    // 最后追加首音节单字候选。B1 让每个跨度的同音词都成边，故同音
+    // 整句变体全部现身（改前每格只留最高频词，仅出我们都不知道）。
     assert_eq!(
         cs,
-        vec!["我们都不知道", "我", "握", "窝"],
-        "整句在前、首音节单字追加到末尾，实际 {cs:?}"
+        vec![
+            "我们都不知道",
+            "握们都不知道",
+            "窝们都不知道",
+            "我",
+            "握",
+            "窝"
+        ],
+        "整句在前、首音节同音切分居中、单字追加末尾，实际 {cs:?}"
     );
     match e.key(code_k(KEY_SPACE)) {
         Outcome::Commit(t) => assert_eq!(t, "我们都不知道"),
         other => panic!("expected Commit, got {:?}", other),
     }
     assert!(e.preedit().is_empty() && e.candidates().is_empty());
-    // 重新打长串，翻到末页选单字「窝」——追加的单字是一等候选
+    // 重新打长串，翻到末页选单字——追加的单字是一等候选（末页首条 = 全局索引 4 = 「握」）
     for c in "womendoubuzhidao".chars() {
         e.key(k(c));
     }
-    assert_eq!(e.page(), (0, 2));
+    // page() 的第二个元素是页大小（= config.page_size 2），不是总页数。
+    // 6 条候选 / page_size 2 = 3 页：第 1 页整句，第 2 页同音整句变体，
+    // 第 3 页才是追加的首音节单字（B1 多候选边带来的新页）。
+    assert_eq!(e.page().0, 0);
     assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
-    assert_eq!(e.page(), (1, 2), "末页应只剩追加的首音节单字");
+    assert_eq!(e.page().0, 1);
+    assert_eq!(e.key(code_k(KEY_EQUAL)), Outcome::Consumed);
+    assert_eq!(e.page().0, 2, "末页应只剩追加的首音节单字");
     match e.key(k('1')) {
         Outcome::Consumed => {}
         other => panic!("expected pending Consumed, got {:?}", other),
