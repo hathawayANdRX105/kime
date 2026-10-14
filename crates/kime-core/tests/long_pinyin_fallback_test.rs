@@ -96,7 +96,7 @@ fn long_pinyin_sentence_list_falls_back_to_first_syllable_chars() {
         other => panic!("expected Commit, got {:?}", other),
     }
     assert!(e.preedit().is_empty() && e.candidates().is_empty());
-    // 重新打长串，翻到末页选单字「窝」——追加的单字是一等候选
+    // 重新打长串，翻到末页选单字——追加的单字是一等候选（末页首条 = 全局索引 4 = 「握」）
     for c in "womendoubuzhidao".chars() {
         e.key(k(c));
     }
