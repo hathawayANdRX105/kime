@@ -1018,7 +1018,12 @@ impl Engine {
                         // 用整音节 join 做落位 key：奇数 pending 时句仍按 freq
                         // 落进补全区头部，不会被误判「未覆盖全输入」而挂到尾部。
                         let full_joined = joined_key(&syllables, "");
-                        Self::place_sentences(&mut self.candidates, sentences, &full_joined);
+                        Self::place_sentences(
+                            &mut self.candidates,
+                            sentences,
+                            &full_joined,
+                            &full_joined,
+                        );
                     }
                     // 缺陷 A 回退：以上全部落空（整串无词条、Viterbi 拼不出全覆盖句）
                     // 时，砍末音节逐档重查，让候选列表非空——用户至少能选到首音节的字。
@@ -1268,7 +1273,9 @@ impl Engine {
             // last_joined（shen'me'y）与句读音（shen'me）不匹配，句会被误判
             // 「未覆盖全输入」挂到列表尾部——按不含尾巴的 join 落补开区。
             let joined = joined_key(primary, "");
-            Self::place_sentences(&mut cands, sentences, &joined);
+            // 层一 key 取 last_joined（查词键），与 joined（句子覆盖键）在
+            // 歧义单音节输入下会脱钩，见 place_sentences 文档。
+            Self::place_sentences(&mut cands, sentences, &self.last_joined, &joined);
             // 其余切分的句候选**追加到末尾**并按文本去重：只查首切分会漏掉整个
             // 正确切分——「dangao」贪心切成 [dang,ao]，真词「蛋糕」只在
             // [dan,gao] 里，first() 一次 Viterbi 永远组不出它。去重让同文本保留
@@ -1456,8 +1463,23 @@ impl Engine {
     /// 用户敲长串时第一位永远是当前已敲音节的最优句子，词条分数不该把句
     /// 压到中间（用户实测长句被高频单字挤下第一后打断组句流）。
     /// 没覆盖全输入的句子（半截尾巴）不参与落位，挂末尾。
-    fn place_sentences(cands: &mut Vec<Candidate>, sentences: Vec<Candidate>, joined: &str) {
-        let l1_end = cands.iter().take_while(|c| c.pinyin == joined).count();
+    ///
+    /// 两个键分开：`l1_key` 是候选列表层一精确块的 pinyin 键（查词用的
+    /// `joined`，即 `self.last_joined`），`coverage_key` 是句子自身覆盖的
+    /// 读音。多数输入下两者同值，但会脱钩：
+    /// - 半截尾巴（`shenmey`）：查词键带尾 `shen'me'y`，句读法不带尾
+    ///   `shen'me`。按前者数 `l1_end` 得 0、按后者比覆盖——句落补全区
+    ///   头部，正是 fcitx5 语义。
+    /// - 歧义单音节输入（`xian` → `[[xian],[xi,an]]`）：查词键是首切分
+    ///   `xian`，句来自后续切分 `xi'an`。两键混用会把 `l1_end` 算成 0，
+    ///   句子插到精确块**之前**顶掉「先」；分开后句落精确块之后。
+    fn place_sentences(
+        cands: &mut Vec<Candidate>,
+        sentences: Vec<Candidate>,
+        l1_key: &str,
+        coverage_key: &str,
+    ) {
+        let l1_end = cands.iter().take_while(|c| c.pinyin == l1_key).count();
         // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
         // 否则频率折算会把更优的切分反-sort 到后面。
         let mut cursor = l1_end;
@@ -1465,7 +1487,7 @@ impl Engine {
             if cands.iter().any(|c| c.text == sentence.text) {
                 continue;
             }
-            let pos = if sentence.pinyin == joined {
+            let pos = if sentence.pinyin == coverage_key {
                 // fcitx5 组句语义：句恒落层一精确块之后、其余候选之前，
                 // 词条分数不把句压到中间（用户实测长句被高频单字挤下第一）。
                 cursor

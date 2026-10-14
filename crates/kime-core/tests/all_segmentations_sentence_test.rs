@@ -193,3 +193,35 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
     );
     let _ = fs::remove_file(&db);
 }
+
+/// 歧义单音节输入（`xian` → `[[xian],[xi,an]]`）的落位回归。
+///
+/// 首切分 `[xian]` 只有一个音节、不进 Viterbi；句来自后续切分 `[xi,an]`。
+/// 此时查词键（`last_joined` = `xian`，层一精确块的依据）与句子覆盖键
+/// （`xi'an`）**脱钩**——若两键混用，`l1_end` 被算成 0，句子插到层一精确块
+/// **之前**，把「先」顶下首位。旧实现此输入根本不跑 Viterbi，故无此回归。
+#[test]
+fn ambiguous_single_syllable_sentence_lands_after_layer_one() {
+    let db = tmp_db(
+        "xian",
+        "INSERT OR REPLACE INTO phrase(pinyin,text,freq,abbrev,user) VALUES
+           ('xian','先',900000,'x',0),
+           ('xian','现',800000,'x',0),
+           ('xi','西',200000,'x',0),
+           ('an','安',300000,'a',0);",
+    );
+    let mut e = engine(&db);
+    keys(&mut e, "xian");
+    let got = texts(&e);
+    let xi_an = position(&got, "西安").expect("后续切分 [xi,an] 应合成「西安」");
+    let first = position(&got, "先").expect("层一精确命中「先」必须在候选列");
+    assert_eq!(
+        first, 0,
+        "层一精确命中必须居首，不能被后续切分的句顶掉，实际 {got:?}"
+    );
+    assert!(
+        xi_an > first,
+        "后续切分的句必须落在层一精确块之后（先/现都在 xian 块内），实际 {got:?}"
+    );
+    let _ = fs::remove_file(&db);
+}
