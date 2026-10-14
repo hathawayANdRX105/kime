@@ -184,7 +184,21 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
            ('shen','什',9000,'s',0),
            ('me','么',8000,'m',0);",
     );
+    eprintln!(
+        "[kime-diag-FALLTAIL] db={} rows={:?}",
+        db.display(),
+        kime_core::dict::Dict::open(&db)
+            .unwrap()
+            .conn()
+            .prepare("SELECT pinyin||'='||text||'#'||abbrev FROM phrase ORDER BY pinyin")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>()
+    );
     let mut e = engine(&db);
+    eprintln!("[kime-diag-FALLTAIL] BEGIN fixture=什(shen)/么(me)");
     for c in "shenmey".chars() {
         let out = e.key(Key {
             ch: Some(c),
