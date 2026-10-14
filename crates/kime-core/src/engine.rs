@@ -1091,13 +1091,6 @@ impl Engine {
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
     fn refresh_full_pinyin(&mut self, fallback_sentences: bool) {
-        eprintln!(
-            "[kime-diag] ENTER refresh_full_pinyin tid={:?} letters={:?} fallback={} sp_active={}",
-            std::thread::current().id(),
-            self.letters,
-            fallback_sentences,
-            self.sp_active
-        );
         // 全拼候选按拼音字母消耗键串（双拼解码失败回退全拼时也走这里）。
         self.sp_active = false;
         let segs = segment(&self.letters);
@@ -1268,28 +1261,7 @@ impl Engine {
                 viterbi_inputs.push(&reading);
             }
         }
-        eprintln!(
-            "[kime-diag] VI-BUILD tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} inputs={:?} cands={:?}",
-            std::thread::current().id(),
-            self.letters,
-            segs,
-            reading,
-            tail,
-            viterbi_inputs,
-            cands.iter().map(|c| (c.text.clone(), c.pinyin.clone(), c.freq)).collect::<Vec<_>>()
-        );
         if let Some((primary, rest)) = viterbi_inputs.split_first() {
-            eprintln!(
-                "[kime-diag] tid={:?} letters={:?} segs={:?} reading={:?} tail={:?} primary={:?} rest={:?} cands={:?}",
-                std::thread::current().id(),
-                self.letters,
-                segs,
-                reading,
-                tail,
-                primary,
-                rest.len(),
-                cands.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
-            );
             let seed = self.context_seed();
             let sentences = crate::lattice::viterbi_sentences_seeded(
                 &self.dict,

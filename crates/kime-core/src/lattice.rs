@@ -309,14 +309,6 @@ fn extend_node(
         grow_with_words(prevs, dict, &cands, total, &mut dp[j]);
     }
     if !any_hit && !any_failed {
-        eprintln!(
-            "[kime-diag] PLACEHOLDER tid={:?} i={} n={} reading={:?} prevs={:?}",
-            std::thread::current().id(),
-            i,
-            n,
-            reading,
-            prevs.iter().map(|p| p.text.clone()).collect::<Vec<_>>()
-        );
         grow_with_placeholder(prevs, &reading[i], &mut dp[i + 1]);
     }
 }

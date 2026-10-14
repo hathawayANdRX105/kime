@@ -19,7 +19,6 @@
 use kime_core::config::Config;
 use kime_core::dict::Dict;
 use kime_core::engine::{Engine, Key};
-use kime_pinyin::segment as pinyin_segment;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -47,6 +46,7 @@ fn engine(db: &Path) -> Engine {
     Engine::new(
         Dict::open(db).expect("open dict"),
         Config {
+            shuangpin: None,
             dict_path: db.to_string_lossy().to_string(),
             ..Config::default()
         },
@@ -185,46 +185,8 @@ fn half_typed_tail_still_falls_back_to_completed_syllables() {
            ('shen','什',9000,'s',0),
            ('me','么',8000,'m',0);",
     );
-    eprintln!(
-        "[kime-diag-FALLTAIL] db={} rows={:?}",
-        db.display(),
-        kime_core::dict::Dict::open(&db)
-            .unwrap()
-            .conn()
-            .prepare("SELECT pinyin||'='||text||'#'||abbrev FROM phrase ORDER BY pinyin")
-            .unwrap()
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .flatten()
-            .collect::<Vec<_>>()
-    );
     let mut e = engine(&db);
-    for probe in ["shen", "shenm", "shenme", "shenmey"] {
-        eprintln!(
-            "[kime-diag-FALLTAIL] segment({:?}) = {:?}",
-            probe,
-            pinyin_segment(probe)
-        );
-    }
-    // BEGIN
-    for c in "shenmey".chars() {
-        let out = e.key(Key {
-            ch: Some(c),
-            code: 0,
-            shift: false,
-            ctrl: false,
-            alt: false,
-        });
-        eprintln!(
-            "[kime-diag-FALLTAIL] tid={:?} key {c:?} -> {out:?} letters={:?} cands={:?}",
-            std::thread::current().id(),
-            e.letters(),
-            e.candidates()
-                .iter()
-                .map(|x| (x.text.clone(), x.pinyin.clone(), x.freq, x.ai))
-                .collect::<Vec<_>>()
-        );
-    }
+    keys(&mut e, "shenmey");
     let got = texts(&e);
     assert!(
         got.contains(&"什么".to_string()),
