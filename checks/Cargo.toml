@@ -8,9 +8,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-check-core = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
-check-rust = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
-check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
+check-core = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-rust = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-git = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
 
 [[bin]]
 name = "checks"

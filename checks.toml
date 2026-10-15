@@ -6,3 +6,21 @@ endpoint = "http://127.0.0.1:8000" # laya（本机）；未运行时 semantic �
 
 # 策略层覆盖（check-core RuleOverride scope_*）：按需收口存量债。
 # 规则管判定、路径管策略——存量债不进热路径（changed 口径天然规避）。
+
+# ---- T11 后续：git 历史信号 + 依赖无环（canon #79/#80，tag check-v0.1.12）----
+# 热点/耦合/缺陷历史 = advisory（可疑信息不拦截）；dep-cycles = Deterministic FAIL。
+# kime 规模小、主干密度低，阈值取 canon 默认。
+[kinds.git-hotspot.kime]
+[kinds.git-coupling.kime]
+[kinds.git-defects.kime]
+[kinds.dep-cycles.kime]
+
+# git 信号的路径收口：manifest / lock / 文档类「与所有东西一起变」的噪声源。
+[rules."GIT.hotspot.kime"]
+scope_exclude = ["Cargo.lock", "Cargo.toml", "README.md", "ROADMAP.md", "corpus-dump.tsv"]
+
+[rules."GIT.coupling.kime"]
+scope_exclude = ["Cargo.lock", "Cargo.toml", "README.md", "ROADMAP.md", "corpus-dump.tsv"]
+
+[rules."GIT.defects.kime"]
+scope_exclude = ["Cargo.lock", "Cargo.toml", "README.md", "ROADMAP.md", "corpus-dump.tsv"]
