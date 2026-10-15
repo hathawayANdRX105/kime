@@ -74,7 +74,7 @@ dependencies = [
 [[package]]
 name = "check-core"
 version = "0.1.0"
-source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.9#b6d8e2b6bc7738c472ddc3233d48fd41cf614903"
+source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.12#2c2f73d91c24b932d3480807df7431095f6e80dd"
 dependencies = [
  "clap",
  "globset",
@@ -87,7 +87,7 @@ dependencies = [
 [[package]]
 name = "check-deps"
 version = "0.1.0"
-source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.9#b6d8e2b6bc7738c472ddc3233d48fd41cf614903"
+source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.12#2c2f73d91c24b932d3480807df7431095f6e80dd"
 dependencies = [
  "check-core",
  "globset",
@@ -97,11 +97,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "check-rust"
+name = "check-git"
 version = "0.1.0"
-source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.9#b6d8e2b6bc7738c472ddc3233d48fd41cf614903"
+source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.12#2c2f73d91c24b932d3480807df7431095f6e80dd"
 dependencies = [
  "check-core",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "check-rust"
+version = "0.1.0"
+source = "git+https://github.com/hathawayANdRX105/canon?tag=check-v0.1.12#2c2f73d91c24b932d3480807df7431095f6e80dd"
+dependencies = [
+ "check-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -110,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "check-core",
  "check-deps",
+ "check-git",
  "check-rust",
 ]
 
@@ -144,7 +158,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -304,7 +318,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -334,6 +348,17 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "syn"
+version = "2.0.119"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
 
 [[package]]
 name = "syn"

@@ -23,6 +23,6 @@ harness:
       cd "$ROOT" || exit 2
       BASE="${GATE_BASE:-origin/main}"
       cargo run -q --manifest-path checks/Cargo.toml -- check --root "$ROOT" \
-        --scope changed --base "$BASE" --class deterministic --canon --json
+        --scope changed --base "$BASE" --class deterministic --class advisory --canon --json
 optional: true # 依赖/工具缺失 → WARN 跳过，不假绿
 timeout: 600
