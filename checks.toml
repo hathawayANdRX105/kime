@@ -1,0 +1,8 @@
+# checks 规则库成员仓策略（T11 接入，SOP = canon specs/docs/CHECKS_ONBOARDING.md）。
+# 覆盖链：checks.toml → canon dispatch / severity_overrides（canon 保留最终话语权）。
+
+[semantic]
+endpoint = "http://127.0.0.1:8000" # laya（本机）；未运行时 semantic 类 → CHECKS-NOTCHECKED INFO
+
+# 策略层覆盖（check-core RuleOverride scope_*）：按需收口存量债。
+# 规则管判定、路径管策略——存量债不进热路径（changed 口径天然规避）。

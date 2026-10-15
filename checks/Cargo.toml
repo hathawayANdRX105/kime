@@ -1,0 +1,17 @@
+# 独立包：不进 kime workspace（公开 CI 不解析私仓 canon 依赖）。
+[workspace]
+
+[package]
+name = "checks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+check-core = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
+check-rust = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
+check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.9" }
+
+[[bin]]
+name = "checks"
+path = "src/main.rs"
