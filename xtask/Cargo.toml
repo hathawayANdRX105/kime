@@ -1,18 +1,12 @@
-# 独立包：不进 kime workspace（公开 CI 不解析私仓 canon 依赖）。
+# xtask 工作区：kime 的开发辅助命令集中地。
+#
+# 每个子目录是一个独立 crate（二进制），用 `cargo xtask <名字> …` 调用
+# （alias 见 .cargo/config.toml，指向本工作区）。check 子命令走 canon 规则库
+# 门禁。
+#
+# 本工作区刻意不进 kime 根 workspace：xtask 有自己的依赖节奏（canon 规则库按
+# tag 升级），独立 lock 让 `cargo build --workspace` 不牵动它。
+
 [workspace]
-
-[package]
-name = "xtask"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-check-core = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
-check-rust = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
-check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
-check-git = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
-
-[[bin]]
-name = "xtask"
-path = "src/main.rs"
+resolver = "2"
+members = ["check"]
