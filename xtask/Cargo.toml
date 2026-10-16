@@ -2,7 +2,7 @@
 [workspace]
 
 [package]
-name = "checks"
+name = "xtask"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -14,5 +14,5 @@ check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v
 check-git = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
 
 [[bin]]
-name = "checks"
+name = "xtask"
 path = "src/main.rs"
