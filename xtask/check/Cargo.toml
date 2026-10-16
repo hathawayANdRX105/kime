@@ -1,0 +1,16 @@
+# kime 门禁入口：canon 规则库 crate，跑在 xtask/ 工作区里（成员见上级 xtask/Cargo.toml）。
+[package]
+name = "xtask-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+check-core = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-rust = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-deps = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+check-git = { git = "https://github.com/hathawayANdRX105/canon", tag = "check-v0.1.12" }
+
+[[bin]]
+name = "check"
+path = "src/main.rs"
