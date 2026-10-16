@@ -8,7 +8,7 @@ jobs = 4
 # （勿用 [env] RUSTC_WRAPPER：cargo 启动时自读该变量，[env] 够不着）
 rustc-wrapper = "sccache"
 
-# canon 规则库入口（checks/ 独立包，D8 的 cargo xtask 形态——独立包设计下
+# canon 规则库入口（xtask/ 独立包，D8 的 cargo xtask 形态——独立包设计下
 # 不能用 -p，走 --manifest-path）。成员仓检查统一入口：cargo xtask <list|check|explain>
 [alias]
-xtask = "run -q --manifest-path checks/Cargo.toml --"
+xtask = "run -q --manifest-path xtask/Cargo.toml --"

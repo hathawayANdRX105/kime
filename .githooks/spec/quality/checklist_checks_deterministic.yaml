@@ -1,7 +1,7 @@
 # CHECKS-DETERMINISTIC: canon 规则库（check-rust / check-deps）成员仓入口
 # 为什么: D9 迁移——规则由 Rust 规则 crate 执行，经 canon 引擎统一
 #   severity/拦截/处置。规则目录:
-#   `cargo run -q --manifest-path checks/Cargo.toml -- explain <id>`
+#   `cargo run -q --manifest-path xtask/Cargo.toml -- explain <id>`
 # 范围: changed 口径（GATE_BASE 回落 origin/main）——只判本次改动文件。
 #   全仓审计手动跑：把 --scope changed 换成 --scope all。
 # 不挂 pre-commit（首次冷编成本）；pre-push 等预构建产物落地再加。
@@ -22,7 +22,7 @@ harness:
       ROOT=$(git rev-parse --show-toplevel)
       cd "$ROOT" || exit 2
       BASE="${GATE_BASE:-origin/main}"
-      cargo run -q --manifest-path checks/Cargo.toml -- check --root "$ROOT" \
+      cargo run -q --manifest-path xtask/Cargo.toml -- check --root "$ROOT" \
         --scope changed --base "$BASE" --class deterministic --class advisory --canon --json
 optional: true # 依赖/工具缺失 → WARN 跳过，不假绿
 timeout: 600
