@@ -33,7 +33,7 @@ Related #
 - [ ] `cargo fmt --all --check` 通过
 - [ ] `cargo clippy --all-targets -- -D warnings` 无告警
 - [ ] `cargo test` 通过（CI 跑，本地不跑）
-## 审查记录（closeout 硬规则）
+## Review record (closeout hard rule)
 
 <!-- 收尾审查后填写。每条发现一行, 不许静默漏项; 驳回要写理由 -->
 | 发现 | 来源 | 严重度 | 处置 |
