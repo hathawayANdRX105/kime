@@ -96,6 +96,7 @@ fn tail_ctx_rows(d: &Dict) -> Vec<Option<String>> {
 
 #[test]
 fn second_commit_uses_context_chain_without_duplicate_tail() {
+    let db = tmp_db("advance");
     let mut e = pinyin_engine(&db);
     // 会话前文「加回来」：模拟 surrounding_text 会话开始时给到的尾巴。
     e.set_context(Some("加回来".to_string()));
