@@ -1232,9 +1232,8 @@ fn sp_odd_pending_keeps_sentence_in_pool() {
     // 双拼 niqrqtn = 键对 n+i=ni, q+r=quan, q+t=que, 半截 n（奇数 pending）。
     // 主查补开区间 [ni'quan'que'n, ...) = 你全却呢(3000)/你全却能(1)；
     // 全覆盖 Viterbi 句 = 你 + 全却 → 「你全却」（文本与 L1/L2 词互异）。
-    // 修前句 pinyin（完整音节 join）匹配不到含 pending 的 sp_joined 被挂尾；
-    // 修后按整音节 join 落位，句恒插层一精确块之后（merge 保护段保证
-    // 首音节单字交错后句仍居首）——fcitx5 组句语义：长句恒在第一。
+    // 有末键半截时句只覆盖完成音节，不覆盖整输入：匹配半截声母的前缀补全
+    //（你全却呢/你全却能）必须先于只覆盖完成音节的句「你全却」。
     let (mut e, db, yaml) = engine_with_sp_sentence_fixture();
     for c in "niqrqtn".chars() {
         e.key(k(c));
@@ -1247,9 +1246,8 @@ fn sp_odd_pending_keeps_sentence_in_pool() {
         "全覆盖句候选「你全却」必须在列表内：{cands:?}"
     );
     assert!(
-        idx("你全却") < idx("你全却呢") && idx("你全却") < idx("你全却能"),
-        "句须恒在层一精确块之后、其余候选之前（fcitx5 组句语义），\
-         不许按词条分数被压到中间：{cands:?}"
+        idx("你全却呢") < idx("你全却") && idx("你全却能") < idx("你全却"),
+        "匹配半截声母的前缀补全须先于只覆盖完成音节的句：{cands:?}"
     );
     let _ = fs::remove_file(&db);
     let _ = fs::remove_file(&yaml);

@@ -92,10 +92,10 @@ fn tail_ctx_rows(d: &Dict) -> Vec<Option<String>> {
         .unwrap()
 }
 
-// ── 需求 1 + 2：连续两次上屏，第二条 tail_ctx 含第一次上屏文本（追加非覆盖） ──
+// ── 两次 CJK 上屏使用 ctx_id 连接，tail_ctx 只补 kime 会话外前文 ──
 
 #[test]
-fn second_commit_tail_contains_first_committed_text() {
+fn second_commit_uses_context_chain_without_duplicate_tail() {
     let db = tmp_db("advance");
     let mut e = pinyin_engine(&db);
     // 会话前文「加回来」：模拟 surrounding_text 会话开始时给到的尾巴。
@@ -108,8 +108,8 @@ fn second_commit_tail_contains_first_committed_text() {
     // 上屏后尾巴推进：加回来 + 进度（追加，非覆盖为 进度）。
     assert_eq!(e.context_tail(), Some("加回来进度"));
 
-    // 第二次上屏：type shijie → 选 世界。此刻 context = 加回来进度，
-    // 故 commit_log 第 2 行 tail_ctx = 加回来进度（含第一次上屏的 进度）。
+    // 第二次上屏：type shijie → 选 世界。相邻前词由 ctx_id 链精确记录；tail_ctx
+    // 只作为无 kime 前词时的回退，避免离线挖掘把同一 bigram 从两路重复计数。
     type_pinyin(&mut e, "shijie");
     assert_commit(&mut e, "世界");
     assert_eq!(e.context_tail(), Some("加回来进度世界"));
@@ -122,12 +122,26 @@ fn second_commit_tail_contains_first_committed_text() {
     assert_eq!(
         rows[0].as_deref(),
         Some("加回来"),
-        "第 1 行 tail = 上屏前文（未被第一次上屏覆盖/推进）"
+        "首词用 surrounding tail 补充会话前文"
     );
     assert_eq!(
-        rows[1].as_deref(),
-        Some("加回来进度"),
-        "第 2 行 tail 含第一次上屏文本 进度（会话内尾巴前进）"
+        rows[1], None,
+        "有明确的 kime 前词时不再重复保存 tail 生成同一 bigram"
+    );
+    let ctx: (String, String) = d
+        .conn()
+        .query_row(
+            "SELECT pv.text, pv.reading
+             FROM commit_log c JOIN vocab pv ON pv.id = c.ctx_id
+             WHERE c.rowid = (SELECT max(rowid) FROM commit_log)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        ctx,
+        ("进度".into(), "jin'du".into()),
+        "后词通过 ctx_id 精确连接前词"
     );
     let _ = fs::remove_file(&db);
 }

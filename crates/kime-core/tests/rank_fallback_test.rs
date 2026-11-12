@@ -1,4 +1,4 @@
-//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；英文整体排在全部中文之后。
+//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；英文精确词高于中文补全。
 //!
 //! fixture 刻意只放单词且第二音节无字——Viterbi 拼不出全覆盖句，正是缺陷 A 的
 //! 触发条件（修复前列表为空）。preedit 语义单列断言钉住：回退只补候选，不改显示。
@@ -98,9 +98,9 @@ fn single_syllable_input_needs_no_fallback() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// 全拼中英文精确命中优先于不匹配拼音的中文补全。
 #[test]
-fn full_pinyin_english_sits_after_all_chinese() {
-    // 打 day：中文只有补全块（da'y*），英文精确词 day 不得插到中文前面。
+fn full_pinyin_english_exact_precedes_chinese_completion() {
     let (mut e, dir) = engine_at("en_full", None);
     type_letters(&mut e, "day");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -108,22 +108,17 @@ fn full_pinyin_english_sits_after_all_chinese() {
         .iter()
         .position(|t| t.eq_ignore_ascii_case("day"))
         .expect("英文精确词 day 在场");
-    assert!(
-        texts[..en_pos]
-            .iter()
-            .all(|t| !t.eq_ignore_ascii_case("day")),
-        "day 之前不得再出现英文；列表 {texts:?}"
-    );
-    assert!(
-        texts.iter().take(en_pos).any(|t| t == "打印"),
-        "中文补全 打印 必须在 day 之前：{texts:?}"
-    );
+    let chinese_pos = texts
+        .iter()
+        .position(|t| t == "打印")
+        .expect("中文补全 打印 在场");
+    assert!(en_pos < chinese_pos, "英文精确词应先于中文补全：{texts:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// 双拼模式同样按原始按键串匹配英文精确词，且优先于中文补全。
 #[test]
-fn shuangpin_english_sits_after_all_chinese() {
-    // 双拼串里含英文段：英文块整体在中文之后。
+fn shuangpin_english_exact_precedes_chinese_completion() {
     let (mut e, dir) = engine_at("en_sp", Some(kime_shuangpin::Scheme::Ziranma));
     type_letters(&mut e, "day");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -131,9 +126,13 @@ fn shuangpin_english_sits_after_all_chinese() {
         .iter()
         .position(|t| t.eq_ignore_ascii_case("day"))
         .expect("英文精确词 day 在场");
+    let chinese_pos = texts
+        .iter()
+        .position(|t| t == "打印" || t == "大约")
+        .expect("中文补全在场");
     assert!(
-        texts[..en_pos].iter().any(|t| t == "打印" || t == "大约"),
-        "day 之前必须有中文候选：{texts:?}"
+        en_pos < chinese_pos,
+        "双拼英文精确词应先于中文补全：{texts:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }

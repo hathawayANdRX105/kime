@@ -414,6 +414,90 @@ fn apply_tail_plan(
 /// → `None`，该行不参与挖掘。
 /// 段内仍取**总频率最高**的完整切分方案（DP；模型选方案是 #88 的活，本期不做）。
 /// `cache` 跨段共享：同一词在不同段里只查一次 phrase 表。
+/// 单个连续 CJK 段的最大总频率前缀 DP 切分：`run` 能被词库词完整切分时
+/// 返回该段的词序列（出现顺序），否则返回 `None`。
+///
+/// 纯最大总频率前缀 DP，与带尾挖掘历史行为一致：**不做整段短语优先**，
+/// 仅供 `split_tail_by_dict` 复用，保证尾挖掘语义不受输出文本的整段短语
+/// 优先策略影响（输出文本走 `segment_output_text` 的独立策略）。
+///
+/// 词判定 = phrase 表有 `text = 词` 的行；词频率 = 该 text 所有行的 MAX(freq)；
+/// `cache` 跨段复用（同一文本只查一次 phrase 表）。`stmt` 由调用方复用，
+/// 必须是 `SELECT MAX(freq) FROM phrase WHERE text = ?1`。
+fn segment_cjk_run(
+    stmt: &mut rusqlite::Statement<'_>,
+    run: &[char],
+    cache: &mut HashMap<String, Option<i64>>,
+) -> rusqlite::Result<Option<Vec<String>>> {
+    // 最大总频率前缀 DP（词长上限 MAX_TAIL_WORD）
+    let n = run.len();
+    let mut dp: Vec<Option<i64>> = vec![None; n + 1];
+    let mut choice: Vec<Option<usize>> = vec![None; n + 1];
+    dp[0] = Some(0);
+    for i in 1..=n {
+        let mut best: Option<(i64, usize)> = None;
+        for j in (i.saturating_sub(MAX_TAIL_WORD))..i {
+            let Some(base) = dp[j] else {
+                continue;
+            };
+            let word: String = run[j..i].iter().collect();
+            let freq: Option<i64> = match cache.get(&word) {
+                Some(f) => *f,
+                None => {
+                    let f: Option<i64> = stmt
+                        .query_row(params![word.as_str()], |r| r.get(0))
+                        .unwrap_or(None);
+                    cache.insert(word.clone(), f);
+                    f
+                }
+            };
+            let Some(f) = freq else {
+                continue;
+            };
+            let cand = base + f;
+            if best.map_or(true, |(b, _)| cand > b) {
+                best = Some((cand, j));
+            }
+        }
+        if let Some((cand, j)) = best {
+            dp[i] = Some(cand);
+            choice[i] = Some(j);
+        }
+    }
+    // 段内无法完整切分 → None；能切 → 回溯出词序列（出现顺序）
+    if dp[n].is_none() {
+        return Ok(None);
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut i = n;
+    while i > 0 {
+        let Some(j) = choice[i] else {
+            // dp[n] 已 Some，回溯链必然完整；此分支不可达，兜底防 unwrap
+            break;
+        };
+        words.push(run[j..i].iter().collect());
+        i = j;
+    }
+    words.reverse();
+    Ok(Some(words))
+}
+
+/// 按词库前缀把 `tail`（落屏句的上屏前文尾）切成词序列（带尾挖掘的私有工具）。
+///
+/// 词判定 = phrase 表有 `text = 词` 的行（等价 `Dict::lookup_prefix` 的 exact
+/// 块——词库有无该词）；词频率 = 该 text 所有行的 MAX(freq)（代表频率，与
+/// 拼音行无关）。
+///
+/// 切分按**连续可切分字符段**做，不再要求整条 tail 被词库词完整覆盖：
+/// 非汉字字符（标点/数字/latin/空格）不作断链点，而是天然分隔符——它们不在
+/// phrase 表，把 tail 切成若干汉字段，每段独立跑前缀 DP（词长仍限
+/// `MAX_TAIL_WORD`）。任一段能**完整切出**词即算可行，取**最靠末尾的可行段**
+/// 的末词作前词：末词必须贴着本次提交的上文，越靠后的段越靠近落屏句词边界。
+/// 末段切不出（末字未收/正在打的残词）而前段能时，退回前段末词（仍贴着上文，
+/// 比整行丢弃更接近真实相邻对）。所有段都切不出（纯标点/数字/latin/未收字）
+/// → `None`，该行不参与挖掘。
+/// 段内仍取**总频率最高**的完整切分方案（DP；模型选方案是 #88 的活，本期不做）。
+/// `cache` 跨段共享：同一词在不同段里只查一次 phrase 表。
 fn split_tail_by_dict(
     conn: &Connection,
     tail: &str,
@@ -427,57 +511,9 @@ fn split_tail_by_dict(
     let mut stmt = conn.prepare("SELECT MAX(freq) FROM phrase WHERE text = ?1")?;
     // 从末段往回逐段前缀 DP：命中第一个可完整切分的段即停，其末词 = 前词。
     for &(start, end) in runs.iter().rev() {
-        let run = &chars[start..end];
-        let n = run.len();
-        let mut dp: Vec<Option<i64>> = vec![None; n + 1];
-        let mut choice: Vec<Option<usize>> = vec![None; n + 1];
-        dp[0] = Some(0);
-        for i in 1..=n {
-            let mut best: Option<(i64, usize)> = None;
-            for j in (i.saturating_sub(MAX_TAIL_WORD))..i {
-                let Some(base) = dp[j] else {
-                    continue;
-                };
-                let word: String = run[j..i].iter().collect();
-                let freq: Option<i64> = match cache.get(&word) {
-                    Some(f) => *f,
-                    None => {
-                        let f: Option<i64> = stmt
-                            .query_row(params![word.as_str()], |r| r.get(0))
-                            .unwrap_or(None);
-                        cache.insert(word.clone(), f);
-                        f
-                    }
-                };
-                let Some(f) = freq else {
-                    continue;
-                };
-                let cand = base + f;
-                if best.map_or(true, |(b, _)| cand > b) {
-                    best = Some((cand, j));
-                }
-            }
-            if let Some((cand, j)) = best {
-                dp[i] = Some(cand);
-                choice[i] = Some(j);
-            }
+        if let Some(words) = segment_cjk_run(&mut stmt, &chars[start..end], cache)? {
+            return Ok(Some(words));
         }
-        // 该段切不出 → 退回更前一段；能切 → 回溯词序列（末词 = 本行前词）
-        if dp[n].is_none() {
-            continue;
-        }
-        let mut words: Vec<String> = Vec::new();
-        let mut i = n;
-        while i > 0 {
-            let Some(j) = choice[i] else {
-                // dp[n] 已 Some，回溯链必然完整；此分支不可达，兜底防 unwrap
-                break;
-            };
-            words.push(run[j..i].iter().collect());
-            i = j;
-        }
-        words.reverse();
-        return Ok(Some(words));
     }
     Ok(None)
 }
@@ -506,6 +542,51 @@ fn cjk_runs(chars: &[char]) -> Vec<(usize, usize)> {
 /// CJK 统一表意文字区段判定：基本区 + 扩展 A。
 fn is_cjk_word_char(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
+}
+/// 把刚提交的输出文本 `text` 按词库切成可供线上学习和离线 LM 的 CJK 词组。
+///
+/// 非 CJK 字符（标点/数字/latin/空格）作分隔、不入组；每个连续 CJK 段
+/// 独立切分。
+///
+/// 切分策略（与带尾挖掘的 `split_tail_by_dict` 故意分离，避免影响尾挖掘语义）：
+/// 先把整段当作一个已收录短语（如「吃了么」整段上屏时不应被拆成高频单字）；
+/// 整段在 phrase 表命中则直接返回该单词；否则退回最大总频率前缀 DP。
+///
+/// 保守策略：任一非空 CJK 段若无法被词库词完整切分，返回空 Vec（跳过本次
+/// 提交，宁缺毋滥，不把半成句/未收字当成词学进 LM）；无 CJK 或空文本亦
+/// 返回空 Vec。返回按出现顺序排列的 CJK 词组，每组内是按顺序排列的词。
+pub fn segment_output_text(conn: &Connection, text: &str) -> rusqlite::Result<Vec<Vec<String>>> {
+    let chars: Vec<char> = text.chars().collect();
+    let runs = cjk_runs(&chars);
+    if runs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT MAX(freq) FROM phrase WHERE text = ?1")?;
+    let mut cache = HashMap::new();
+    let mut groups: Vec<Vec<String>> = Vec::with_capacity(runs.len());
+    for &(start, end) in &runs {
+        let run = &chars[start..end];
+        // 先按整段短语命中处理（已收录常用短语整段保留）。
+        let whole: String = run.iter().collect();
+        let whole_freq: Option<i64> = match cache.get(&whole) {
+            Some(f) => *f,
+            None => {
+                let f: Option<i64> = stmt
+                    .query_row(params![whole.as_str()], |r| r.get(0))
+                    .unwrap_or(None);
+                cache.insert(whole.clone(), f);
+                f
+            }
+        };
+        match whole_freq {
+            Some(_) => groups.push(vec![whole]),
+            None => match segment_cjk_run(&mut stmt, run, &mut cache)? {
+                Some(words) => groups.push(words),
+                None => return Ok(Vec::new()),
+            },
+        }
+    }
+    Ok(groups)
 }
 
 /// 纯词库词（带尾挖掘的前词）取（必要时建）vocab 行 id。

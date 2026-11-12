@@ -5,13 +5,14 @@
 //! - `Ignored`  → 放行（wayland 下 release grab）
 //! - `Commit`   → commit_string(文本)，engine 内部已清空组合状态
 //!
-//! 内部流：letters 累积 → [`kime_pinyin::segment`] → [`Dict::lookup_prefix`]
-// → 候选。不做任何 I/O；切分非法时保持旧状态（无声可打即无候选）。
+//! 字母累积 → [`kime_pinyin::segment`] / 双拼解码 → [`Dict::lookup_prefix`] → 候选。
+//! 候选组合路径不写数据库；最终 Commit 只读词库分词，并把学习写入异步队列。
 
 use crate::config::Config;
 use crate::context::append_tail;
 use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
+use crate::lm::segment_output_text;
 use crate::punct;
 use kime_pinyin::segment;
 use std::io::Write;
@@ -284,10 +285,13 @@ impl Engine {
         pending_len + idx.min(pe_len)
     }
 
-    /// 更新输入框上下文尾巴（平台壳在 `surrounding_text` 事件时调用）。
-    /// `None` = 光标前无可用上下文。与组合生命周期无关：清组合不清上下文。
+    /// 更新输入框上下文尾巴（平台壳在非 input-method echo 的 `surrounding_text` 批次调用）。
+    /// `None` = 光标前无可用上下文。外部文本/光标编辑会终止 kime 提交词链，避免把
+    /// 不相邻的输出学成 bigram；kime 自己的 Commit echo 由平台壳过滤，不影响连续输入。
     pub fn set_context(&mut self, tail: Option<String>) {
         self.context = tail;
+        self.last_commit = None;
+        self.dict.set_lm_context(None);
     }
 
     /// 当前上下文尾巴（分词 / 排序的上下文输入），无上下文时 `None`。
@@ -319,13 +323,10 @@ impl Engine {
         self.preedit_display = s;
     }
 
-    /// 选词入缓冲：learn + 消耗被选候选覆盖的音节 + 词进 pending_words +
-    /// 撤销条目入栈。不含「全覆盖立即上屏」判断——标点等终结键需要
-    /// 强制入缓冲时单独调这个。
+    /// 选词入缓冲：消耗候选覆盖的音节、词进 pending_words、撤销条目入栈。
+    /// 学习只在最终输出文本通过 `commit_output` 时发生。
     fn stage_candidate(&mut self, cand: &Candidate) {
         let text = cand.text.clone();
-        self.learn_or_warn(cand);
-
         let consumed: Vec<String> = if cand.pinyin.is_empty() {
             self.last_reading.clone()
         } else {
@@ -376,12 +377,9 @@ impl Engine {
         text
     }
 
-    /// 选词（#81）：learn + 清空候选/页码，但**只消耗被选候选覆盖的
-    /// 音节**，剩余字母重组回 letters 继续组词。词先入 pending_words：
-    /// 部分覆盖时留在缓冲等整串覆盖一起上屏（与 fcitx5 的 preedit 留
-    /// 词同构）；**全覆盖时立即上屏**（fcitx5 语义，本函数内直接
-    /// Commit）。撤销栈条目同步入栈：退格弹 pending 成对弹出；上屏即
-    /// 整链清空（#96：上屏 = 撤销链死亡）。
+    /// 选词：清空候选/页码，但只消耗被选候选覆盖的音节，剩余字母重组回 letters
+    /// 继续组词。词先入 pending_words；只有最终实际 Commit 后，commit_output 才按
+    /// 发出的完整文本分词学习。撤销栈条目同步入栈；上屏即整链清空（#96）。
     ///
     /// 候选自带读音（pinyin 按 `'` 切分）：打长串 `womendoubuzhidao`
     /// 翻页选了「我」后剩余音节拼回字母串，refresh_candidates 重新
@@ -407,7 +405,7 @@ impl Engine {
             self.cursor = 0;
             self.last_joined.clear();
             self.rebuild_preedit_display();
-            return Outcome::Commit(committed);
+            return Outcome::Commit(self.commit_output(committed));
         }
 
         if !self.letters.is_empty() {
@@ -459,7 +457,7 @@ impl Engine {
             // 输入串结束，撤销链随组合消亡。
             self.clear_composition();
             self.chinese = false;
-            return Outcome::Commit(text);
+            return Outcome::Commit(self.commit_output(text));
         }
 
         // 英文模式：除上面已处理的 Shift 外，其余键一律放行。
@@ -634,7 +632,7 @@ impl Engine {
                 self.last_joined.clear();
                 self.last_reading.clear();
                 self.preedit_display.clear();
-                return Outcome::Commit(text);
+                return Outcome::Commit(self.commit_output(text));
             }
             if !self.letters.is_empty() {
                 // 选完全部候选后残留拼音无候选可组：空格原样上屏收尾
@@ -642,7 +640,7 @@ impl Engine {
                 // 修前此处 Ignored 放行、残串挂 preedit 里不输出）。
                 let text = self.letters.clone();
                 self.clear_composition();
-                return Outcome::Commit(text);
+                return Outcome::Commit(self.commit_output(text));
             }
             return Outcome::Ignored;
         }
@@ -664,7 +662,7 @@ impl Engine {
                     self.quote_open = None;
                     // 标点上屏 = 输入串结束：清空撤销栈
                     self.undo_consumed.clear();
-                    return Outcome::Commit(c.to_string());
+                    return Outcome::Commit(self.commit_output(c.to_string()));
                 }
                 // 成对引号：map_punct 只给开引号；连着按的第二次在这里换成闭引号。
                 let closing = self.quote_open == Some(c);
@@ -683,12 +681,12 @@ impl Engine {
                     // 此处再清一遍保底）。
                     if self.pending_words.is_empty() {
                         self.undo_consumed.clear();
-                        return Outcome::Commit(mapped.to_string());
+                        return Outcome::Commit(self.commit_output(mapped.to_string()));
                     }
                     // pending 释放：经 release_words 连 pending 带栈一起清（#96）
                     let text = self.release_words();
                     self.preedit_display.clear();
-                    return Outcome::Commit(format!("{text}{mapped}"));
+                    return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
                 } else if !self.candidates.is_empty() {
                     // 情况 B（fcitx5 顶字）：标点前先上屏当前页首候选；候选
                     // 覆盖剩余拼音时词直入缓冲，最后 preedit 全部（词 + 原样
@@ -700,14 +698,14 @@ impl Engine {
                     text.push_str(mapped);
                     self.pending_words.clear();
                     self.clear_composition();
-                    return Outcome::Commit(text);
+                    return Outcome::Commit(self.commit_output(text));
                 } else {
                     // 情况 C：无候选词，字母串（连同 pending 整段）+ 标点
-                    // 原样上屏（= 输入串结束：clear_composition 清 pending 与撤销栈）
+                    // 原样上屏（= 输入串结束：clear_composition 清 pending 与撤销栈）。
                     let pending_text = self.pending_words.join("");
                     let text = format!("{pending_text}{}", self.letters);
                     self.clear_composition();
-                    return Outcome::Commit(format!("{text}{mapped}"));
+                    return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
                 }
             }
         }
@@ -749,14 +747,14 @@ impl Engine {
                 // 消失、撤销栈清空（输入串结束）。
                 let text = format!("{}{}", self.pending_words.join(""), self.letters);
                 self.clear_composition();
-                return Outcome::Commit(text);
+                return Outcome::Commit(self.commit_output(text));
             }
             if !self.pending_words.is_empty() {
                 // 无字母有 pending（#81）：Enter = 整段释放；release_words
                 // 连 pending 带栈一起清（#96：上屏即链死）。
                 let text = self.release_words();
                 self.preedit_display.clear();
-                return Outcome::Commit(text);
+                return Outcome::Commit(self.commit_output(text));
             }
             return Outcome::Ignored;
         }
@@ -826,55 +824,109 @@ fn joined_key(syllables: &[String], tail: &str) -> String {
 }
 
 impl Engine {
-    /// 学习以**被选候选自己的 pinyin** 为准：多切分查询后 last_reading 只反映首切分
-    /// （打 "dangao" 选「蛋糕」时它是 ["dang"]），拿它学习会把用户词学到错误读音下。
-    /// 候选自带读音 = pinyin 按 `'` 切分；外部注入（AI）候选没带时回退 last_reading。
-    fn learn_or_warn(&mut self, cand: &Candidate) {
-        let reading: Vec<String> = if cand.pinyin.is_empty() {
-            self.last_reading.clone()
-        } else {
-            cand.pinyin.split('\'').map(str::to_string).collect()
+    /// 提交上屏学习：以 `Outcome::Commit` 发出的文本为准，候选预选/取消不学习。
+    /// 已知完整短语保留为一个词；其余文本按词库频率 DP 分词后再学习。
+    ///
+    /// `tail_ctx` 是提交前上下文快照，只为首个 CJK 词、且没有前一条 kime 提交时
+    /// 作为回退证据；后续词通过 `ctx_id` 精确连接，避免 tail 路径重复计数。
+    /// 标点和 ASCII 分隔的 CJK 段不互相建立相邻关系。引擎上下文最终只追加一次完整
+    /// 输出文本，文本包含标点/ASCII 时也完整保留。
+    ///
+    /// kime 发出 Commit 后协议不提供应用接收确认或完整文档读取，因此这里学习的是
+    /// kime 发给应用的准确提交串，不声称它等于应用最终保存的完整句子。
+    /// 学习写入异步入队；分词和读音反查仅做只读 SQLite 查询。
+    fn commit_output(&mut self, text: String) -> String {
+        let tail_ctx = self.context.as_deref().unwrap_or("").to_string();
+
+        let starts_cjk = text.chars().next().map(is_cjk).unwrap_or(false);
+        if !starts_cjk {
+            self.last_commit = None;
+        }
+
+        let runs = match segment_output_text(self.dict.conn(), &text) {
+            Ok(runs) if !runs.is_empty() => runs,
+            _ => {
+                self.last_commit = None;
+                self.dict.set_lm_context(None);
+                self.context = Some(append_tail(&tail_ctx, &text));
+                return text;
+            }
         };
-        // 离线 LM 原材料：只带原始串入队，落库与 vocab 解析都在后台写线程
-        // （#101：键路径零 SQLite 写）。tail = 引擎自持的上屏前文尾
-        // （surrounding_text 末段），随 commit 落 tail_ctx 列，离线挖掘按
-        // 词库前缀切出真实相邻对（#89）。壳层零改动。
+
+        let tail_pending = if starts_cjk
+            && self.last_commit.is_none()
+            && !tail_ctx.is_empty()
+            && tail_ctx.chars().next_back().is_some_and(is_cjk)
+        {
+            Some(tail_ctx.as_str())
+        } else {
+            None
+        };
+        let mut tail_pending = tail_pending;
+        let run_count = runs.len();
+        for (run_index, run) in runs.into_iter().enumerate() {
+            for word in run {
+                let Some((reading, _freq)) = self
+                    .dict
+                    .readings_of_text(&word, 1)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                else {
+                    self.last_commit = None;
+                    self.dict.set_lm_context(None);
+                    tail_pending = None;
+                    continue;
+                };
+                let syllables: Vec<String> = reading.split('\'').map(str::to_owned).collect();
+                if syllables.iter().any(|s| s.is_empty()) {
+                    continue;
+                }
+                self.learn_commit_word(&word, &syllables, tail_pending.take());
+            }
+            // 段之间不建立相邻对：标点/ASCII 断链；最后一段保留末词作为下次上文。
+            if run_index + 1 < run_count {
+                self.last_commit = None;
+                self.dict.set_lm_context(None);
+                tail_pending = None;
+            }
+        }
+
+        let ends_cjk = text.chars().next_back().map(is_cjk).unwrap_or(false);
+        if !ends_cjk {
+            self.last_commit = None;
+            self.dict.set_lm_context(None);
+        }
+
+        self.context = Some(append_tail(&tail_ctx, &text));
+        text
+    }
+
+    /// 单词级提交学习（原 `learn_or_warn` 的整候选逻辑，现下放到提交时段内逐词执行）。
+    ///
+    /// `reading` 已按 `'` 拆成音节，确保用户词缩写与候选读音保持一致。
+    fn learn_commit_word(&mut self, word: &str, reading: &[String], tail_ctx: Option<&str>) {
         let prev = self.last_commit.take();
+        let tail = if prev.is_none() { tail_ctx } else { None };
         self.dict.enqueue_log_commit(
             prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
-            &reading,
-            &cand.text,
-            self.context.as_deref(),
+            reading,
+            word,
+            tail,
         );
-        self.last_commit = Some((cand.text.clone(), reading.join("'")));
-        // 上下文尾巴自持推进（为什么见 [`append_tail`] 模块文档）：壳层对 kime
-        // 自己的上屏回声（text_change_cause == INPUT_METHOD）不推引擎
-        // （platform-wayland context_batch.rs 的 Echo 裁决），除非引擎在每次
-        // 成功上屏后把本次词追加进 self.context，否则一场会话内 tail_ctx 冻结
-        // 在会话语前文本，离线挖掘从中切出错误相邻对。热路径 context_seed 组句
-        // 种子读同一份尾巴，一并受益。须在 enqueue_log_commit 之后：上面读到的
-        // self.context 是「上屏前」尾（本次落库用），追加后才是下次上屏前文。
-        let current = self.context.as_deref().unwrap_or("");
-        let advanced = append_tail(current, &cand.text);
-        self.context = Some(advanced);
-        // LM 上下文 = 刚提交的词：装载其后继计数，下一次按键的候选排序即生效。
-        // 顺手检查世代号（离线挖掘跑过则重载缓存）；只读查询，miss 不写库。
+        self.last_commit = Some((word.to_string(), reading.join("'")));
         self.dict.set_lm_context(
             self.last_commit
                 .as_ref()
                 .map(|(t, r)| (t.as_str(), r.as_str())),
         );
-        // 内存提频当帧生效（2026-09-15 拍板「使用即提升当场生效」），持久化
-        // 另走入队；learn_mem 成功才 enqueue，与旧 `learn` = 内存 + 持久化的
-        // 成功序一致。stderr 写失败直接吞——按键路径不许 panic。
-        match self.dict.learn_mem(&reading, &cand.text) {
-            Ok(()) => self.dict.enqueue_learn(&reading, &cand.text),
+        match self.dict.learn_mem(reading, word) {
+            Ok(()) => self.dict.enqueue_learn(reading, word),
             Err(e) => {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "[kime] 用户词学习失败 ({} → {}): {}",
-                    self.preedit,
-                    cand.text,
+                    "[kime] 提交学习失败 ({} → {}): {}",
+                    reading.join("'"),
+                    word,
                     e
                 );
             }
@@ -1035,15 +1087,22 @@ impl Engine {
                             self.rebuild_preedit_display();
                             self.last_joined = sp_joined.clone();
                         }
-                        // 句候选覆盖的 pinyin = 完整音节（不含 pending 半截键），
-                        // 用整音节 join 做落位 key：奇数 pending 时句仍按 freq
-                        // 落进补全区头部，不会被误判「未覆盖全输入」而挂到尾部。
+                        // 句候选覆盖的 pinyin = 完整音节（不含 pending 半截键）。
+                        // 有末键半截时输入尚未收口（sp_joined 带尾）：句读音与查词键
+                        // 脱钩，按 sp_joined 落位会让句「未覆盖全输入」挂到列表尾，
+                        // 自然排在匹配半截声母的前缀补全之后（iilem → chi+le+pending m：
+                        // 「吃了么」先于「吃了」）。无 pending 时两键同值，落位不变。
                         let full_joined = joined_key(&syllables, "");
+                        let (l1_key, coverage_key) = if has_pending {
+                            (&sp_joined, &sp_joined)
+                        } else {
+                            (&full_joined, &full_joined)
+                        };
                         Self::place_sentences(
                             &mut self.candidates,
                             sentences,
-                            &full_joined,
-                            &full_joined,
+                            l1_key,
+                            coverage_key,
                         );
                     }
                     // 缺陷 A 回退：以上全部落空（整串无词条、Viterbi 拼不出全覆盖句）
@@ -1094,9 +1153,10 @@ impl Engine {
     /// 所以双拼/全拼下行为一致。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声
     /// 灌进每一次按键。
     ///
-    /// 落位（用户裁定）：**中文候选全部在前**——英文块（精确词 + 补全词）整体追加到
-    /// 列表末尾，不再按层一 splice。`lookup_english` 内部恒「精确在前、补全在后」，
-    /// 英文块内顺序不变；层一「精确命中优先于补全」的中文内部规则完全不受影响。
+    /// 落位（用户裁定）：英文精确命中（key 等于原始输入，大小写不敏感）插到中文层一
+    /// 精确块之后、中文补全块之前；英文前缀补全仍整体挂列表末尾。块内“精确在前、
+    /// 补全在后”不变，单字母噪声闸不变；中文层一「精确命中优先于补全」的内部规则
+    /// 完全不受影响。
     fn merge_english(&mut self) {
         if self.letters.len() < 2 {
             return;
@@ -1107,7 +1167,22 @@ impl Engine {
         if en.is_empty() {
             return;
         }
-        self.candidates.extend(en);
+        // lookup_english 已按「精确块 → 补全块」返回；pinyin 存的是词本身，用
+        // 大小写不敏感比对拆成精确与补全两段。
+        let (exact, comps): (Vec<Candidate>, Vec<Candidate>) = en
+            .into_iter()
+            .partition(|c| c.pinyin.eq_ignore_ascii_case(&self.letters));
+        // 插入点 = 中文层一精确块末尾（精确词条 pinyin 恒等于查词键 last_joined），
+        // 即「中文精确之后、中文补全之前」；逐条 insert 保持精确段内部先后。
+        let l1_end = self
+            .candidates
+            .iter()
+            .take_while(|c| c.pinyin == self.last_joined)
+            .count();
+        for (i, c) in exact.into_iter().enumerate() {
+            self.candidates.insert(l1_end + i, c);
+        }
+        self.candidates.extend(comps);
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
@@ -1497,22 +1572,13 @@ impl Engine {
         best.map(|(reading, freq)| Seed { reading, freq })
     }
 
-    /// 整句候选名次：覆盖全部输入音节的句子属层一——**永不压过层一的精确
-    /// 命中词**（词条本体已在列表时句被文本去重），但**恒落在层一精确块
-    /// 之后、其余所有候选（补全词条 / 单字）之前**——fcitx5 的组句习惯：
-    /// 用户敲长串时第一位永远是当前已敲音节的最优句子，词条分数不该把句
-    /// 压到中间（用户实测长句被高频单字挤下第一后打断组句流）。
-    /// 没覆盖全输入的句子（半截尾巴）不参与落位，挂末尾。
+    /// 整句候选落位：不完整覆盖（例如双拼末键仅有声母）时，匹配该声母的完整词优先；
+    /// 只覆盖已完成音节的句子排在这些补全之后。没有 pending 时，全覆盖句仍落在
+    /// 中文精确命中块之后、普通补全与单字之前。
     ///
-    /// 两个键分开：`l1_key` 是候选列表层一精确块的 pinyin 键（查词用的
-    /// `joined`，即 `self.last_joined`），`coverage_key` 是句子自身覆盖的
-    /// 读音。多数输入下两者同值，但会脱钩：
-    /// - 半截尾巴（`shenmey`）：查词键带尾 `shen'me'y`，句读法不带尾
-    ///   `shen'me`。按前者数 `l1_end` 得 0、按后者比覆盖——句落补全区
-    ///   头部，正是 fcitx5 语义。
-    /// - 歧义单音节输入（`xian` → `[[xian],[xi,an]]`）：查词键是首切分
-    ///   `xian`，句来自后续切分 `xi'an`。两键混用会把 `l1_end` 算成 0，
-    ///   句子插到精确块**之前**顶掉「先」；分开后句落精确块之后。
+    /// `l1_key` 用于确定层一精确块边界；`coverage_key` 用于判断句子覆盖范围。多数情况
+    /// 两者相同，但在半截尾音或歧义切分时可能不同。歧义单音节输入（`xian` →
+    /// `[[xian],[xi,an]]`）中，首切分精确命中不能被后续切分组句越过。
     fn place_sentences(
         cands: &mut Vec<Candidate>,
         sentences: Vec<Candidate>,
@@ -1553,4 +1619,9 @@ impl Engine {
             }
         }
     }
+}
+/// 连续 CJK 汉字：与 `crate::lm::is_cjk_word_char` 同口径（基本区 + 扩展 A）。
+/// 用于判定输出的首尾字符，决定 `last_commit` 的跨提交留存与跨段断链。
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }

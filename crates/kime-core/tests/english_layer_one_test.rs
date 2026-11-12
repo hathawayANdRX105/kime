@@ -1,9 +1,8 @@
-//! 英文精确词的层归属（第四轮反馈第 1 条）：`ok` 被「哦可哦可」压住、`emoji` 看不见。
+//! 英文精确词优先于中文补全（例如 `ok` 的 OK），但中文精确命中仍在最前。
 //!
-//! 契约：英文候选里**精确消耗输入的词条**（pinyin == 原始输入，大小写不敏感——
-//! pinyin 就是词本身）与中文精确命中同属层一：插到中文层一块之后，中文层一空时打头。
-//! 前缀补全的英文仍挂全部中文（含层二补全）之后。回归对象就是旧的「一律 extend 到
-//! 末尾」实现：把它改回去，下面的断言逐条炸。
+//! 契约：英文精确匹配插到中文层一之后、中文补全之前；英文前缀补全仍放在末尾，
+//! 两字母门槛不变。
+//! `ok` 与 `an` 回归覆盖精确和补全之间的层级顺序。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,48 +84,43 @@ fn texts(cands: &[Candidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
 
-/// 中文层一空（`ok` 没有任何词读音恰为 o'k）：**中文候选（含补全块）全部在前**，
-/// 英文块整体垫底，块内精确 OK 仍先于补全 okay（用户裁定：中文优先）。
+/// 中文层一空（`ok` 没有任何词读音恰为 o'k）：英文精确命中 OK 插到层一块之后、
+/// 中文补全块之前，即整体打头；英文块内精确 OK 仍先于补全 okay。
 #[test]
-fn chinese_completions_precede_all_english() {
+fn english_exact_leads_when_chinese_layer_one_empty() {
     let (mut e, dir) = engine("ok");
     type_letters(&mut e, "ok");
     let got = texts(e.candidates());
-    let oke_pos = got
-        .iter()
-        .position(|t| *t == "哦可")
-        .expect("哦可 补全在场");
     let ok_pos = got.iter().position(|t| *t == "OK").unwrap();
+    let oke_pos = got.iter().position(|t| *t == "哦可").unwrap();
     let okay_pos = got.iter().position(|t| *t == "okay").unwrap();
     assert_eq!(
         got.first().copied(),
-        Some("哦可"),
-        "中文补全块必须打头，实际列表 {got:?}"
+        Some("OK"),
+        "英文精确 OK 应打头，实际列表 {got:?}"
     );
     assert!(
-        ok_pos > oke_pos,
-        "中文全部在前，英文精确 OK 不得插到 哦可 之前：{got:?}"
+        ok_pos < oke_pos,
+        "英文精确 OK 不得落后于中文补全 哦可：{got:?}"
     );
-    assert!(okay_pos > ok_pos, "英文块内精确仍先于补全：{got:?}");
+    assert!(ok_pos < okay_pos, "英文块内精确仍先于补全：{got:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 中文层一非空（`an`：安/按 精确命中）：顺序 = 中文全部（含补全 安排）→ 英文块。
+/// 中文精确命中仍先于英文精确词，英文精确词再先于中文补全。
 #[test]
-fn english_sits_after_all_chinese_when_layer_one_is_nonempty() {
+fn chinese_exact_then_english_exact_then_chinese_completion() {
     let (mut e, dir) = engine("an");
     type_letters(&mut e, "an");
     let got = texts(e.candidates());
-    assert_eq!(&got[..2], ["安", "按"], "中文层一块必须原样打头：{got:?}");
     assert_eq!(
         got,
-        ["安", "按", "安排", "an"],
-        "英文整体垫底，中文（含补全）全部在前：{got:?}"
+        ["安", "按", "an", "安排"],
+        "中文精确 → 英文精确 → 中文补全：{got:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }
-
-/// 单字母不查英文（既有噪声闸不变）；两个字母起精确词才进层一。
+/// 单字母不查英文（既有噪声闸不变）；两个字母起精确词才进候选。
 #[test]
 fn single_letter_still_skips_english() {
     let (mut e, dir) = engine("a");
