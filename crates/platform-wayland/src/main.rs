@@ -221,6 +221,10 @@ struct LlmWorker {
 }
 
 impl LlmWorker {
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
+    /// Panics: tokio runtime 构建失败时 panic（线程数/系统资源不足等环境问题）。
+    /// 构造期失败即配置/环境错误，进程无 runtime 无法继续；本函数返回 Self
+    /// 而非 Result/Option，无法用 `?` 传播。
     fn new(
         endpoint: String,
         model: String,
@@ -1830,11 +1834,17 @@ enum RunOutcome {
 /// 连一次 wayland、bind 全局对象、跑事件循环,直到:
 ///   - 正常退出(should_exit)→ Done
 ///   - 连不上或连着断开(连接/注册失败、协议错误、合成器重启)→ ConnLost(调用方退避重连)
+// cfg_attr 排在整段文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+// 作为安全不变量文档，属性夹在文档与函数之间会打断相邻关系。
+#[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
 ///
 /// 收敛核心：mangowm 崩/重启、合成器还没起来或偶发协议错误时，不让整个 kime 进程
 /// 跟着死——连接类失败一律「reset → 退避 → 重试」，进程只有 should_exit → Done
 /// 一条正常退出路（#101）。
 /// Safety: 调用方保证 Wayland display fd 有效；poll 只等待该 fd 上的事件。
+///
+/// Panics: `app.conn` 为 None 时 panic。连接在函数开头已建立并写入 `app.conn`，
+/// panic 路径不可达；本函数返回 RunOutcome 而非 Result/Option，无法用 `?` 传播。
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,

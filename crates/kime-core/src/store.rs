@@ -308,7 +308,12 @@ impl FstStore {
             .get(self.kblob_start + s as usize..self.kblob_start + e as usize)
     }
 
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
     /// 热表取回：前缀桶的预计算全局 top-K，零遍历。
+    ///
+    /// Panics: 记录头/字段切片长度不符时 panic。长度由前一行 `blob.get(..)`
+    /// 返回 Some 保证（取到的切片必是请求的长度），panic 路径不可达；本函数
+    /// 返回 Vec 而非 Result/Option，无法用 `?` 传播，且是热路径不宜改签名。
     fn fetch_topk(&self, off: usize, limit: usize) -> Vec<Candidate> {
         let mut out = Vec::new();
         let Some(blob) = self._mmap.get(self.topk_blob_start + off..) else {
@@ -367,8 +372,13 @@ impl FstStore {
         out
     }
 
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
     /// 把 key_idx 所指块的前 `limit` 条（块内已按 freq DESC, text ASC 排好）归并进 top-k 堆。
     /// 堆满 limit 后先做块头剪枝：块内最优都不敌当前第 limit 名 → 整块跳过，不产生任何分配。
+    ///
+    /// Panics: 堆顶切片长度不符时 panic。`limit > 0` 由调用方守卫，故堆非空、
+    /// 长度不变量成立，panic 路径不可达；本函数返回 () 而非 Result/Option，
+    /// 无法用 `?` 传播，且是热路径不宜改签名。
     fn collect_block(
         &self,
         key_idx: u64,
@@ -714,12 +724,17 @@ fn block_head(data: &[u8]) -> Option<(u64, &[u8])> {
     ))
 }
 
+#[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
 /// 解码 values 区一个块的前 `limit` 条。
 ///
 /// 块在构建期已按 (freq DESC, text ASC) 排序，解到 limit 即停——v2 解整块
 /// （`shen` 那种几千条）只为拿前 50，是每键 30–98ms 的根源。
 /// 旧代码用「块首字节 == 0」判空块：计数换成 u32 LE 之后 256 条的块首字节同样是 0，
 /// 该捷径会静默吞掉整块，故改为按 count 走。
+///
+/// Panics: 记录字段切片长度不符时 panic。长度由前一行 `blob.get(..)` 返回 Some
+/// 保证，panic 路径不可达；本函数返回 Vec 而非 Result/Option，无法用 `?` 传播，
+/// 且是热路径不宜改签名。
 fn decode_block(data: &[u8], pinyin: &str, limit: usize) -> Vec<Candidate> {
     let mut out = Vec::new();
     let Some(count) = block_count(data, 0) else {

@@ -14,6 +14,14 @@ members = [
 version = "0.20.85"
 edition = "2021"
 
+# dylint 的 lint 名只在 dylint 运行时注册，且 dylint 用 `--cfg=dylint_lib="<库名>"`
+# 传递「当前加载的是哪个 lint 库」。rustc 的 check-cfg 不认识这个 cfg 名，
+# 会报 unexpected_cfgs（-D warnings 下直接失败）。这里按 dylint 官方文档声明
+# 该 cfg 的合法取值集合，成员 crate 通过 [lints] workspace = true 继承。
+[workspace.lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(dylint_lib, values(any()))"]
+
 [[bench]]
 name = "kime_bench"
 path = "benches/kime_bench.rs"
@@ -43,3 +51,7 @@ opt-level = 2
 [profile.dev]
 debug = "line-tables-only"
 incremental = false
+
+# 继承 workspace 的 lint 配置（check-cfg 声明 dylint_lib 这个 cfg 名）
+[lints]
+workspace = true

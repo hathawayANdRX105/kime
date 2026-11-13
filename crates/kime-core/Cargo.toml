@@ -20,3 +20,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 wiremock = "0.6"
+# 继承 workspace 的 lint 配置（check-cfg 声明 dylint_lib 这个 cfg 名）
+[lints]
+workspace = true

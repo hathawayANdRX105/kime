@@ -10,3 +10,7 @@ edition.workspace = true
 # 无自动 trim：候选 label 集合有限且单条目极小，长会话的增长可接受（取舍：用一点
 # 内存换按键同步路径上的整形 CPU）。
 cosmic-text = { version = "0.19.0", features = ["shape-run-cache"] }
+
+# 继承 workspace 的 lint 配置（check-cfg 声明 dylint_lib 这个 cfg 名）
+[lints]
+workspace = true
