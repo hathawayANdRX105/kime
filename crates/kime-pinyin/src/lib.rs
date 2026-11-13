@@ -39,8 +39,11 @@ fn dfs(bytes: &[u8], pos: usize, path: &mut Vec<String>, out: &mut Vec<Reading>)
     let max = (bytes.len() - pos).min(6);
     for len in (1..=max).rev() {
         // bytes[pos..pos+len] 已经是 ASCII 小写字母（前置过滤），合法 UTF-8。
-        // safe 版本零额外成本：编译器在 ASCII 切片上消除验证。
-        let sub = std::str::from_utf8(&bytes[pos..pos + len]).expect("ascii slice");
+        // 用 let-else 而非 expect：expect 在不返回 Result/Option 的函数里
+        // panic 路径不可达却仍会中止进程（expect-in-non-result 规则）。
+        let Ok(sub) = std::str::from_utf8(&bytes[pos..pos + len]) else {
+            continue;
+        };
         if is_syllable(sub) {
             path.push(sub.to_owned());
             dfs(bytes, pos + len, path, out);

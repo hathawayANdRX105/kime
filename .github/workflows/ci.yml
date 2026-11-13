@@ -182,11 +182,16 @@ jobs:
             --no-deps --workspace $LIB_PATHS > /tmp/dylint.all 2>&1
           code=$?
           set -e
+          # rustc 输出带 ANSI 颜色（CARGO_TERM_COLOR=always），先剥色再统计，
+          # 否则锚点 grep 全部落空、finding 清单为空（假绿）。
+          sed -r 's/\x1B\[[0-9;]*[mGK]//g' /tmp/dylint.all > /tmp/dylint.plain
           echo "== dylint exit: $code =="
-          echo "== findings by lint =="
-          grep -oE '`-[A-Z] [a-z_]+`' /tmp/dylint.all | sort | uniq -c || true
-          echo "== findings with location =="
-          grep -E '^(warning|error): |^\s+--> crates/' /tmp/dylint.all || true
+          echo "== finding count by lint =="
+          grep -oE '`-[A-Z] [a-z_-]+`' /tmp/dylint.plain | sort | uniq -c || true
+          echo "== finding messages =="
+          grep -E '^(warning|error): ' /tmp/dylint.plain | sort | uniq -c || true
+          echo "== finding locations =="
+          grep -E '^\s+--> crates/' /tmp/dylint.plain | sed 's/^ *//' | sort | uniq -c || true
 
   perf:
     name: Benchmark (synthetic dict)
