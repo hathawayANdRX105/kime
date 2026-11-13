@@ -143,7 +143,6 @@ jobs:
           mkdir -p "$DINST"
           printf '[package]\nname = "dylint-installer"\nversion = "0.0.0"\nedition = "2021"\n' > "$DINST/Cargo.toml"
           cargo +nightly-2026-08-20 install \
-            --manifest-path "$DINST/Cargo.toml" \
             --root "$DINST/root" \
             --version 6.3.0 \
             cargo-dylint dylint-link
