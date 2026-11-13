@@ -123,6 +123,8 @@ pub struct Engine {
     pending_words: Vec<String>,
     /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
     /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
+    preedit_display: String,
+    /// 未拼接 pending 的原始拼音缓存（全拼 letters / 双拼解码后拼音）。
     preedit: String,
 }
 
@@ -202,6 +204,7 @@ impl Engine {
             page_index: 0,
             fuzzy_map,
             preedit: String::new(),
+            preedit_display: String::new(),
             undo_consumed: Vec::new(),
             pending_words: Vec::new(),
             span_cache: crate::lattice::SpanCache::default(),
@@ -236,7 +239,7 @@ impl Engine {
 
     /// 当前 preedit 显示串（#81：预选词拼接 + 未上屏拼音，如 "你好niha"）
     pub fn preedit(&self) -> &str {
-        &self.preedit
+        &self.preedit_display
     }
 
     /// (当前页, 页大小) — 候选窗布局用
@@ -309,7 +312,6 @@ impl Engine {
         self.sp_active = false;
         self.undo_consumed.clear();
         self.pending_words.clear();
-        self.preedit.clear();
     }
 
     /// 重建 preedit 显示串 = 预选词拼接 + 剩余拼音缓存（#81）。
@@ -317,7 +319,7 @@ impl Engine {
     fn rebuild_preedit_display(&mut self) {
         let mut s: String = self.pending_words.concat();
         s.push_str(&self.preedit);
-        self.preedit = s;
+        self.preedit_display = s;
     }
 
     /// 选词入缓冲：消耗候选覆盖的音节、词进 pending_words、撤销条目入栈。
@@ -398,6 +400,7 @@ impl Engine {
             self.candidates.clear();
             self.last_reading.clear();
             self.preedit.clear();
+            self.preedit_display.clear();
             self.page_index = 0;
             self.cursor = 0;
             self.last_joined.clear();
@@ -629,6 +632,7 @@ impl Engine {
                 self.last_joined.clear();
                 self.last_reading.clear();
                 self.preedit.clear();
+                self.preedit_display.clear();
                 return Outcome::Commit(self.commit_output(text));
             }
             if !self.letters.is_empty() {
@@ -683,6 +687,7 @@ impl Engine {
                     // pending 释放：经 release_words 连 pending 带栈一起清（#96）
                     let text = self.release_words();
                     self.preedit.clear();
+                    self.preedit_display.clear();
                     return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
                 } else if !self.candidates.is_empty() {
                     // 情况 B（fcitx5 顶字）：标点前先上屏当前页首候选；候选
@@ -751,6 +756,7 @@ impl Engine {
                 // 连 pending 带栈一起清（#96：上屏即链死）。
                 let text = self.release_words();
                 self.preedit.clear();
+                self.preedit_display.clear();
                 return Outcome::Commit(self.commit_output(text));
             }
             return Outcome::Ignored;

@@ -102,6 +102,104 @@ def candidates_slop_comment(files):
                             "excerpt": stripped[:300], "context": ctx})
     return out
 
+def _brace_depth_end(lines, start_line, start_col):
+    """Scan from the '{' at (start_line, start_col) until brace depth
+    returns to 0. Braces inside "..." strings, '...' chars, // line
+    comments, /* */ block comments and raw strings r[#]*"...#[#]* are
+    ignored. Return the line index (inclusive) of the matching '}', or
+    None if never balanced."""
+    depth = 1
+    i_line = start_line
+    i_col = start_col + 1
+    n = len(lines)
+    in_str = False
+    in_char = False
+    in_line_comment = False
+    in_block_comment = False
+    raw_mode = False
+    raw_hashes = 0
+    while i_line < n:
+        line = lines[i_line]
+        j = i_col if i_line == start_line else 0
+        L = len(line)
+        while j < L:
+            c = line[j]
+            nxt = line[j + 1] if j + 1 < L else ""
+            if in_line_comment:
+                break
+            if in_block_comment:
+                if c == "*" and nxt == "/":
+                    in_block_comment = False
+                    j += 2
+                else:
+                    j += 1
+                continue
+            if raw_mode:
+                if c == '"':
+                    hh = 0
+                    p = j + 1
+                    while p < L and line[p] == "#":
+                        hh += 1
+                        p += 1
+                    if hh == raw_hashes:
+                        raw_mode = False
+                        j = p
+                    else:
+                        j += 1
+                else:
+                    j += 1
+                continue
+            if in_str:
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == '"':
+                    in_str = False
+                j += 1
+                continue
+            if in_char:
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "'":
+                    in_char = False
+                j += 1
+                continue
+            if c == "/" and nxt == "/":
+                in_line_comment = True
+                break
+            if c == "/" and nxt == "*":
+                in_block_comment = True
+                j += 2
+                continue
+            if c == '"':
+                q = j - 1
+                hh = 0
+                while q >= 0 and line[q] == "#":
+                    hh += 1
+                    q -= 1
+                if q >= 0 and line[q] == "r":
+                    raw_mode = True
+                    raw_hashes = hh
+                else:
+                    in_str = True
+                j += 1
+                continue
+            if c == "'":
+                in_char = True
+                j += 1
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return i_line
+            j += 1
+        i_line += 1
+        i_col = 0
+    return None
+
 
 def candidates_rust_test_no_assert(files):
     out = []
@@ -112,24 +210,39 @@ def candidates_rust_test_no_assert(files):
         i = 0
         while i < len(lines):
             if TEST_FN.search(lines[i]):
-                fn_name, _, body = "", i, []
+                # locate the `fn ... {` (brace may be on a later line)
+                fn_line = None
+                brace_col = None
                 k = i + 1
-                depth = 0
                 while k < len(lines):
-                    m = FN_NAME.match(lines[k])
-                    if m and not fn_name:
-                        fn_name = m.group(1)
-                    body.append(lines[k])
-                    depth += lines[k].count("{") - lines[k].count("}")
-                    if depth == 0 and "{" in "".join(body):
-                        break
+                    if re.match(r"\s*fn\b", lines[k]):
+                        brace_col = lines[k].find("{")
+                        if brace_col != -1:
+                            fn_line = k
+                            break
+                        bk = k + 1
+                        while bk < len(lines) and "{" not in lines[bk]:
+                            bk += 1
+                        if bk < len(lines):
+                            fn_line = bk
+                            brace_col = lines[bk].find("{")
+                            break
                     k += 1
-                text = "\n".join(body)
+                if fn_line is None:
+                    i += 1
+                    continue
+                end_line = _brace_depth_end(lines, fn_line, brace_col)
+                if end_line is None:
+                    i += 1
+                    continue
+                m = FN_NAME.match(lines[fn_line])
+                fn_name = m.group(1) if m else ""
+                text = "\n".join(lines[fn_line:end_line + 1])
                 if not re.search(r"\bassert", text):
                     out.append({"path": path, "line": i + 1,
                                 "excerpt": f"fn {fn_name} (no literal assert)",
                                 "context": text[:2000]})
-                i = k
+                i = end_line + 1
             i += 1
     return out
 
