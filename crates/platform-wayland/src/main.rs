@@ -427,7 +427,10 @@ impl PopupCanvas {
 
     // #[allow] 必须排在文档注释之前：门禁的 ts_extract 按「紧邻 item 的连续
     // /// 行」取安全不变量文档，属性夹在中间会打断这段相邻关系。
-    #[allow(expect_in_non_result)]
+    // cfg_attr 而非裸 allow：dylint 的 lint 名只在 dylint 运行时注册，裸
+    // #[allow(expect_in_non_result)] 在普通 rustc/clippy 下是 unknown lint
+    // （-D warnings 直接失败）；cfg_attr(dylint_lib=...) 只在 dylint 下生效。
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
     ///
     /// Safety: 本函数用裸指针把 mmap 区域画进候选窗，slot 必须有效。

@@ -33,7 +33,11 @@ impl LlmClient {
 
     // #[allow] 排在文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
     // 作为安全不变量文档，属性夹在中间会打断相邻关系。
-    #[allow(expect_in_non_result)]
+    // cfg_attr 而非裸 allow：dylint 的 lint 名只在 dylint 运行时注册，裸
+    // #[allow(expect_in_non_result)] 在普通 rustc/clippy 下是 unknown lint
+    // （-D warnings 直接失败）；cfg_attr(dylint_lib=...) 只在 dylint 下生效
+    // （dylint README 的官方写法）。
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
     /// 自定义超时构建（离线挖掘的 jev 判定调用慢于 IME 热路径，放宽到分钟级）。
     ///
     /// `reqwest::Client::build()` 只在传入非法参数（如非法超时）时才失败；
