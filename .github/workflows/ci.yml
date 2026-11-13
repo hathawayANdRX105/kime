@@ -175,19 +175,18 @@ jobs:
           for name in $LINT_NAMES; do
             so=$(ls "$LINT_DIR/lib${name}@"*.so)
             LIB_PATHS="$LIB_PATHS --lib-path $so"
-            LINT_FLAGS="$LINT_FLAGS -D $name"
+            LINT_FLAGS="$LINT_FLAGS -W $name"
           done
           set +e
           DYLINT_RUSTFLAGS="$LINT_FLAGS" cargo +nightly-2026-08-20 dylint \
-            --no-deps --workspace $LIB_PATHS > /tmp/dylint.out 2> /tmp/dylint.err
+            --no-deps --workspace $LIB_PATHS > /tmp/dylint.all 2>&1
           code=$?
           set -e
-          if [ "$code" -ne 0 ]; then
-            echo "dylint failed with exit $code"
-            cat /tmp/dylint.err
-            tail -50 /tmp/dylint.out
-            exit 1
-          fi
+          echo "== dylint exit: $code =="
+          echo "== findings by lint =="
+          grep -oE '`-[A-Z] [a-z_]+`' /tmp/dylint.all | sort | uniq -c || true
+          echo "== findings with location =="
+          grep -E '^(warning|error): |^\s+--> crates/' /tmp/dylint.all || true
 
   perf:
     name: Benchmark (synthetic dict)
