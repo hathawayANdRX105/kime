@@ -196,6 +196,8 @@ jobs:
           # 否则锚点 grep 全部落空、finding 清单为空（假绿）。
           sed -r 's/\x1B\[[0-9;]*[mGK]//g' /tmp/dylint.all > /tmp/dylint.plain
           echo "== dylint exit: $code =="
+          echo "== dylint.plain size (bytes) =="
+          wc -c < /tmp/dylint.plain
           echo "== finding count by lint =="
           grep -oE '`-[A-Z] [a-z_-]+`' /tmp/dylint.plain | sort | uniq -c || true
           echo "== finding messages =="
