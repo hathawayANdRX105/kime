@@ -22,6 +22,9 @@ use std::sync::mpsc::Sender;
 ///
 /// `pub` 是给回归测试复用同一段 `pre_exec`：真实路径的 `wl-paste` 需要 Wayland
 /// 合成器，CI 跑不了，测试用 `sleep` 钉住机制本身。
+///
+/// Safety: 内部 `pre_exec` 闭包在 fork 后、exec 前的子进程里执行，只允许异步
+/// 信号安全调用；这里只有 prctl / getppid / _exit 三个裸 syscall，不碰分配器与 TLS。
 pub fn arm(cmd: &mut Command) {
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: pre_exec 闭包跑在 fork 后、exec 前的子进程里，只允许异步信号安全
@@ -79,7 +82,19 @@ impl Watcher {
     }
 
     fn run(&mut self, tx: Sender<String>) {
-        let mut out = self.child.stdout.take().expect("stdout piped");
+        // start() 必按 Stdio::piped 启动 wl-paste（64-73 行），stdout 一定能 take 出来；
+        // 不 expect：run 返回 ()，panic 无法被调用方恢复，异常时优雅退出、等待子进程。
+        let mut out = match self.child.stdout.take() {
+            Some(out) => out,
+            None => {
+                let _ = self.child.wait();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[kime-clip] wl-paste --watch 无 stdout 管道，退出"
+                );
+                return;
+            }
+        };
         let mut buf = [0u8; 4096];
         let mut pending: Vec<u8> = Vec::new();
         loop {

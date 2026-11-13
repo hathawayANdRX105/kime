@@ -264,10 +264,17 @@ impl Engine {
         self.cursor
     }
 
+    // #[allow] 排在文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+    // 作为安全不变量文档，属性夹在中间会打断相邻关系。
+    #[allow(expect_in_non_result)]
     /// preedit 显示串内的光标字符索引 —— 壳报给 `set_preedit_string` 的 caret 位置。
     /// 全拼（含双拼解码失败回退全拼）时 preedit 恒等于 letters，逐字符 1:1；
     /// 双拼显示态两键对一个音节：光标前的完整键对贡献整音节长度，
     /// 奇数位光标补上半截键所代表的声母（与 refresh 的 pending 同一算法）。
+    ///
+    /// Panics: 双拼分支里 `self.sp` 为 None 时 panic。入口的 `self.sp.is_none()`
+    /// 已提前返回，此处必为 Some，失败路径不可达；本函数返回 `usize` 而非
+    /// Result/Option，无法用 `?` 传播，且是 pub 接口不改签名，故用 expect 写明不变量。
     pub fn preedit_cursor(&self) -> usize {
         let pe_len = self.preedit_display.chars().count();
         // #81：显示串前缀 = 预选词拼接，caret 偏移同量
@@ -282,7 +289,10 @@ impl Engine {
             .sum();
         if self.cursor % 2 == 1 {
             if let Some(c) = self.letters.chars().nth(self.cursor - 1) {
-                idx += self.sp.as_ref().unwrap().initial_of(c).chars().count();
+                let sp = self.sp.as_ref().expect(
+                    "self.sp.is_none() triggers the early return above, so sp is Some here",
+                );
+                idx += sp.initial_of(c).chars().count();
             }
         }
         pending_len + idx.min(pe_len)
@@ -674,38 +684,48 @@ impl Engine {
                     ('\'', true) => "’",
                     _ => mapped,
                 };
-                if self.letters.is_empty() {
-                    // 情况 A：无预编辑串。有 pending = 释放 pending + 标点；
-                    // 无 pending = 直接上屏标点。标点 = 输入串结束（硬终结点）：
-                    // 栈随 burst 终止（全覆盖选词 Commit 已清栈（#96：上屏即链死），
-                    // 此处再清一遍保底）。
-                    if self.pending_words.is_empty() {
+                // 三种情形用 match 分派：标点前的收尾路径互斥且都以 return 结束，
+                // 用 match 既避免 if/else-if 链，也让「每支都提前返回」的结构显式化。
+                match (
+                    self.letters.is_empty(),
+                    self.pending_words.is_empty(),
+                    self.candidates.is_empty(),
+                ) {
+                    // 情况 A：无字母串、无 pending = 直接上屏标点。标点 = 输入串结束
+                    // （硬终结点）：栈随 burst 终止（全覆盖选词 Commit 已清栈
+                    // （#96：上屏即链死），此处再清一遍保底）。
+                    (true, true, _) => {
                         self.undo_consumed.clear();
                         return Outcome::Commit(self.commit_output(mapped.to_string()));
                     }
-                    // pending 释放：经 release_words 连 pending 带栈一起清（#96）
-                    let text = self.release_words();
-                    self.preedit_display.clear();
-                    return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
-                } else if !self.candidates.is_empty() {
+                    // 情况 A'：无字母串但有 pending —— pending 释放：经 release_words
+                    // 连 pending 带栈一起清（#96）。
+                    (true, false, _) => {
+                        let text = self.release_words();
+                        self.preedit_display.clear();
+                        return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
+                    }
                     // 情况 B（fcitx5 顶字）：标点前先上屏当前页首候选；候选
                     // 覆盖剩余拼音时词直入缓冲，最后 preedit 全部（词 + 原样
                     // 残段）+ 标点一起上屏 = 输入串结束（硬终结点清栈）。
-                    let top = self.candidates[self.highlight()].clone();
-                    self.stage_candidate(&top);
-                    let mut text = self.pending_words.join("");
-                    text.push_str(&self.letters);
-                    text.push_str(mapped);
-                    self.pending_words.clear();
-                    self.clear_composition();
-                    return Outcome::Commit(self.commit_output(text));
-                } else {
+                    (false, _, false) => {
+                        let top = self.candidates[self.highlight()].clone();
+                        self.stage_candidate(&top);
+                        let mut text = self.pending_words.join("");
+                        text.push_str(&self.letters);
+                        text.push_str(mapped);
+                        self.pending_words.clear();
+                        self.clear_composition();
+                        return Outcome::Commit(self.commit_output(text));
+                    }
                     // 情况 C：无候选词，字母串（连同 pending 整段）+ 标点
                     // 原样上屏（= 输入串结束：clear_composition 清 pending 与撤销栈）。
-                    let pending_text = self.pending_words.join("");
-                    let text = format!("{pending_text}{}", self.letters);
-                    self.clear_composition();
-                    return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
+                    (false, _, true) => {
+                        let pending_text = self.pending_words.join("");
+                        let text = format!("{pending_text}{}", self.letters);
+                        self.clear_composition();
+                        return Outcome::Commit(self.commit_output(format!("{text}{mapped}")));
+                    }
                 }
             }
         }
@@ -935,12 +955,19 @@ impl Engine {
         self.span_cache.clear();
     }
 
+    // #[allow] 排在文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+    // 作为安全不变量文档，属性夹在中间会打断相邻关系。
+    #[allow(expect_in_non_result)]
     /// 候选查询：双拼模式走 Table::to_syllables 解码，全拼模式走 kime_pinyin::segment + lookup_prefix，
     /// 兜底 lookup_abbrev。维护 self.last_reading 与 self.preedit。
     ///
     /// 平台壳在上下文变化（input-method-v2 的 `done` 提交 surrounding_text）后调一次：
     /// 壳写完 `set_context` 立刻调它，候选即按新上下文重排，不必等下一次按键。
     /// 按键路径内部在组合变化时自动调，壳层请勿在按键路径里重复调。
+    ///
+    /// Panics: 双拼分支里 `self.sp` 为 None 时 panic。外层 `if self.sp.is_some()`
+    /// 已守卫，此处必为 Some，失败路径不可达；本函数返回 `()` 而非
+    /// Result/Option，无法用 `?` 传播，且是 pub 接口不改签名，故用 expect 写明不变量。
     pub fn refresh_candidates(&mut self) {
         if self.letters.is_empty() {
             self.candidates.clear();
@@ -956,7 +983,9 @@ impl Engine {
             // 解码和半截键的拼音前缀都在块表达式里算完，`self.sp` 的借用随块结束：
             // 后面要 `&mut self` 写 candidates / 调 refresh_full_pinyin。
             let (decoded, pending, half_key_syls) = {
-                let table = self.sp.as_ref().unwrap();
+                let table = self.sp.as_ref().expect(
+                    "self.sp.is_some() is checked by the enclosing `if` and sp is not reassigned before this block",
+                );
                 if len.is_multiple_of(2) {
                     match table.to_syllables(&self.letters) {
                         ok @ Ok(_) => (ok, String::new(), Vec::new()),

@@ -167,15 +167,25 @@ jobs:
           set -euo pipefail
           RS="$RUNNER_TEMP/rust-specs"
           LINT_DIR="$RS/target/release"
-          LINT_NAMES="ban_unwrap chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else expect_in_non_result let_if_else max_nesting_depth redundant_branch_closures test_placement"
+          # 分级：
+          # -D 阻断（语义类，本 PR 已清零）：ban_unwrap / expect_in_non_result
+          # -W 报告（风格/重构类，存量待独立任务收敛）：其余
+          #   ——rust-specs 侧这些 lint 的默认级别本就是 Warn，只有项目显式 -D
+          #   才升级为错误；批量改写会污染本 PR 的主题。
+          BLOCK_LINTS="ban_unwrap expect_in_non_result"
+          REPORT_LINTS="chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else let_if_else max_nesting_depth redundant_branch_closures test_placement"
+          ALL_LINTS="$BLOCK_LINTS $REPORT_LINTS"
           # --lib-path 每次收一个 dylib 文件（dylint 6.3 逐个 canonicalize 后
           # 校验文件名须为 lib<name>@<toolchain>.so），不能传目录。
           LIB_PATHS=""
           LINT_FLAGS=""
-          for name in $LINT_NAMES; do
+          for name in $ALL_LINTS; do
             so=$(ls "$LINT_DIR/lib${name}@"*.so)
             LIB_PATHS="$LIB_PATHS --lib-path $so"
-            LINT_FLAGS="$LINT_FLAGS -W $name"
+            case " $BLOCK_LINTS " in
+              *" $name "*) LINT_FLAGS="$LINT_FLAGS -D $name" ;;
+              *) LINT_FLAGS="$LINT_FLAGS -W $name" ;;
+            esac
           done
           set +e
           DYLINT_RUSTFLAGS="$LINT_FLAGS" cargo +nightly-2026-08-20 dylint \
@@ -190,8 +200,25 @@ jobs:
           grep -oE '`-[A-Z] [a-z_-]+`' /tmp/dylint.plain | sort | uniq -c || true
           echo "== finding messages =="
           grep -E '^(warning|error): ' /tmp/dylint.plain | sort | uniq -c || true
-          echo "== finding locations =="
-          grep -E '^\s+--> crates/' /tmp/dylint.plain | sed 's/^ *//' | sort | uniq -c || true
+          echo "== findings with lint and location =="
+          # 每条诊断块形如：warning: <msg> / --> <file:line> / note: ... with `-W <lint>`
+          # 聚合统计会把消息与位置配对丢掉，这里按块输出三行一组。
+          awk '
+            /^warning: / && !/generated [0-9]+ warnings/ { msg=$0; sub(/^warning: /,"",msg); loc=""; lint="" }
+            /--> crates\// { if (msg != "" && loc == "") { loc=$0; sub(/^.*--> /,"",loc) } }
+            /requested on the command line with/ {
+              if (msg != "") {
+                lint=$0; sub(/^.*with `/,"",lint); sub(/`.*/,"",lint);
+                printf "%s | %s | %s\n", lint, loc, msg;
+              }
+            }
+          ' /tmp/dylint.plain | sort | uniq -c
+          # -D 级 lint 有 finding 即失败；-W 级只报告。
+          if [ "$code" -ne 0 ]; then
+            echo "dylint failed with exit $code"
+            grep -E '^(error|warning): ' /tmp/dylint.plain | head -40 || true
+            exit 1
+          fi
 
   perf:
     name: Benchmark (synthetic dict)

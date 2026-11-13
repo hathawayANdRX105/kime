@@ -425,9 +425,16 @@ impl PopupCanvas {
         }
     }
 
+    // #[allow] 必须排在文档注释之前：门禁的 ts_extract 按「紧邻 item 的连续
+    // /// 行」取安全不变量文档，属性夹在中间会打断这段相邻关系。
+    #[allow(expect_in_non_result)]
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
     ///
     /// Safety: 本函数用裸指针把 mmap 区域画进候选窗，slot 必须有效。
+    ///
+    /// Panics: `buffers[slot]` 为 None 时 panic。该不变量由 `pick_slot`（只返回持有
+    /// buffer 的槽位）与分配失败的 early return 保证；触及即表示 Wayland 状态已损坏，
+    /// 无法恢复，因此本函数不返回 Result。event-loop 回调无恢复路径，允许 expect。
     fn present(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         self.dirty = false;
         let layout = match self.chip {
@@ -455,13 +462,16 @@ impl PopupCanvas {
                 }
             }
         }
-        {
-            let b = self.buffers[slot].as_ref().unwrap();
-            // Safety: `b.ptr`/`b.plen` 来自同一份成功 mmap，且 slot 当前有效。
-            let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
-            renderer.paint(&layout, self.highlight, pixels);
-        }
-        let b = self.buffers[slot].as_ref().unwrap();
+        // pick_slot 只返回 free 槽位，且 present 里已把 buffers[slot] 置为 Some：
+        // 复用命中，或刚通过 create_buffer 写入；分配失败在前面已经 early return，
+        // 所以此处 as_ref() 必然为 Some。这是 Wayland 侧的不变量，panic 也无法恢复。
+        let b = self
+            .buffers[slot]
+            .as_ref()
+            .expect("buffers[slot] is Some: pick_slot ensured the buffer (reused or just allocated); allocation failure returns early");
+        // Safety: `b.ptr`/`b.plen` 来自同一份成功 mmap，且 slot 当前有效。
+        let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
+        renderer.paint(&layout, self.highlight, pixels);
         self.surface.attach(Some(&b.buffer), 0, 0);
         self.surface
             .damage(0, 0, layout.width as i32, layout.height as i32);

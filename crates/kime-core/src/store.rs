@@ -80,6 +80,10 @@ pub struct FstStore {
 }
 
 impl FstStore {
+    /// 打开并校验 dict.bin（FST 热表 + abbrev 区）。
+    ///
+    /// Safety: 内部用 `Mmap::map` 把文件映射进内存——该调用要求文件在映射期间
+    /// 不被截断/改写，词库文件由 build-dict 生成后只读，本路径不写它。
     pub fn open(bin_path: &Path) -> Result<Self> {
         let file = File::open(bin_path)
             .with_context(|| format!("打开 FST 词库失败: {}", bin_path.display()))?;
@@ -91,17 +95,31 @@ impl FstStore {
                 bin_path.display()
             );
         }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            mmap[4..8]
+                .try_into()
+                .expect("version slice is exactly 4 bytes: mmap.len() >= HEADER_LEN"),
+        );
         if version != FORMAT_VERSION {
             anyhow::bail!(
                 "{} 是 dict.bin v{version}，本版本只支持 v{FORMAT_VERSION}，请重新 build-dict",
                 bin_path.display()
             );
         }
-        let u32_at =
-            |range: std::ops::Range<usize>| u32::from_le_bytes(mmap[range].try_into().unwrap());
-        let u64_at =
-            |range: std::ops::Range<usize>| u64::from_le_bytes(mmap[range].try_into().unwrap());
+        let u32_at = |range: std::ops::Range<usize>| {
+            u32::from_le_bytes(
+                mmap[range]
+                    .try_into()
+                    .expect("header slice is exactly 4 bytes: mmap.len() >= HEADER_LEN"),
+            )
+        };
+        let u64_at = |range: std::ops::Range<usize>| {
+            u64::from_le_bytes(
+                mmap[range]
+                    .try_into()
+                    .expect("header slice is exactly 8 bytes: mmap.len() >= HEADER_LEN"),
+            )
+        };
         let fst_len = u32_at(8..12) as usize;
         let n_keys = u32_at(12..16) as usize;
         let values_len = u64_at(16..24) as usize;
@@ -260,7 +278,10 @@ impl FstStore {
         let i = usize::try_from(key_idx).ok()?;
         let base = self.offs_start.checked_add(i.checked_mul(4)?)?;
         let b = self._mmap.get(base..base.checked_add(4)?)?;
-        let off = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+        let off = u32::from_le_bytes(
+            b.try_into()
+                .expect("block-offset slice is exactly 4 bytes: .get() returned Some"),
+        ) as usize;
         self.values().get(off..)
     }
 
@@ -270,12 +291,18 @@ impl FstStore {
         let s = {
             let base = self.koffs_start + i * 4;
             let b = self._mmap.get(base..base + 4)?;
-            u32::from_le_bytes(b.try_into().unwrap())
+            u32::from_le_bytes(
+                b.try_into()
+                    .expect("key start slice is exactly 4 bytes: .get() returned Some"),
+            )
         };
         let e = {
             let base = self.koffs_start + (i + 1) * 4;
             let b = self._mmap.get(base..base + 4)?;
-            u32::from_le_bytes(b.try_into().unwrap())
+            u32::from_le_bytes(
+                b.try_into()
+                    .expect("key end slice is exactly 4 bytes: .get() returned Some"),
+            )
         };
         self._mmap
             .get(self.kblob_start + s as usize..self.kblob_start + e as usize)
@@ -290,7 +317,11 @@ impl FstStore {
         let Some(cnt_b) = blob.get(0..2) else {
             return out;
         };
-        let count = u16::from_le_bytes(cnt_b.try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(
+            cnt_b
+                .try_into()
+                .expect("count header is exactly 2 bytes: blob.get(0..2) returned Some"),
+        ) as usize;
         let mut pos = 2usize;
         for _ in 0..count {
             if out.len() >= limit {
@@ -300,9 +331,21 @@ impl FstStore {
                 Some(r) => r,
                 None => break,
             };
-            let key_idx = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as u64;
-            let freq = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as u64;
-            let tlen = u16::from_le_bytes(rec[8..10].try_into().unwrap()) as usize;
+            let key_idx = u32::from_le_bytes(
+                rec[0..4]
+                    .try_into()
+                    .expect("record key slice is exactly 4 bytes: record is 10 bytes"),
+            ) as u64;
+            let freq = u32::from_le_bytes(
+                rec[4..8]
+                    .try_into()
+                    .expect("record freq slice is exactly 4 bytes: record is 10 bytes"),
+            ) as u64;
+            let tlen = u16::from_le_bytes(
+                rec[8..10]
+                    .try_into()
+                    .expect("record tlen slice is exactly 2 bytes: record is 10 bytes"),
+            ) as usize;
             pos += 10;
             let text = match blob.get(pos..pos + tlen) {
                 Some(t) => t,
@@ -337,7 +380,10 @@ impl FstStore {
             return;
         };
         if top.len() == limit {
-            let worst = &top.peek().unwrap().0;
+            let worst = &top
+                .peek()
+                .expect("heap is non-empty: top.len() == limit and limit > 0")
+                .0;
             match block_head(data) {
                 Some((freq, text)) => {
                     if !(freq > worst.freq || (freq == worst.freq && text < worst.text.as_bytes()))
@@ -357,7 +403,10 @@ impl FstStore {
         };
         for c in decode_block(data, &pinyin, limit) {
             if top.len() == limit {
-                let worst = &top.peek().unwrap().0;
+                let worst = &top
+                    .peek()
+                    .expect("heap is non-empty: top.len() == limit and limit > 0")
+                    .0;
                 if !(c.freq > worst.freq || (c.freq == worst.freq && c.text < worst.text)) {
                     break; // 块内降序，此后更无胜算
                 }
@@ -544,12 +593,18 @@ impl FstStore {
         let s = {
             let base = self.atbl_start + i * 4;
             let b = self._mmap.get(base..base + 4)?;
-            u32::from_le_bytes(b.try_into().unwrap())
+            u32::from_le_bytes(
+                b.try_into()
+                    .expect("abbrev start slice is exactly 4 bytes: .get() returned Some"),
+            )
         };
         let e = {
             let base = self.atbl_start + (i + 1) * 4;
             let b = self._mmap.get(base..base + 4)?;
-            u32::from_le_bytes(b.try_into().unwrap())
+            u32::from_le_bytes(
+                b.try_into()
+                    .expect("abbrev end slice is exactly 4 bytes: .get() returned Some"),
+            )
         };
         let rec = self
             ._mmap
@@ -615,7 +670,10 @@ fn increment_prefix(prefix: &str) -> Option<String> {
 /// 读块头候选计数（u32 LE）；越界返回 None。
 fn block_count(data: &[u8], start: usize) -> Option<usize> {
     let b = data.get(start..start + COUNT_LEN)?;
-    Some(u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    Some(u32::from_le_bytes(
+        b.try_into()
+            .expect("count slice is exactly 4 bytes: .get() returned Some"),
+    ) as usize)
 }
 
 /// 读单条候选的 text_len（u24 LE）；越界返回 None。
@@ -647,7 +705,13 @@ fn block_head(data: &[u8]) -> Option<(u64, &[u8])> {
     let s = COUNT_LEN + TEXT_LEN_LEN;
     let text = data.get(s..s + tl)?;
     let fb = data.get(s + tl..s + tl + FREQ_LEN)?;
-    Some((u32::from_le_bytes(fb.try_into().unwrap()) as u64, text))
+    Some((
+        u32::from_le_bytes(
+            fb.try_into()
+                .expect("freq slice is exactly 4 bytes: .get() returned Some"),
+        ) as u64,
+        text,
+    ))
 }
 
 /// 解码 values 区一个块的前 `limit` 条。
@@ -674,7 +738,11 @@ fn decode_block(data: &[u8], pinyin: &str, limit: usize) -> Vec<Candidate> {
         }
         let text = String::from_utf8_lossy(&data[pos..pos + text_len]).into_owned();
         pos += text_len;
-        let freq = u32::from_le_bytes(data[pos..pos + FREQ_LEN].try_into().unwrap()) as u64;
+        let freq = u32::from_le_bytes(
+            data[pos..pos + FREQ_LEN]
+                .try_into()
+                .expect("freq is exactly 4 bytes: bounds checked above"),
+        ) as u64;
         pos += FREQ_LEN;
         out.push(Candidate {
             text,

@@ -118,6 +118,11 @@ struct Handler {
 }
 
 impl Handler {
+    // #[allow] 排在文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+    // 作为安全不变量文档，属性夹在中间会打断相邻关系。
+    #[allow(expect_in_non_result)]
+    /// XKB 默认键映射是 XIM 服务器的硬依赖，编译失败即环境本身已损坏，调用方
+    /// 无法恢复；构造函数签名冻结为不返回 Result，这里 panic。允许 expect。
     fn new(engine: Engine, window: Option<CandidateWindow>) -> Self {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(
@@ -129,7 +134,7 @@ impl Handler {
             None,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
-        .expect("failed to compile the default XKB keymap");
+        .expect("failed to compile the default XKB keymap: libxkbcommon is a hard dependency");
 
         Self {
             engine: Arc::new(Mutex::new(engine)),

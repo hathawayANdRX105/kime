@@ -31,7 +31,17 @@ impl LlmClient {
         Self::new_with_timeout(endpoint, model, Duration::from_secs(2))
     }
 
+    // #[allow] 排在文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+    // 作为安全不变量文档，属性夹在中间会打断相邻关系。
+    #[allow(expect_in_non_result)]
     /// 自定义超时构建（离线挖掘的 jev 判定调用慢于 IME 热路径，放宽到分钟级）。
+    ///
+    /// `reqwest::Client::build()` 只在传入非法参数（如非法超时）时才失败；
+    /// 此处超时由自身构造，失败即配置错误，且进程无客户端就无法继续，
+    /// 所以构造期 panic 不可恢复。签名保持 `-> Self`：改为 `Result` 会级联
+    /// 到 lm.rs、`Jeving::new`、platform-wayland 的 main.rs 以及 tests/llm.rs，
+    /// 而 tests 目录本轮不改；故此处抑制 `expect-in-non_result`，并保持
+    /// expect 消息为英文。
     pub fn new_with_timeout(endpoint: String, model: String, timeout: Duration) -> Self {
         Self {
             endpoint: endpoint.clone(),
@@ -151,6 +161,7 @@ fn build_prompt(syllables: &[String], context: Option<&str>) -> String {
         ),
     }
 }
+
 /// 解析 LLM 响应文本为候选：逐行读文本，跳过空行，最多收前 3 行（超出截断）。
 pub fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
     text.lines()
