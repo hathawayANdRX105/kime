@@ -151,6 +151,12 @@ jobs:
         run: |
           set -euo pipefail
           RS="$RUNNER_TEMP/rust-specs"
+          # dylib 必须由 dylint-link 链接（产物名 lib<name>@<toolchain>.so，
+          # cargo dylint --lib-path 只认这个形式）。rust-specs 各 lint 目录的
+          # .cargo/config.toml 配了同款 linker，但从 kime 仓库根以
+          # --manifest-path 构建时 cargo 按 cwd 发现 config，取不到 lint
+          # 目录的配置而回落 cc，这里用环境变量补齐（同效果，全局生效）。
+          export RUSTFLAGS="-C linker=dylint-link"
           RUSTC_BOOTSTRAP=1 cargo +nightly-2026-08-20 build --release \
             --manifest-path "$RS/Cargo.toml" \
             -p ban_unwrap -p chainable_single_statement -p consecutive_same_shape_loops \
