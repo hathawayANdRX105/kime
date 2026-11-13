@@ -1397,7 +1397,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                 }
                 state.pending_content_type = Some((hint, purpose));
             }
-            ZwpInputMethodEvent::Done { .. } => {
+            ZwpInputMethodEvent::Done => {
                 // serial 与现有 im_serial 同源，保持既有 commit 流程不变；
                 // 提交语义（归一 → 截断 → set_context → 刷新）见 plan_context_commit。
                 state.im_serial += 1;
