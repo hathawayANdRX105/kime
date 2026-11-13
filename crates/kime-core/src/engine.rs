@@ -945,7 +945,7 @@ impl Engine {
         if self.letters.is_empty() {
             self.candidates.clear();
             self.last_reading.clear();
-            self.rebuild_preedit_display();
+            self.preedit_display.clear();
             self.last_joined.clear();
             return;
         }
