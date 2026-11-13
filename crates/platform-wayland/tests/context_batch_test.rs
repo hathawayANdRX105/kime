@@ -17,10 +17,8 @@ struct Recorder {
 impl Recorder {
     /// dispatch 层拿到裁决后对引擎执行的动作：只有 Apply 才调 set_context。
     fn apply(&mut self, action: &ContextCommit) {
-        match action {
-            ContextCommit::Apply(tail) => self.contexts.push(tail.clone()),
-            // Echo（回声）与 Unchanged（本批无 surrounding）都不推引擎
-            _ => {}
+        if let ContextCommit::Apply(tail) = action {
+            self.contexts.push(tail.clone());
         }
     }
 }

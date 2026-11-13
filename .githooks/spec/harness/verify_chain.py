@@ -114,12 +114,14 @@ def candidates_rust_test_no_assert(files):
             if TEST_FN.search(lines[i]):
                 fn_name, _, body = "", i, []
                 k = i + 1
+                depth = 0
                 while k < len(lines):
                     m = FN_NAME.match(lines[k])
                     if m and not fn_name:
                         fn_name = m.group(1)
                     body.append(lines[k])
-                    if lines[k].strip() == "}" and k > i + 1:
+                    depth += lines[k].count("{") - lines[k].count("}")
+                    if depth == 0 and "{" in "".join(body):
                         break
                     k += 1
                 text = "\n".join(body)

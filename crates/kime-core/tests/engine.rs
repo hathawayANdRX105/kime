@@ -577,8 +577,8 @@ fn ctrl_h_delete_to_empty_then_commit_kills_chain() {
     let _ = fs::remove_file(&yaml);
 }
 
-/// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) + 清组合
-/// + 切英文——输入串随原样上屏结束，词级撤销链随 burst 终止；
+/// Shift-flush 路径：letters 非空时 Shift 走 Commit(**原字母**) 清组合
+/// 并切英文——输入串随原样上屏结束，词级撤销链随 burst 终止；
 /// 退格放行给应用（英文模式同样 Ignored），不再弹回旧选词拼音
 /// （v0.19.68 前语义是保留，3eb8279 的 `shift_flush_keeps_undo_stack`
 /// 语义反转）。

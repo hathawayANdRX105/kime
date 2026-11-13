@@ -67,6 +67,8 @@ def _name(src: bytes, item) -> str:
 
 def _doc_before(root, src: bytes, item) -> str:
     """Doc comment lines immediately preceding the item (sibling walk)."""
+    if item.parent is not None:
+        root = item.parent
     lines = []
     idx = None
     for i, c in enumerate(root.children):
@@ -347,7 +349,7 @@ def _enclosing(node):
 def _has_safety_doc(root, src: bytes, unsafe_node) -> bool:
     """The item containing the unsafe block carries a safety invariant."""
     cur = unsafe_node
-    while cur is not None and cur.type not in ITEM_KINDS:
+    while cur is not None and cur.type != "function_item":
         cur = cur.parent
     if cur is None:
         return False

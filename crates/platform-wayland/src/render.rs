@@ -81,7 +81,7 @@ impl Renderer {
 
     /// 横排单行摆放：每项 "N. 候选"，定宽分隔，总宽随内容自适应。
     /// candidates 已是当前页（调用方切好片），这里不再截断。
-    /// 模式字不常驻候选条：中英切换只闪一次 `chip_layout` 小窗。
+    /// 模式字不常驻候选条：中英切换瞬间另走 `chip_layout` 闪一次小窗。
     /// 空候选 → 隐藏帧。
     pub fn layout(&mut self, candidates: &[String]) -> Layout {
         if candidates.is_empty() {
@@ -152,5 +152,11 @@ impl Renderer {
             self.painter
                 .draw_run(&item.text, color, buf, layout.width as usize, item.x as i32);
         }
+    }
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
     }
 }

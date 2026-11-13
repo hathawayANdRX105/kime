@@ -1,4 +1,6 @@
 //! input-method-v2 平台壳：绑 seat → get_input_method → grab → engine。
+//! Safety: 平台壳直接调用 Wayland/libc FFI；每个 unsafe 块在紧邻注释中写明
+//! 前置条件（fd、映射和缓冲区所有权/生命周期）。
 //! 未消费的键经 zwp_virtual_keyboard_v1 原样送回，避免 grab 吞掉回车/快捷键。
 
 use std::env;
@@ -189,6 +191,7 @@ fn debug_log(line: impl FnOnce() -> String) {
     }
 }
 
+/// Safety: `fd` 来自仍存活的 `AsFd`；dup 返回的新 fd 由 `OwnedFd` 独占。
 fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
     let raw = unsafe { libc::dup(fd.as_fd().as_raw_fd()) };
     if raw < 0 {
@@ -197,8 +200,10 @@ fn dup_fd(fd: impl AsFd) -> Option<OwnedFd> {
         Some(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 }
-/// CLOCK_MONOTONIC 毫秒——与 wlroots 系合成器 key 事件 time 同一起点，
-/// poll 超时、重复节奏、透传时间戳共用这一把表。
+
+/// CLOCK_MONOTONIC 毫秒。
+///
+/// Safety: `ts` 是有效的可写 timespec，clock_gettime 只写入它。
 fn now_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -273,15 +278,13 @@ struct ShmBuffer {
 }
 
 impl Drop for ShmBuffer {
+    /// Safety: 映射和 fd 归本对象所有，销毁后不再访问。
     fn drop(&mut self) {
-        // 崩溃取证：buffer 被 drop（wl_buffer.destroy + munmap+close）的时刻与尺寸。
-        // 若 drop 发生在合成器仍持有该 buffer 时（release 未到），随后的
-        // create_pool/create_buffer 就可能越界——与 pool 创建日志对时间线。
         if DEBUG.load(Ordering::Relaxed) {
             log(&format!("popup buffer drop w={} h={}", self.w, self.h));
         }
-        // 协议销毁先行，之后不再触碰 buffer；死连接上该请求静默丢弃不 panic。
         self.buffer.destroy();
+        // Safety: 映射和 fd 均归本对象所有，且销毁后不再访问。
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
@@ -423,6 +426,8 @@ impl PopupCanvas {
     }
 
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
+    ///
+    /// Safety: 本函数用裸指针把 mmap 区域画进候选窗，slot 必须有效。
     fn present(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         self.dirty = false;
         let layout = match self.chip {
@@ -452,6 +457,7 @@ impl PopupCanvas {
         }
         {
             let b = self.buffers[slot].as_ref().unwrap();
+            // Safety: `b.ptr`/`b.plen` 来自同一份成功 mmap，且 slot 当前有效。
             let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
             renderer.paint(&layout, self.highlight, pixels);
         }
@@ -480,7 +486,9 @@ impl PopupCanvas {
         fallback
     }
 
-    /// 避坑 4：宽高均为正、stride = width*4、Format::Argb8888。
+    /// 创建一个与布局尺寸匹配的 shm buffer。
+    ///
+    /// Safety: 映射和 fd 由返回的 ShmBuffer 拥有。
     fn create_buffer(
         shm: &WlShm,
         layout: &Layout,
@@ -491,21 +499,20 @@ impl PopupCanvas {
         if w == 0 || h == 0 || w > 8192 || h > 1024 {
             return Err("popup 尺寸非法");
         }
-        // 池下限一页（4096）：1×1 隐藏帧裸算只有 4 字节池，是 wl_shm 池里的畸形
-        // 规格——自定义合成器（mangowm）的 create_pool 校验对过小池可能判
-        // invalid arguments（#65 崩溃类，09-28 16295 行现场）。memfd 多给 4KB
-        // 无代价；buffer 仍按 w×h 建，池内 [0, w*h*4) 有效。
         let plen = (w as usize) * (h as usize) * 4;
         let len = plen.max(4096);
-        let fd =
-            unsafe { libc::memfd_create(b"kime-popup\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
+        // Safety: `c"kime-popup"` 是有效的 NUL 结尾字符串，MFD_CLOEXEC 合法。
+        let fd = unsafe { libc::memfd_create(c"kime-popup".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return Err("memfd_create 失败");
         }
+        // Safety: `fd` 是刚创建的可用描述符，`len` 是有效长度。
         if unsafe { libc::ftruncate(fd, len as libc::off_t) } < 0 {
+            // Safety: 失败路径关闭刚创建的 fd。
             unsafe { libc::close(fd) };
             return Err("ftruncate 失败");
         }
+        // Safety: 映射长度与 fd 大小一致，MAP_SHARED 允许读写共享。
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -517,9 +524,11 @@ impl PopupCanvas {
             )
         };
         if ptr == libc::MAP_FAILED {
+            // Safety: mmap 失败时关闭 fd，避免泄漏。
             unsafe { libc::close(fd) };
             return Err("mmap 失败");
         }
+        // Safety: `fd` 在函数返回前保持有效；BorrowedFd 不接管所有权。
         let fd_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         // 崩溃取证：create_pool 是 wl_shm 唯一建池入口，崩前最后一行这条日志
         // 即肇事 pool 规格（w/h/len），对照 mangowm 的池校验定根因。
@@ -1024,7 +1033,7 @@ impl AppState {
         }
         let ch = self.keyboard.key_char(code);
         let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
-        let mode_before = self.engine.as_ref().map_or(true, |e| e.chinese());
+        let mode_before = self.engine.as_ref().is_none_or(|e| e.chinese());
         let outcome = match self.engine.as_mut() {
             Some(engine) => engine.key(shell_key(code, ch, ctrl, alt)),
             None => {
@@ -1397,8 +1406,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                     state.pending_cause,
                     CONTEXT_TAIL_CHARS,
                 );
-                match state.engine.as_mut() {
-                    Some(engine) => match action {
+                if let Some(engine) = state.engine.as_mut() {
+                    match action {
                         ContextCommit::Unchanged => {}
                         ContextCommit::Echo => {
                             if DEBUG.load(Ordering::Relaxed) {
@@ -1415,9 +1424,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
                             // 空组合是 no-op）。不在按键路径里调。
                             engine.refresh_candidates();
                         }
-                    },
-                    // 词库没开成：上下文丢了就丢了，引擎起来前的状态无意义。
-                    None => {}
+                    }
                 }
                 // pending 状态是每批一次性消耗的：done 之后清零，
                 // 下一批没来 surrounding_text 就是「没变化」而非「清空」。
@@ -1644,6 +1651,9 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for AppState {
 }
 
 impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
+    /// 处理键盘 grab 事件。
+    ///
+    /// Safety: keymap fd 在 lseek 期间有效。
     fn event(
         state: &mut Self,
         grab: &ZwpInputMethodKeyboardGrabV2,
@@ -1674,6 +1684,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                     let loaded = dup_fd(&fd)
                         .map(File::from)
                         .and_then(|mut f| {
+                            // Safety: `f` 持有有效 fd，SEEK_SET 是合法操作。
                             let _ = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_SET) };
                             let mut text = String::new();
                             f.read_to_string(&mut text).ok().map(|_| text)
@@ -1810,6 +1821,7 @@ enum RunOutcome {
 /// 收敛核心：mangowm 崩/重启、合成器还没起来或偶发协议错误时，不让整个 kime 进程
 /// 跟着死——连接类失败一律「reset → 退避 → 重试」，进程只有 should_exit → Done
 /// 一条正常退出路（#101）。
+/// Safety: 调用方保证 Wayland display fd 有效；poll 只等待该 fd 上的事件。
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,

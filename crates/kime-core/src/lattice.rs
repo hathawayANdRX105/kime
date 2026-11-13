@@ -293,6 +293,8 @@ fn span_candidates(
 
 /// 扩展一个节点：每个命中词的跨度建边进下游；所有跨度都查不到词（且
 /// 没有查词失败）时插占位边，保证路径能走通。
+/// 参数是 Viterbi 热路径的借用状态；打包 struct 会多一层借用间接。
+#[allow(clippy::too_many_arguments)]
 fn extend_node(
     prevs: &[Path],
     dict: &Dict,
@@ -302,11 +304,11 @@ fn extend_node(
     total: f64,
     cache: &mut SpanCache,
     reported_err: &mut bool,
-    dp: &mut Vec<Vec<Path>>,
+    dp: &mut [Vec<Path>],
 ) {
     let mut any_hit = false;
     let mut any_failed = false;
-    for j in (i + 1)..=n {
+    for (j, slot) in dp.iter_mut().enumerate().take(n + 1).skip(i + 1) {
         let (cands, failed) = span_candidates(dict, cache, reading, i, j, reported_err);
         if failed {
             any_failed = true;
@@ -316,7 +318,7 @@ fn extend_node(
             continue;
         }
         any_hit = true;
-        grow_with_words(prevs, dict, &cands, total, &mut dp[j]);
+        grow_with_words(prevs, dict, &cands, total, slot);
     }
     if !any_hit && !any_failed {
         grow_with_placeholder(prevs, &reading[i], &mut dp[i + 1]);

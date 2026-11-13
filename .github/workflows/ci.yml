@@ -55,7 +55,7 @@ jobs:
         with:
           tool: sccache
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -114,6 +114,74 @@ jobs:
             target/release/platform-x11
           if-no-files-found: error
           retention-days: 14
+
+  rust-specs-dylint:
+    name: rust-specs dylint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout rust-specs
+        uses: actions/checkout@v4
+        with:
+          repository: hathawayANdRX105/rust-specs
+          ref: main
+          path: rust-specs
+      - name: Move rust-specs outside kime workspace
+        run: mv "$GITHUB_WORKSPACE/rust-specs" "$RUNNER_TEMP/rust-specs"
+      - name: Prepare adopted lints
+        run: |
+          set -euo pipefail
+          GATED="$RUNNER_TEMP/gated-lints"
+          mkdir -p "$GATED"
+          for name in ban-unwrap chainable-single-statement consecutive-same-shape-loops early-return-needs-no-else expect-in-non-result let-if-else max-nesting-depth redundant-branch-closures test_placement; do
+            test -d "$RUNNER_TEMP/rust-specs/lints/$name"
+            cp -r "$RUNNER_TEMP/rust-specs/lints/$name" "$GATED/$name"
+          done
+          cp "$RUNNER_TEMP/rust-specs/rust-toolchain.toml" "$GATED/rust-toolchain.toml"
+          cp -r "$RUNNER_TEMP/rust-specs/support" "$RUNNER_TEMP/support"
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dylint
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev
+          cargo +nightly-2026-08-20 install cargo-dylint --locked
+          cargo +nightly-2026-08-20 install dylint-link --locked
+      - name: Run dylint
+        run: |
+          set -euo pipefail
+          GATED="$RUNNER_TEMP/gated-lints"
+          LINT_FLAGS=""
+          LINT_ALLOW=""
+          for name in ban_unwrap chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else expect_in_non_result let_if_else max_nesting_depth redundant_branch_closures test_placement; do
+            LINT_FLAGS="$LINT_FLAGS -D $name"
+            LINT_ALLOW="$LINT_ALLOW,$name"
+          done
+          LINT_ALLOW="${LINT_ALLOW#,}"
+          set +e
+          DYLINT_RUSTFLAGS="$LINT_FLAGS" cargo +nightly-2026-08-20 dylint --no-deps --path "$GATED" --pattern '*' --all --workspace -- --message-format=json > /tmp/dylint.json 2> /tmp/dylint.err
+          code=$?
+          set -e
+          failed=0
+          findings="$(jq -r --arg allow "$LINT_ALLOW" 'select(.reason == "compiler-message") | select(.message.code != null) | select((.message.spans | length) > 0) | select((.message.code.code | ascii_downcase) as $c | ($allow | split(",") | index($c)) != null) | [(.message.code.code | ascii_downcase), (.message.spans[0].file_name // ""), ((.message.spans[0].line_start // 0) | tostring), (.message.message // "")] | @tsv' /tmp/dylint.json 2>/dev/null || true)"
+          if [ -n "$findings" ]; then
+            while IFS=$'\t' read -r id path line msg; do
+              [ -n "$id" ] || continue
+              echo "::error file=$path,line=$line::$id $msg"
+              failed=1
+            done <<< "$findings"
+          fi
+          if [ "$code" != "0" ] && [ -z "$findings" ]; then
+            echo "dylint failed with exit $code"
+            tail -40 /tmp/dylint.err
+            failed=1
+          fi
+          exit "$failed"
 
   perf:
     name: Benchmark (synthetic dict)
