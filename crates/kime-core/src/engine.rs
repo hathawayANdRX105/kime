@@ -314,6 +314,7 @@ impl Engine {
         self.sp_active = false;
         self.undo_consumed.clear();
         self.pending_words.clear();
+        self.preedit_display.clear();
     }
 
     /// 重建 preedit 显示串 = 预选词拼接 + 剩余拼音缓存（#81）。
