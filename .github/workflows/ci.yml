@@ -167,6 +167,8 @@ jobs:
           set -euo pipefail
           RS="$RUNNER_TEMP/rust-specs"
           LINT_DIR="$RS/target/release"
+          echo "== lint dylib artifacts =="
+          ls -la "$LINT_DIR"/*.so 2>&1 || true
           LINT_FLAGS=""
           for name in ban_unwrap chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else expect_in_non_result let_if_else max_nesting_depth redundant_branch_closures test_placement; do
             LINT_FLAGS="$LINT_FLAGS -D $name"
