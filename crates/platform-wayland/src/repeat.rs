@@ -7,8 +7,9 @@
 //! - mango `src/input/keyboard.c::keyboard_repeat` 的自研 wl_event_source 重复定时器
 //!   只回调 `keyboard_check_keybinding`（全局键位），从不再走
 //!   `mango_im_keyboard_grab_forward_key` —— IM grab 每按住一次只收到一个 press
-//!   和一个 release。协议里 `repeat_info` 事件的存在本身即「IM 客户端自理重复」的设计意图。
-//! 所以组合内连删/连移必须由壳自己合成。
+//!   和一个 release。协议里 `repeat_info` 事件的存在本身即「IM 客户端自理重复」
+//!   的设计意图。
+//!   所以组合内连删/连移必须由壳自己合成。
 //!
 //! 时钟统一用调用方传入的毫秒数（main.rs 用 CLOCK_MONOTONIC，与合成器 key 事件 time
 //! 同起点）；本模块不碰时间也不碰 wayland 连接，纯函数供 tests/ 覆盖。

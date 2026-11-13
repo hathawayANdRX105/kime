@@ -58,9 +58,9 @@ fn round_trip_all() {
 
 #[test]
 fn decode_unique() {
-    for i in 0..TABLE.len() {
-        for j in (i + 1)..TABLE.len() {
-            assert_ne!(TABLE[i].1, TABLE[j].1, "{} and {}", TABLE[i].0, TABLE[j].0);
+    for (i, (name_i, key_i)) in TABLE.iter().enumerate() {
+        for (name_j, key_j) in TABLE.iter().skip(i + 1) {
+            assert_ne!(key_i, key_j, "{name_i} and {name_j}");
         }
     }
 }

@@ -28,6 +28,8 @@ fn armed_child_dies_when_parent_exits() {
 }
 
 /// helper 侧：起一个 armed `sleep`，交回 pid，然后让进程退出。
+/// 不 wait 是测试契约：父进程退出时由内核回收 armed 子进程。
+#[allow(clippy::zombie_processes)]
 fn helper() {
     let mut cmd = Command::new("sleep");
     cmd.arg("30");

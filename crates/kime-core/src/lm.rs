@@ -455,7 +455,7 @@ fn segment_cjk_run(
                 continue;
             };
             let cand = base + f;
-            if best.map_or(true, |(b, _)| cand > b) {
+            if best.is_none_or(|(b, _)| cand > b) {
                 best = Some((cand, j));
             }
         }
@@ -790,7 +790,8 @@ fn gate_batch(
             pairs
                 .iter()
                 .zip(flags.iter())
-                .filter_map(|(p, f)| f.then(|| p.clone()))
+                .filter(|(_, f)| **f)
+                .map(|(p, _)| p.clone())
                 .collect()
         }
         None => {
@@ -825,12 +826,12 @@ fn build_gate_prompt(pairs: &[(String, String)], samples: &[String]) -> String {
     s
 }
 
+/// jev 门控预扫的返回类型：文本空间准入对 + 每对上下文样本。
+type GateCandidates = (Vec<(String, String)>, HashMap<(String, String), String>);
+
 /// jev 门控预扫：两路径准入候选对（计数 ≥ `MIN_ADMISSION`，文本空间去重）
 /// + 每对一条上下文样本（空串 = 无样本）。只读，事务前调用。
-fn gate_candidates(
-    conn: &Connection,
-    tail: &TailPlan,
-) -> rusqlite::Result<(Vec<(String, String)>, HashMap<(String, String), String>)> {
+fn gate_candidates(conn: &Connection, tail: &TailPlan) -> rusqlite::Result<GateCandidates> {
     // ctx 路径：commit_log 里重复 >= MIN_ADMISSION 的相邻对 + 上屏前文尾样本
     let sql = format!(
         "SELECT pv.text, nv.text, max(cl.tail_ctx)

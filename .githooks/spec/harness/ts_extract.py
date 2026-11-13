@@ -66,16 +66,21 @@ def _name(src: bytes, item) -> str:
 
 
 def _doc_before(root, src: bytes, item) -> str:
-    """Doc comment lines immediately preceding the item (sibling walk)."""
+    """Doc comment lines immediately preceding the item (sibling walk).
+    Uses the item's own parent so a `///`/`// Safety` doc right before a
+    nested item (e.g. a method inside an impl's declaration_list) is found;
+    root-level items keep the existing root-children behavior."""
+    parent = item.parent
+    siblings = parent.children if parent is not None else root.children
     lines = []
     idx = None
-    for i, c in enumerate(root.children):
+    for i, c in enumerate(siblings):
         if c.id == item.id:
             idx = i
             break
     if idx is None:
         return ""
-    for c in reversed(root.children[:idx]):
+    for c in reversed(siblings[:idx]):
         if c.type == "line_comment" and _text(src, c).lstrip().startswith("///"):
             lines.append(_text(src, c).lstrip().lstrip("/").strip())
         else:
@@ -347,7 +352,7 @@ def _enclosing(node):
 def _has_safety_doc(root, src: bytes, unsafe_node) -> bool:
     """The item containing the unsafe block carries a safety invariant."""
     cur = unsafe_node
-    while cur is not None and cur.type not in ITEM_KINDS:
+    while cur is not None and cur.type != "function_item":
         cur = cur.parent
     if cur is None:
         return False

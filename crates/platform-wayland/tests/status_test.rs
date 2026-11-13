@@ -10,9 +10,14 @@ fn status_returns_current_mode() {
 
 #[test]
 fn config_punct_mode_roundtrip() {
-    let mut config = Config::default();
-    config.punct_mode = PunctMode::English;
+    let config = Config {
+        punct_mode: PunctMode::English,
+        ..Config::default()
+    };
     assert_eq!(config.punct_mode, PunctMode::English);
-    config.punct_mode = PunctMode::Chinese;
+    let config = Config {
+        punct_mode: PunctMode::Chinese,
+        ..Config::default()
+    };
     assert_eq!(config.punct_mode, PunctMode::Chinese);
 }

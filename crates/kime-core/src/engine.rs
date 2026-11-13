@@ -87,8 +87,6 @@ pub struct Engine {
     /// 首个切分的读音序列（preedit/光标的显示依据）；learn 仅在被选候选自带
     /// pinyin 缺失时回退到它
     last_reading: Vec<String>,
-    /// 缓存的 preedit 字符串（双拼模式为解码后拼音，全拼为 letters）
-    preedit: String,
     /// 当前标点模式（中文全角 / 英文原样）
     punct_mode: crate::config::PunctMode,
     /// 成对引号状态：`Some(q)` = 刚上屏过 `q` 的开引号，下一次再敲 `q` 出闭引号。
@@ -123,8 +121,7 @@ pub struct Engine {
     /// = 弹最近选词（纯内部，应用零删除）；弹词时同序弹出该词在
     /// undo_consumed 里配对入栈的条目（未释放 = 无效撤销记录）。
     pending_words: Vec<String>,
-    /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
-    /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
+    /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音；壳层 set_preedit_string 用。
     preedit_display: String,
 }
 
@@ -201,12 +198,11 @@ impl Engine {
             sp: shuangpin.map(kime_shuangpin::Table::new),
             sp_active: false,
             last_reading: Vec::new(),
-            preedit: String::new(),
             page_index: 0,
             fuzzy_map,
+            preedit_display: String::new(),
             undo_consumed: Vec::new(),
             pending_words: Vec::new(),
-            preedit_display: String::new(),
             span_cache: crate::lattice::SpanCache::default(),
             punct_mode,
             quote_open: None,
@@ -237,9 +233,16 @@ impl Engine {
         self.punct_mode = mode;
     }
 
-    /// 当前 preedit 显示串（#81：预选词拼接 + 未上屏拼音，如 "你好niha"）
+    /// 当前完整 preedit 显示串（pending 拼接 + 未上屏拼音）。
     pub fn preedit(&self) -> &str {
         &self.preedit_display
+    }
+
+    fn raw_preedit(&self) -> String {
+        self.preedit_display
+            .strip_prefix(&self.pending_words.concat())
+            .unwrap_or(&self.preedit_display)
+            .to_string()
     }
 
     /// (当前页, 页大小) — 候选窗布局用
@@ -266,10 +269,10 @@ impl Engine {
     /// 双拼显示态两键对一个音节：光标前的完整键对贡献整音节长度，
     /// 奇数位光标补上半截键所代表的声母（与 refresh 的 pending 同一算法）。
     pub fn preedit_cursor(&self) -> usize {
-        let pe_len = self.preedit.chars().count();
+        let pe_len = self.preedit_display.chars().count();
         // #81：显示串前缀 = 预选词拼接，caret 偏移同量
         let pending_len: usize = self.pending_words.iter().map(|w| w.chars().count()).sum();
-        if self.sp.is_none() || self.preedit == self.letters {
+        if self.sp.is_none() || self.preedit_display == self.letters {
             return pending_len + self.cursor.min(pe_len);
         }
         let full_pairs = self.cursor / 2;
@@ -305,7 +308,6 @@ impl Engine {
         self.letters.clear();
         self.candidates.clear();
         self.last_reading.clear();
-        self.preedit.clear();
         self.page_index = 0;
         self.cursor = 0;
         self.last_joined.clear();
@@ -319,7 +321,7 @@ impl Engine {
     /// 所有改 pending / preedit 缓存的路径末尾调一次。
     fn rebuild_preedit_display(&mut self) {
         let mut s: String = self.pending_words.concat();
-        s.push_str(&self.preedit);
+        s.push_str(&self.raw_preedit());
         self.preedit_display = s;
     }
 
@@ -350,7 +352,6 @@ impl Engine {
         self.candidates.clear();
         self.page_index = 0;
         self.last_joined.clear();
-        self.preedit.clear();
         self.last_reading.clear();
         // 词级撤销：记下本次选词消耗的拼音键串（原串前段）+ 上屏字符数。
         let undo_entry = self.letters[..old_len - remaining.len()].to_string();
@@ -400,7 +401,7 @@ impl Engine {
             self.letters.clear();
             self.candidates.clear();
             self.last_reading.clear();
-            self.preedit.clear();
+            self.preedit_display.clear();
             self.page_index = 0;
             self.cursor = 0;
             self.last_joined.clear();
@@ -626,7 +627,6 @@ impl Engine {
                 let mut text = self.release_words();
                 text.push_str(&self.letters);
                 self.letters.clear();
-                self.preedit.clear();
                 self.page_index = 0;
                 self.cursor = 0;
                 self.last_joined.clear();
@@ -945,8 +945,7 @@ impl Engine {
         if self.letters.is_empty() {
             self.candidates.clear();
             self.last_reading.clear();
-            self.preedit.clear();
-            self.rebuild_preedit_display();
+            self.preedit_display.clear();
             self.last_joined.clear();
             return;
         }
@@ -1003,7 +1002,12 @@ impl Engine {
                     let sp_joined = joined_key(&syllables, pending);
                     self.sp_active = true;
                     self.last_reading = syllables.clone();
-                    self.preedit = format!("{}{}", syllables.join(""), pending);
+                    self.preedit_display = format!(
+                        "{}{}{}",
+                        self.pending_words.concat(),
+                        syllables.join(""),
+                        pending
+                    );
                     self.rebuild_preedit_display();
                     self.last_joined = sp_joined.clone();
                     let mut cands = self
@@ -1083,7 +1087,12 @@ impl Engine {
                         if !sentences.is_empty() && self.candidates.is_empty() {
                             // 全拼重试也没结果 → 双拼解读才是对的，恢复它的 preedit/读音
                             self.last_reading = syllables.clone();
-                            self.preedit = format!("{}{}", syllables.join(""), pending);
+                            self.preedit_display = format!(
+                                "{}{}{}",
+                                self.pending_words.concat(),
+                                syllables.join(""),
+                                pending
+                            );
                             self.rebuild_preedit_display();
                             self.last_joined = sp_joined.clone();
                         }
@@ -1210,7 +1219,7 @@ impl Engine {
         };
 
         self.last_reading = reading.clone();
-        self.preedit = self.letters.clone();
+        self.preedit_display = format!("{}{}", self.pending_words.concat(), self.letters);
         self.rebuild_preedit_display();
         self.last_joined = joined_key(&reading, &tail);
 
@@ -1527,7 +1536,7 @@ impl Engine {
             }
             merged.push(e.clone());
         }
-        merged.extend(main.map(|n| n.clone()));
+        merged.extend(main.cloned());
         merged.truncate(limit);
         *cands = merged;
     }

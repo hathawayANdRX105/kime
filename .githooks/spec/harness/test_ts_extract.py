@@ -149,6 +149,29 @@ class SignalTest(unittest.TestCase):
             self.assertIn("category", x)
             self.assertIn("suggestion", x)
 
+    def test_nested_impl_method_safety_doc_not_signaled(self):
+        src = """impl Foo {
+    /// Safety: caller must uphold P
+    pub fn method(&self) {
+        unsafe { std::hint::black_box(self); }
+    }
+}
+"""
+        lines = [x["line"] for x in ts.signals("x.rs", src)
+                 if x["id"] == "TS-UNSAFE-NOINVARIANT"]
+        self.assertEqual(lines, [])
+
+    def test_nested_impl_method_without_safety_doc_signaled(self):
+        src = """impl Foo {
+    pub fn method(&self) {
+        unsafe { std::hint::black_box(self); }
+    }
+}
+"""
+        lines = [x["line"] for x in ts.signals("x.rs", src)
+                 if x["id"] == "TS-UNSAFE-NOINVARIANT"]
+        self.assertEqual(len(lines), 1)
+
 
 class SoftDepTest(unittest.TestCase):
     def test_missing_grammar_skips_silently(self):
