@@ -204,7 +204,7 @@ jobs:
           # 每条诊断块形如：warning: <msg> / --> <file:line> / note: ... with `-W <lint>`
           # 聚合统计会把消息与位置配对丢掉，这里按块输出三行一组。
           awk '
-            /^warning: / && !/generated [0-9]+ warnings/ { msg=$0; sub(/^warning: /,"",msg); loc=""; lint="" }
+            /^(warning|error): / && !/generated [0-9]+ warnings/ { msg=$0; sub(/^(warning|error): /,"",msg); loc=""; lint="" }
             /--> crates\// { if (msg != "" && loc == "") { loc=$0; sub(/^.*--> /,"",loc) } }
             /requested on the command line with/ {
               if (msg != "") {
