@@ -30,7 +30,7 @@ platform-mac/         （规划中）macOS IMKit 壳
 - **双拼半截键补全**：零声母半截键（y/w/元音，公共前缀塌缩为空）枚举完整音节、末音节匹配的词优先——ziranma `ke`+`y` → 「可以」类 ke'yi 词置顶，单键 `y` → yi 系词在前；有公共前缀的键（u→sh）行为不变
 
 ### 上下文感知
-- **surrounding_text 捕获**：input-method-v2 四事件（surrounding_text / text_change_cause / content_type / done）双缓冲批处理，done 才提交；引擎只保留光标前 32 字符
+- **surrounding_text 捕获**：input-method-v2 四事件（surrounding_text / text_change_cause / content_type / done）双缓冲批处理，done 才提交；引擎只保留光标前 320 字符
 - **提交文本边界**：`Commit` 是 kime 发给应用的文本；协议没有“应用已接受全文”的确认，surrounding_text 也只是应用支持的有限光标周边文本，不等于完整句子
 - **回声过滤**：`cause=INPUT_METHOD`（自己上屏）不推引擎，防自激循环
 - **种子先验**：上文末词经 `readings_of_text` 反查读音，作 lattice 虚拟起点参与联合概率（不进产出文本）

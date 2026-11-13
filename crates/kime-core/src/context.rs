@@ -78,9 +78,9 @@ pub fn is_from_input_method(cause: u32) -> bool {
 /// 上下文尾巴的字符上限。
 ///
 /// 与壳层 `platform-wayland/src/context_batch.rs` 的 `CONTEXT_TAIL_CHARS` 同值
-/// （= 32）。依赖单向向下（platform-wayland → kime-core），kime-core 不能引用
+/// （= 320）。依赖单向向下（platform-wayland → kime-core），kime-core 不能引用
 /// 壳层常量，故此值须人工保持与壳层同步：改一侧必须改另一侧。
-pub const CONTEXT_TAIL_MAX_CHARS: usize = 32;
+pub const CONTEXT_TAIL_MAX_CHARS: usize = 320;
 
 /// 把刚上屏的词 `committed` 追加进上下文尾巴 `current`，并按字符边界截断到
 /// 末 [`CONTEXT_TAIL_MAX_CHARS`] 个字符。
