@@ -121,11 +121,10 @@ pub struct Engine {
     /// = 弹最近选词（纯内部，应用零删除）；弹词时同序弹出该词在
     /// undo_consumed 里配对入栈的条目（未释放 = 无效撤销记录）。
     pending_words: Vec<String>,
-    /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音（双拼为解码后
-    /// 拼音、全拼为 letters）；壳层 set_preedit_string 用。
-    preedit_display: String,
     /// 未拼接 pending 的原始拼音缓存（全拼 letters / 双拼解码后拼音）。
     preedit: String,
+    /// 缓存的 preedit **显示**串 = pending 拼接 + 剩余拼音；壳层 set_preedit_string 用。
+    preedit_display: String,
 }
 
 impl Engine {
@@ -237,8 +236,13 @@ impl Engine {
         self.punct_mode = mode;
     }
 
-    /// 当前 preedit 显示串（#81：预选词拼接 + 未上屏拼音，如 "你好niha"）
+    /// 未拼接 pending 的原始拼音缓存（全拼 letters / 双拼解码后拼音）。
     pub fn preedit(&self) -> &str {
+        &self.preedit
+    }
+
+    /// 当前完整 preedit 显示串（pending 拼接 + 未上屏拼音，如 "你好niha"）。
+    pub fn preedit_display(&self) -> &str {
         &self.preedit_display
     }
 
