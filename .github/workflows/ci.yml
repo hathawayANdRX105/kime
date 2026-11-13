@@ -169,6 +169,11 @@ jobs:
           LINT_DIR="$RS/target/release"
           echo "== lint dylib artifacts =="
           ls -la "$LINT_DIR"/*.so 2>&1 || true
+          # cargo 默认产出裸名 lib<name>.so，dylint-link 另产出带 @toolchain
+          # 的副本；cargo dylint --lib-path 扫目录时裸名文件不合
+          # lib<name>@<toolchain>.so 形式会整体拒收。只留 @ 形式。
+          find "$LINT_DIR" -maxdepth 1 -type f -name 'lib*.so' ! -name '*@*' -delete
+          ls -la "$LINT_DIR"/*.so 2>&1 || true
           LINT_FLAGS=""
           for name in ban_unwrap chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else expect_in_non_result let_if_else max_nesting_depth redundant_branch_closures test_placement; do
             LINT_FLAGS="$LINT_FLAGS -D $name"
