@@ -130,8 +130,8 @@ jobs:
           path: rust-specs
       - name: Move rust-specs outside kime workspace
         run: mv "$GITHUB_WORKSPACE/rust-specs" "$RUNNER_TEMP/rust-specs"
-      - name: Install pinned nightly + rustc-dev
-        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev
+      - name: Install pinned nightly + rustc-dev + llvm-tools-preview
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: sccache
