@@ -73,6 +73,13 @@ fn texts(hits: &[Candidate]) -> Vec<String> {
     hits.iter().map(|c| c.text.clone()).collect()
 }
 
+/// 收尾：先 drop 掉 Dict（`LearnWriter::drop` 会 join 后台写线程、排空队列），
+/// 再删目录——顺序反了会撞上后台线程重建的 `-wal`/`-shm` 文件（Directory not empty）。
+fn cleanup(dict: Dict, dir: std::path::PathBuf) {
+    drop(dict);
+    let _ = fs::remove_dir_all(dir);
+}
+
 fn eff_of(hits: &[Candidate], text: &str) -> u64 {
     hits.iter()
         .find(|c| c.text == text)
@@ -95,7 +102,7 @@ fn english_eff_is_freq_plus_user_bonus() {
         "首用即满额：eff = freq + USER_BOOST"
     );
     assert_eq!(after[0].freq, 100, "freq 恒为词库原值：加成只落 eff");
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A2：同一词上屏 N 次 → 计数 +N，eff 随之上升。
@@ -113,7 +120,7 @@ fn repeated_use_raises_count_and_eff() {
         100 + 3 * 300_000,
         "eff 应随使用次数上升"
     );
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A3：用户诉求的直接验收——常用的 `ruin` 用过之后排在没用过的 `rug` 之前。
@@ -139,7 +146,7 @@ fn frequently_used_word_overtakes_unused_words() {
         "ruin 的 eff 应含首用满额加成"
     );
     assert_eq!(eff_of(&after, "rug"), 900, "没用过的 rug 只有裸频");
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A4：不在 `english` 表里的串不产生任何学习记录，候选集合不变。
@@ -151,7 +158,7 @@ fn unknown_word_is_not_learned() {
     assert_eq!(d.english_usage("zxqv"), None, "词库外的词不得进计数");
     let after = texts(&d.lookup_english("if", 10));
     assert_eq!(before, after, "候选集合不得变化");
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A5：分层契约不被提频打破——层二词（`ifx`）不得插到层一词（`if`）之前。
@@ -170,7 +177,7 @@ fn boosted_completion_never_jumps_ahead_of_exact_hit() {
         if_pos < ifx_pos,
         "层一词 if 必须整体在层二词 ifx 之前：{texts:?}"
     );
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// 英文计数不得污染中文提频：`user_pinyins` 只认中文键，
@@ -187,7 +194,7 @@ fn english_learning_does_not_disturb_chinese_candidates() {
         before, after,
         "英文计数不得改变中文候选顺序：{before:?} → {after:?}"
     );
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A6：不回归——英文候选的分层、单字母闸、大小写不敏感匹配、`AA`/`aa` 独立条目
@@ -201,8 +208,13 @@ fn english_lookup_contract_is_unchanged_by_learning() {
         ["if", "ifx"],
         "层一整体在层二之前"
     );
-    // 单字母闸：不到两个字母不查英文（既有契约）。
-    assert!(d.lookup_english("i", 10).is_empty(), "单字母不查英文");
+    // 单字母闸在引擎侧（`merge_english` 的 letters.len() < 2），不在 `lookup_english`：
+    // 这里只钉字典层契约——`i` 作为前缀照样能查到补全（层二），与改动前一致。
+    assert_eq!(
+        texts(&d.lookup_english("i", 10)),
+        ["if", "ifx"],
+        "前缀查询返回层二补全（单字母闸在引擎侧）"
+    );
     // limit 截断：层一名额优先。
     assert_eq!(
         texts(&d.lookup_english("if", 1)),
@@ -214,7 +226,7 @@ fn english_lookup_contract_is_unchanged_by_learning() {
     // 学习后：命中集合与分层不变，只有层内次序可能变。
     let hits = d.lookup_english("if", 10);
     assert_eq!(texts(&hits), ["if", "ifx"], "学习不得改变命中集合与分层");
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// `AA` 与 `aa` 是两条独立条目：学习 `aa` 只加 `aa` 的加成，`AA` 不受影响。
@@ -242,7 +254,7 @@ aa\taa\t20
         50,
         "AA 是独立条目，不该被 aa 的使用次数牵连"
     );
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// 英文词**不进** `phrase` 表（那张表是拼音前缀查询的数据源）。
@@ -259,15 +271,16 @@ fn english_learning_never_writes_the_phrase_table() {
         )
         .unwrap();
     assert_eq!(rows, 0, "英文词不得进 phrase 表");
-    fs::remove_dir_all(dir).unwrap();
+    cleanup(d, dir);
 }
 
 /// A7（不吞键）：英文模式下每个字母键的可见行为与改动前逐字一致——
 /// 仍是 `Outcome::Ignored`（壳层据此转发给应用），首字母与后续字母一样。
 #[test]
 fn english_mode_letters_are_still_ignored() {
-    let (d, dir) = seeded("a7");
-    let mut e = Engine::new(d, Config::default());
+    let (dict, dir) = seeded("a7");
+    let db_path = dir.join("dict.sqlite3");
+    let mut e = Engine::new(dict, Config::default());
     e.set_chinese(false);
     for c in "if".chars() {
         assert_eq!(
@@ -282,14 +295,16 @@ fn english_mode_letters_are_still_ignored() {
             "英文模式的字母键必须仍然放行（不得被吞）"
         );
     }
-    fs::remove_dir_all(dir).unwrap();
+    drop(e);
+    cleanup(Dict::open(&db_path).unwrap(), dir);
 }
 
 /// 英文模式下打字 → 空格分词 → 词被学习（学习闭环的端到端路径）。
 #[test]
 fn english_mode_typing_then_space_learns_the_word() {
-    let (d, dir) = seeded("e2e");
-    let mut e = Engine::new(d, Config::default());
+    let (dict, dir) = seeded("e2e");
+    let db_path = dir.join("dict.sqlite3");
+    let mut e = Engine::new(dict, Config::default());
     e.set_chinese(false);
     for c in "if".chars() {
         e.key(Key {
@@ -313,5 +328,6 @@ fn english_mode_typing_then_space_learns_the_word() {
         Some(1),
         "空格边界应把累积的英文词学进去"
     );
-    fs::remove_dir_all(dir).unwrap();
+    drop(e);
+    cleanup(Dict::open(&db_path).unwrap(), dir);
 }
