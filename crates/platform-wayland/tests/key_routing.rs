@@ -638,7 +638,7 @@ fn english_mode_letters_are_forwarded_to_the_app() {
     let (mut sh, dir) = Shell::new("en_letters");
     // 切英文模式（引擎的唯一模式翻转入口）。
     sh.engine.set_chinese(false);
-    for c in ["i", "f"] {
+    for c in ['i', 'f'] {
         let code = letter_code(c);
         assert_eq!(
             sh.press(code),

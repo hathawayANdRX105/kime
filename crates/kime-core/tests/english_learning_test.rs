@@ -69,8 +69,8 @@ fn seeded(tag: &str) -> (Dict, std::path::PathBuf) {
     (dict, dir)
 }
 
-fn texts(hits: &[Candidate]) -> Vec<&str> {
-    hits.iter().map(|c| c.text.as_str()).collect()
+fn texts(hits: &[Candidate]) -> Vec<String> {
+    hits.iter().map(|c| c.text.clone()).collect()
 }
 
 fn eff_of(hits: &[Candidate], text: &str) -> u64 {
@@ -126,7 +126,7 @@ fn frequently_used_word_overtakes_unused_words() {
     let before = texts(&d.lookup_english("ru", 10));
     assert_eq!(
         before,
-        vec!["rug", "round"],
+        ["rug", "round"],
         "前置条件：未学习时高频的 rug 在前"
     );
 
@@ -134,7 +134,7 @@ fn frequently_used_word_overtakes_unused_words() {
     let after = d.lookup_english("ru", 10);
     assert_eq!(
         texts(&after),
-        vec!["round", "rug"],
+        ["round", "rug"],
         "常用的 round 应排到没用过的 rug 之前"
     );
     assert_eq!(
@@ -200,7 +200,7 @@ fn english_lookup_contract_is_unchanged_by_learning() {
     // 学习前：层一（`if` 精确命中）整体在层二（`ifx` 补全）之前。
     assert_eq!(
         texts(&d.lookup_english("if", 10)),
-        vec!["if", "ifx"],
+        ["if", "ifx"],
         "层一整体在层二之前"
     );
     // 单字母闸：不到两个字母不查英文（既有契约）。
@@ -208,18 +208,14 @@ fn english_lookup_contract_is_unchanged_by_learning() {
     // limit 截断：层一名额优先。
     assert_eq!(
         texts(&d.lookup_english("if", 1)),
-        vec!["if"],
+        ["if"],
         "limit=1 时层一占满，补全一个都拿不到"
     );
 
     d.learn_english("ifx");
     // 学习后：命中集合与分层不变，只有层内次序可能变。
     let hits = d.lookup_english("if", 10);
-    assert_eq!(
-        texts(&hits),
-        vec!["if", "ifx"],
-        "学习不得改变命中集合与分层"
-    );
+    assert_eq!(texts(&hits), ["if", "ifx"], "学习不得改变命中集合与分层");
     fs::remove_dir_all(dir).unwrap();
 }
 
