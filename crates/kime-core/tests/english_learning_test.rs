@@ -39,6 +39,7 @@ ruin\truin\t100
 rug\trug\t900
 gob\tgob\t800
 ifx\tifx\t5
+ni\tni\t300
 ";
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -178,7 +179,9 @@ fn boosted_completion_never_jumps_ahead_of_exact_hit() {
 fn english_learning_does_not_disturb_chinese_candidates() {
     let (mut d, dir) = seeded("cn");
     let before = texts(&d.lookup_prefix(&["ni".to_string()], "", 10).unwrap());
-    d.learn_english("ni");
+    // `ni` 在英文表里也存在：这一学必须真的写进英文计数，才谈得上「不污染中文」。
+    assert!(d.learn_english("ni"), "ni 在英文表里，必须能学");
+    assert_eq!(d.english_usage("ni"), Some(1), "英文计数已写入");
     let after = texts(&d.lookup_prefix(&["ni".to_string()], "", 10).unwrap());
     assert_eq!(
         before, after,
