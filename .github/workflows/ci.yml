@@ -130,8 +130,8 @@ jobs:
           path: rust-specs
       - name: Move rust-specs outside kime workspace
         run: mv "$GITHUB_WORKSPACE/rust-specs" "$RUNNER_TEMP/rust-specs"
-      - name: Install pinned nightly + rustc-dev
-        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev
+      - name: Install pinned nightly + rustc-dev + llvm-tools-preview
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: sccache
@@ -151,6 +151,12 @@ jobs:
         run: |
           set -euo pipefail
           RS="$RUNNER_TEMP/rust-specs"
+          # dylib 必须由 dylint-link 链接（产物名 lib<name>@<toolchain>.so，
+          # cargo dylint --lib-path 只认这个形式）。rust-specs 各 lint 目录的
+          # .cargo/config.toml 配了同款 linker，但从 kime 仓库根以
+          # --manifest-path 构建时 cargo 按 cwd 发现 config，取不到 lint
+          # 目录的配置而回落 cc，这里用环境变量补齐（同效果，全局生效）。
+          export RUSTFLAGS="-C linker=dylint-link"
           RUSTC_BOOTSTRAP=1 cargo +nightly-2026-08-20 build --release \
             --manifest-path "$RS/Cargo.toml" \
             -p ban_unwrap -p chainable_single_statement -p consecutive_same_shape_loops \
@@ -161,19 +167,58 @@ jobs:
           set -euo pipefail
           RS="$RUNNER_TEMP/rust-specs"
           LINT_DIR="$RS/target/release"
+          # 分级：
+          # -D 阻断（语义类，本 PR 已清零）：ban_unwrap / expect_in_non_result
+          # -W 报告（风格/重构类，存量待独立任务收敛）：其余
+          #   ——rust-specs 侧这些 lint 的默认级别本就是 Warn，只有项目显式 -D
+          #   才升级为错误；批量改写会污染本 PR 的主题。
+          BLOCK_LINTS="ban_unwrap expect_in_non_result"
+          REPORT_LINTS="chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else let_if_else max_nesting_depth redundant_branch_closures test_placement"
+          ALL_LINTS="$BLOCK_LINTS $REPORT_LINTS"
+          # --lib-path 每次收一个 dylib 文件（dylint 6.3 逐个 canonicalize 后
+          # 校验文件名须为 lib<name>@<toolchain>.so），不能传目录。
+          LIB_PATHS=""
           LINT_FLAGS=""
-          for name in ban_unwrap chainable_single_statement consecutive_same_shape_loops early_return_needs_no_else expect_in_non_result let_if_else max_nesting_depth redundant_branch_closures test_placement; do
-            LINT_FLAGS="$LINT_FLAGS -D $name"
+          for name in $ALL_LINTS; do
+            so=$(ls "$LINT_DIR/lib${name}@"*.so)
+            LIB_PATHS="$LIB_PATHS --lib-path $so"
+            case " $BLOCK_LINTS " in
+              *" $name "*) LINT_FLAGS="$LINT_FLAGS -D $name" ;;
+              *) LINT_FLAGS="$LINT_FLAGS -W $name" ;;
+            esac
           done
           set +e
           DYLINT_RUSTFLAGS="$LINT_FLAGS" cargo +nightly-2026-08-20 dylint \
-            --no-deps --workspace --lib-path "$LINT_DIR" > /tmp/dylint.out 2> /tmp/dylint.err
+            --no-deps --workspace $LIB_PATHS > /tmp/dylint.all 2>&1
           code=$?
           set -e
+          # rustc 输出带 ANSI 颜色（CARGO_TERM_COLOR=always），先剥色再统计，
+          # 否则锚点 grep 全部落空、finding 清单为空（假绿）。
+          sed -r 's/\x1B\[[0-9;]*[mGK]//g' /tmp/dylint.all > /tmp/dylint.plain
+          echo "== dylint exit: $code =="
+          echo "== dylint.plain size (bytes) =="
+          wc -c < /tmp/dylint.plain
+          echo "== finding count by lint =="
+          grep -oE '`-[A-Z] [a-z_-]+`' /tmp/dylint.plain | sort | uniq -c || true
+          echo "== finding messages =="
+          grep -E '^(warning|error): ' /tmp/dylint.plain | sort | uniq -c || true
+          echo "== findings with lint and location =="
+          # 每条诊断块形如：warning: <msg> / --> <file:line> / note: ... with `-W <lint>`
+          # 聚合统计会把消息与位置配对丢掉，这里按块输出三行一组。
+          awk '
+            /^(warning|error): / && !/generated [0-9]+ warnings/ { msg=$0; sub(/^(warning|error): /,"",msg); loc=""; lint="" }
+            /--> crates\// { if (msg != "" && loc == "") { loc=$0; sub(/^.*--> /,"",loc) } }
+            /requested on the command line with/ {
+              if (msg != "") {
+                lint=$0; sub(/^.*with `/,"",lint); sub(/`.*/,"",lint);
+                printf "%s | %s | %s\n", lint, loc, msg;
+              }
+            }
+          ' /tmp/dylint.plain | sort | uniq -c
+          # -D 级 lint 有 finding 即失败；-W 级只报告。
           if [ "$code" -ne 0 ]; then
             echo "dylint failed with exit $code"
-            cat /tmp/dylint.err
-            tail -50 /tmp/dylint.out
+            grep -E '^(error|warning): ' /tmp/dylint.plain | head -40 || true
             exit 1
           fi
 

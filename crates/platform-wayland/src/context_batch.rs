@@ -48,6 +48,8 @@ pub fn plan_context_commit(
     ContextCommit::Apply(tail.tail_before_cursor(max_chars).map(str::to_string))
 }
 
-/// 上下文尾巴的字符上限：32 个字符足够覆盖一个短语/半句话，
-/// 再长也只是给 LLM/分词喂噪声（且每次 done 都要 clone 一份）。
-pub const CONTEXT_TAIL_CHARS: usize = 32;
+/// 上下文尾巴的字符上限：约一到两句（分词/LLM 消歧需要整句视野，
+/// 32 字只能给半句，见 #129 后续）。320 汉字 = 960 字节，远在
+/// Wayland 消息 ~4000 字节上限内；每次 done clone 一次，百字级
+/// 字符串开销可忽略。
+pub const CONTEXT_TAIL_CHARS: usize = 320;

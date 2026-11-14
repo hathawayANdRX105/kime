@@ -58,8 +58,8 @@ fn non_echo_cause_commits() {
 
 #[test]
 fn tail_truncates_to_max_chars_by_character() {
-    // 40 个汉字、光标在末尾 → 只留最后 32 个；截断按字符边界，不按字节
-    let text = "字".repeat(40);
+    // 上限 + 8 个汉字、光标在末尾 → 只留最后 CONTEXT_TAIL_CHARS 个；截断按字符边界，不按字节
+    let text = "字".repeat(CONTEXT_TAIL_CHARS + 8);
     let s = surrounding(&text, text.len());
     let action = plan_context_commit(Some(&s), 1, CONTEXT_TAIL_CHARS);
     let ContextCommit::Apply(Some(tail)) = action else {

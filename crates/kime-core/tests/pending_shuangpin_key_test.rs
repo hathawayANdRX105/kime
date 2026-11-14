@@ -71,10 +71,19 @@ fn pending_shuangpin_key_queries_its_initial() {
         got.contains(&"是") && got.contains(&"事"),
         "半截键 u 应给出 sh 系的字，实际 {got:?}"
     );
+    // 末键 u 还有第二种意图：它作**韵母位**（自然码 wu = w+u，声母键还没按）。
+    // 这类词现在也会进候选（「乌」拼音是完整音节 wu，与「按字母 u 查」不是同一条
+    // 路），但 u 是 sh 声母键，用户按 u 想要的是 sh 系——sh 系必须排在前面。
+    // （「优」的拼音是裸字母 u，不是合法音节，任何路径都不该带出它。）
+    let shi_pos = got.iter().position(|t| *t == "是");
+    let wu_pos = got.iter().position(|t| *t == "乌");
     assert!(
-        !got.contains(&"乌") && !got.contains(&"优"),
-        "半截键 u 不该把拼音以 u 开头的词当候选，实际 {got:?}"
+        !got.contains(&"优"),
+        "拼音是裸字母 u 的词不该进候选，实际 {got:?}"
     );
+    if let (Some(shi), Some(wu)) = (shi_pos, wu_pos) {
+        assert!(shi < wu, "sh 系词应排在韵母位意图的词之前，实际 {got:?}");
+    }
     // preedit 要显示用户正在拼的声母，而不是裸键
     assert_eq!(e.preedit(), "sh", "preedit 应展开成 sh");
 }

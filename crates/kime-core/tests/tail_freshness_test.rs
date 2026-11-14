@@ -6,7 +6,7 @@
 //! 钉五件事（red 条件见对应断言）：
 //! 1. 连续两次上屏：第二条 `commit_log.tail_ctx` 含第一次上屏文本（直接查库）；
 //! 2. 会话前有上下文（`set_context(Some)`）时追加而非覆盖；
-//! 3. 追加后超 32 字符上限按**字符边界**截断，不产 UTF-8 碎片；
+//! 3. 追加后超上限按**字符边界**截断，不产 UTF-8 碎片；
 //! 4. `set_context(None)` 后首次上屏：引擎内存尾巴 = 本次提交文本；
 //! 5. Esc / 退格清组合不改变上下文（回归保护，与 context_test.rs 同族）。
 //!
@@ -170,23 +170,24 @@ fn first_commit_with_no_context_tail_is_committed_text() {
 
 #[test]
 fn append_tail_truncates_on_char_boundary() {
-    // 30 个「上」+ 5 个「屏」= 35 字 > 32：只留末 32 字 = 27「上」+ 5「屏」。
-    let current = "上".repeat(30);
+    // 上限 + 2 个「上」+ 5 个「屏」= 上限 + 7 字：只留末 CONTEXT_TAIL_MAX_CHARS 字
+    // = 末（上限 − 5）「上」+ 5「屏」。
+    let current = "上".repeat(CONTEXT_TAIL_MAX_CHARS + 2);
     let committed = "屏".repeat(5);
-    let out = append_tail(&current, &committed);
-    let mut expected = "上".repeat(27);
+    let out = append_tail(current.as_str(), &committed);
+    let mut expected = "上".repeat(CONTEXT_TAIL_MAX_CHARS - 5);
     expected.push_str(&"屏".repeat(5));
     assert_eq!(
         out.chars().count(),
         CONTEXT_TAIL_MAX_CHARS,
-        "截断到末 32 字符"
+        "截断到上限字符数"
     );
-    assert_eq!(out, expected, "保留末 32 字符");
-    // CJK 每字 3 字节；32 字 = 96 字节，char 计数精确即无 UTF-8 碎片。
+    assert_eq!(out, expected, "只保留下限窗口内的末尾字符");
+    // CJK 每字 3 字节；上限字数 × 3 字节，char 计数精确即无 UTF-8 碎片。
     assert_eq!(
         out.len(),
         CONTEXT_TAIL_MAX_CHARS * 3,
-        "无碎片（字节数 = 32×3）"
+        "无碎片（全 CJK 字节 = 字数 × 3）"
     );
 
     // 未超上限：原样拼接返回，不截断。
@@ -197,10 +198,11 @@ fn append_tail_truncates_on_char_boundary() {
 
 #[test]
 fn commit_truncates_long_cjk_context_on_char_boundary() {
-    // 40 字前文 + 2 字上屏 = 42 > 32：引擎内存尾巴 = 末 32 字 = 30「上」+「进度」。
+    // 上限 + 8 字前文 + 2 字上屏：引擎内存尾巴 = 末 CONTEXT_TAIL_MAX_CHARS 字
+    // = 前文末（上限 − 2）+ 本次词。
     let db = tmp_db("trunc");
     let mut e = pinyin_engine(&db);
-    e.set_context(Some("上".repeat(40)));
+    e.set_context(Some("上".repeat(CONTEXT_TAIL_MAX_CHARS + 8)));
     type_pinyin(&mut e, "jindu");
     assert_commit(&mut e, "进度");
 
@@ -212,8 +214,8 @@ fn commit_truncates_long_cjk_context_on_char_boundary() {
     );
     assert_eq!(
         got.to_string(),
-        "上".repeat(30) + "进度",
-        "末 32 字 = 前文末 30 + 本次词"
+        "上".repeat(CONTEXT_TAIL_MAX_CHARS - 2) + "进度",
+        "末尾窗口 = 前文末（上限 − 2）+ 本次词"
     );
     assert_eq!(got.len(), CONTEXT_TAIL_MAX_CHARS * 3, "无 UTF-8 碎片");
     let _ = fs::remove_file(&db);

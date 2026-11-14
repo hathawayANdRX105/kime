@@ -101,6 +101,34 @@ impl Table {
         }
         out
     }
+
+    /// 双拼奇数键：key 作**韵母位（第二键）**时能组成的全部音节。
+    ///
+    /// 遍历 26 个首键 `a`..`z`，取 `self.decode(first, key)`，收集非 None 的音节、
+    /// 去重并保持首键顺序（与 [`Table::syllables_of_initial`] 同风格）。
+    ///
+    /// 这是 engine 在奇数键下的「韵母位意图」：如自然码 `p`（un/ün）可解出
+    /// cun/dun/gun/hun/chun/jun/kun/lun/nun/qun/run/sun/tun/shun/zhun/xun/yun/zun；
+    /// 小鹤 `p`（ie）可解出 bie/die/jie/lie/mie/nie/pie/qie/tie/xie。
+    /// 这些以 key 为韵母的音节，在 `initial_of` 走「公共前缀」的路径里查不到，
+    /// 才需要这条独立的反向查表；否则奇数键（如单独按 `p`）会「完全没反应」。
+    ///
+    /// 空键/非 a-z 键返回空表。
+    pub fn final_syllables_of(&self, key: char) -> Vec<&'static str> {
+        if !key.is_ascii_lowercase() {
+            return Vec::new();
+        }
+        let second = key as u8;
+        let mut out: Vec<&'static str> = Vec::new();
+        for first in b'a'..=b'z' {
+            if let Some(syl) = (self.decode)(first, second) {
+                if !out.contains(&syl) {
+                    out.push(syl);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// ASCII 公共前缀（拼音全 ASCII，按字节切安全）。

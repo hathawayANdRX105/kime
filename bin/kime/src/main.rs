@@ -330,10 +330,12 @@ fn handle_debug_cmd(args: &[String]) -> ExitCode {
             let dir = std::env::temp_dir().join(format!(
                 "kime_debug_{}_{}",
                 std::process::id(),
+                // 系统时钟早于 UNIX_EPOCH 时 duration_since 返回 Err；此处只需
+                // 一个不重复的临时目录名，退化取 0 即可，不值得 panic。
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
             ));
             std::fs::create_dir_all(&dir).ok();
             let db = dir.join("dict.sqlite3");

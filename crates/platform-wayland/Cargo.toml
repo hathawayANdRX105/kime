@@ -21,3 +21,7 @@ fontdb = "0.24"
 xkbcommon = "0.9"
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+# 继承 workspace 的 lint 配置（check-cfg 声明 dylint_lib 这个 cfg 名）
+[lints]
+workspace = true

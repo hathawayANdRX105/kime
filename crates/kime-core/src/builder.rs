@@ -17,6 +17,7 @@
 //!
 //! 只打包 `phrase`。`english` 表（2.2 万条英文词）**不进 dict.bin**：它由 `Dict::open`
 //! 直接从 SQLite 读成常驻内存的排序 Vec，`Dict::lookup_english` 二分直查，两条路径互不相干。
+//!
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -111,7 +112,9 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
     let mut block_offsets: Vec<u32> = Vec::with_capacity(n_keys);
     let mut total_candidates = 0u64;
     for pinyin in &pinyins {
-        let cands = groups.get(pinyin).unwrap();
+        let cands = groups
+            .get(pinyin)
+            .expect("groups missing this pinyin: pinyins comes from groups.keys()");
         block_offsets.push(u32::try_from(values.len()).context("values 区超出 u32 偏移范围")?);
         // 计数必须是 u32：rime-ice 的 pinyin='100' 组有 98 万条，u16 会回绕成 63457。
         let Ok(count) = u32::try_from(cands.len()) else {
@@ -154,7 +157,10 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
                 break; // 前缀必须整体是 a–z，与查询端条件一致
             }
             let heap = buckets.entry(&pinyin[..plen]).or_default();
-            for cand in groups.get(pinyin.as_str()).unwrap() {
+            for cand in groups
+                .get(pinyin.as_str())
+                .expect("groups missing this pinyin: pinyins comes from groups.keys()")
+            {
                 let entry = BucketEntry {
                     key_idx,
                     freq: cand.freq,
@@ -162,7 +168,12 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
                 };
                 if heap.len() < TOPK {
                     heap.push(entry);
-                } else if bucket_cmp(&entry, heap.peek().unwrap()) == Ordering::Less {
+                } else if bucket_cmp(
+                    &entry,
+                    heap.peek()
+                        .expect("heap empty: heap.len() >= TOPK (64) in this arm"),
+                ) == Ordering::Less
+                {
                     heap.pop();
                     heap.push(entry);
                 }
@@ -175,7 +186,7 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
         topk_builder.insert(prefix, topk_blob.len() as u64)?;
         let mut entries: Vec<BucketEntry> = heap.into_vec();
         entries.sort_by(bucket_cmp);
-        let count = u16::try_from(entries.len()).expect("TOPK 不超 u16");
+        let count = u16::try_from(entries.len()).expect("top-k count fits in u16");
         topk_blob.extend_from_slice(&count.to_le_bytes());
         for e in &entries {
             let tlen = u16::try_from(e.text.len()).context("热表候选文本超出 u16")?;

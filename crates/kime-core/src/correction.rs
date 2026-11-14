@@ -71,8 +71,11 @@ pub fn corrected_keys(letters: &str) -> Vec<String> {
                 continue;
             }
             v[i] = nb;
-            // 全 ASCII，from_utf8 不可能失败
-            let s = String::from_utf8(v).expect("ascii");
+            // 入口守卫已保证全 ASCII 小写；变体只替换 ASCII 字节，因此 from_utf8 必然成功，
+            // else 分支不可达（跳过该候选，与不可达的 panic 等价，不会中断进程）。
+            let Ok(s) = String::from_utf8(v) else {
+                continue;
+            };
             if seen.insert(s.clone()) {
                 out.push(s);
             }
@@ -85,7 +88,11 @@ pub fn corrected_keys(letters: &str) -> Vec<String> {
         }
         let mut v = bytes.clone();
         v.swap(i, i + 1);
-        let s = String::from_utf8(v).expect("ascii");
+        // 同上：入口守卫保证全 ASCII，转位只交换 ASCII 字节，from_utf8 必然成功，
+        // else 不可达，跳过该候选，不中断进程。
+        let Ok(s) = String::from_utf8(v) else {
+            continue;
+        };
         if seen.insert(s.clone()) {
             out.push(s);
         }
@@ -109,8 +116,11 @@ pub fn inserted_keys(letters: &str) -> Vec<String> {
         for c in b'a'..=b'z' {
             let mut v = bytes.clone();
             v.insert(gap, c);
-            // 全 ASCII，from_utf8 不可能失败
-            let s = String::from_utf8(v).expect("ascii");
+            // 同上：入口守卫保证全 ASCII，插入只写入 a-z 字节，from_utf8 必然成功，
+            // else 不可达，跳过该候选，不中断进程。
+            let Ok(s) = String::from_utf8(v) else {
+                continue;
+            };
             if seen.insert(s.clone()) {
                 out.push(s);
             }

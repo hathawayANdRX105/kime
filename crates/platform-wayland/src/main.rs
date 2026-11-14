@@ -112,12 +112,24 @@ struct KeyLogFile {
 static KEY_LOG: AtomicBool = AtomicBool::new(false);
 static KEY_LOG_FILE: LazyLock<Mutex<Option<KeyLogFile>>> = LazyLock::new(|| Mutex::new(None));
 
-fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+fn key_log(
+    code: u32,
+    ch: Option<char>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    outcome: &Outcome,
+    summary: &str,
+) {
     if !KEY_LOG.load(Ordering::Relaxed) {
         return;
     }
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
-    let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
+    let line = format!(
+        "{}{}",
+        key_log_line(code, ch, ctrl, alt, shift, outcome),
+        summary
+    );
     let mut g = KEY_LOG_FILE.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
         *g = OpenOptions::new()
@@ -138,7 +150,24 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
         }
         kf.written += n;
         let _ = kf.buf.write_all(line.as_bytes());
+        // 逐键日志是**取证**用途（用户敲完字就要看），BufWriter 的 8KB 缓冲
+        // 会让最近几十个按键一直留在内存里、看不到任何输出。每行刷一次盘：
+        // 该开关默认关（键路径零文件 I/O），开启时本就是低频取证场景。
+        let _ = kf.buf.flush();
     }
+}
+
+/// 逐键日志的候选摘要：键处理完的候选个数 + 首几项。
+///
+/// 有了它才能从日志直接判断「按键有没有出候选」「出的候选对不对」——
+/// preedit 只说明键到了引擎，候选才是用户看到的东西。
+///
+/// 摘要与按键行**写进同一行**（而不是另起一行）：两处写入共用同一个
+/// `written` 计数与 1MiB 自截断，分开写会让摘要行绕过上限检查。
+fn key_log_candidate_summary(engine: &kime_core::Engine) -> String {
+    let cands = engine.candidates();
+    let first: Vec<&str> = cands.iter().take(5).map(|c| c.text.as_str()).collect();
+    format!(" cands={} first=[{}]", cands.len(), first.join(","))
 }
 
 /// KIME_DEBUG=1 状态转移日志：追加写 /tmp/kime-ime-debug.log（写失败静默忽略，
@@ -221,6 +250,10 @@ struct LlmWorker {
 }
 
 impl LlmWorker {
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
+    /// Panics: tokio runtime 构建失败时 panic（线程数/系统资源不足等环境问题）。
+    /// 构造期失败即配置/环境错误，进程无 runtime 无法继续；本函数返回 Self
+    /// 而非 Result/Option，无法用 `?` 传播。
     fn new(
         endpoint: String,
         model: String,
@@ -425,9 +458,19 @@ impl PopupCanvas {
         }
     }
 
+    // #[allow] 必须排在文档注释之前：门禁的 ts_extract 按「紧邻 item 的连续
+    // /// 行」取安全不变量文档，属性夹在中间会打断这段相邻关系。
+    // cfg_attr 而非裸 allow：dylint 的 lint 名只在 dylint 运行时注册，裸
+    // #[allow(expect_in_non_result)] 在普通 rustc/clippy 下是 unknown lint
+    // （-D warnings 直接失败）；cfg_attr(dylint_lib=...) 只在 dylint 下生效。
+    #[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
     /// 布局 → 找空闲槽位 → 画 → attach + commit + frame 请求。
     ///
     /// Safety: 本函数用裸指针把 mmap 区域画进候选窗，slot 必须有效。
+    ///
+    /// Panics: `buffers[slot]` 为 None 时 panic。该不变量由 `pick_slot`（只返回持有
+    /// buffer 的槽位）与分配失败的 early return 保证；触及即表示 Wayland 状态已损坏，
+    /// 无法恢复，因此本函数不返回 Result。event-loop 回调无恢复路径，允许 expect。
     fn present(&mut self, renderer: &mut Renderer, qh: &QueueHandle<AppState>) {
         self.dirty = false;
         let layout = match self.chip {
@@ -455,13 +498,16 @@ impl PopupCanvas {
                 }
             }
         }
-        {
-            let b = self.buffers[slot].as_ref().unwrap();
-            // Safety: `b.ptr`/`b.plen` 来自同一份成功 mmap，且 slot 当前有效。
-            let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
-            renderer.paint(&layout, self.highlight, pixels);
-        }
-        let b = self.buffers[slot].as_ref().unwrap();
+        // pick_slot 只返回 free 槽位，且 present 里已把 buffers[slot] 置为 Some：
+        // 复用命中，或刚通过 create_buffer 写入；分配失败在前面已经 early return，
+        // 所以此处 as_ref() 必然为 Some。这是 Wayland 侧的不变量，panic 也无法恢复。
+        let b = self
+            .buffers[slot]
+            .as_ref()
+            .expect("buffers[slot] is Some: pick_slot ensured the buffer (reused or just allocated); allocation failure returns early");
+        // Safety: `b.ptr`/`b.plen` 来自同一份成功 mmap，且 slot 当前有效。
+        let pixels = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.plen) };
+        renderer.paint(&layout, self.highlight, pixels);
         self.surface.attach(Some(&b.buffer), 0, 0);
         self.surface
             .damage(0, 0, layout.width as i32, layout.height as i32);
@@ -1028,7 +1074,7 @@ impl AppState {
         // 剪贴板模式优先：C-; 触发 / 导航 / 提交都在这里闭环，不进引擎。
         if self.clip_mode_key(code, qh) {
             let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
-            key_log(code, None, ctrl, alt, false, &Outcome::Consumed);
+            key_log(code, None, ctrl, alt, false, &Outcome::Consumed, "");
             return;
         }
         let ch = self.keyboard.key_char(code);
@@ -1042,7 +1088,21 @@ impl AppState {
                 Outcome::Ignored
             }
         };
-        key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
+        // 候选摘要与按键行同行：摘要单独写会绕过 1MiB 自截断计数。
+        let summary = self
+            .engine
+            .as_ref()
+            .map(key_log_candidate_summary)
+            .unwrap_or_default();
+        key_log(
+            code,
+            ch,
+            ctrl,
+            alt,
+            matches!(code, 42 | 54),
+            &outcome,
+            &summary,
+        );
         // KIME_DEBUG 状态快照（关着时闭包不会执行，零开销）：键码/字符/outcome +
         // 引擎状态 {letters, preedit, cursor, undo_depth, undo_top}，供远端诊断
         // 逐键还原状态转移。
@@ -1817,11 +1877,17 @@ enum RunOutcome {
 /// 连一次 wayland、bind 全局对象、跑事件循环,直到:
 ///   - 正常退出(should_exit)→ Done
 ///   - 连不上或连着断开(连接/注册失败、协议错误、合成器重启)→ ConnLost(调用方退避重连)
+// cfg_attr 排在整段文档注释之前：门禁 ts_extract 取「紧邻 item 的连续 /// 行」
+// 作为安全不变量文档，属性夹在文档与函数之间会打断相邻关系。
+#[cfg_attr(dylint_lib = "expect_in_non_result", allow(expect_in_non_result))]
 ///
 /// 收敛核心：mangowm 崩/重启、合成器还没起来或偶发协议错误时，不让整个 kime 进程
 /// 跟着死——连接类失败一律「reset → 退避 → 重试」，进程只有 should_exit → Done
 /// 一条正常退出路（#101）。
 /// Safety: 调用方保证 Wayland display fd 有效；poll 只等待该 fd 上的事件。
+///
+/// Panics: `app.conn` 为 None 时 panic。连接在函数开头已建立并写入 `app.conn`，
+/// panic 路径不可达；本函数返回 RunOutcome 而非 Result/Option，无法用 `?` 传播。
 fn run_once(app: &mut AppState) -> RunOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,

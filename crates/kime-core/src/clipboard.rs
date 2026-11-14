@@ -98,7 +98,10 @@ impl ClipStore {
             };
             let text: String = body.chars().take(PRESET_MAX_CHARS).collect();
             self.presets.push(ClipEntry::new(name, 0));
-            self.presets.last_mut().unwrap().text = text;
+            // 上一行刚 push，presets 必非空（ClipEntry::text 是 pub，可直接赋值）
+            if let Some(last) = self.presets.last_mut() {
+                last.text = text;
+            }
         }
     }
 }
