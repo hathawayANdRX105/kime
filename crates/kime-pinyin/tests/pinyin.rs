@@ -100,7 +100,7 @@ fn table_sanity() {
     assert_eq!(
         SYLLABLES.len(),
         416,
-        "音节表规模漂移：改表请同步 tests/coverage_test.rs 的 ALL_SYLLABLES 期望集"
+        "音节表规模漂移：改表请同步 crates/kime-pinyin/src/lib.rs 的 SYLLABLES 与 tests/coverage_test.rs 断言"
     );
     let mut seen = HashSet::new();
     for s in SYLLABLES {
