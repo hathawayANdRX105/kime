@@ -138,6 +138,30 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
         }
         kf.written += n;
         let _ = kf.buf.write_all(line.as_bytes());
+        // 逐键日志是**取证**用途（用户敲完字就要看），BufWriter 的 8KB 缓冲
+        // 会让最近几十个按键一直留在内存里、看不到任何输出。每行刷一次盘：
+        // 该开关默认关（键路径零文件 I/O），开启时本就是低频取证场景。
+        let _ = kf.buf.flush();
+    }
+}
+
+/// 逐键日志附一行候选摘要：键处理完的候选首项 + 个数。
+///
+/// 有了它才能从日志直接判断「按键有没有出候选」「出的候选对不对」——
+///
+/// preedit 只说明键到了引擎，候选才是用户看到的东西。
+fn key_log_candidates(engine: &kime_core::Engine) {
+    if !KEY_LOG.load(Ordering::Relaxed) {
+        return;
+    }
+    let cands = engine.candidates();
+    let first: Vec<&str> = cands.iter().take(5).map(|c| c.text.as_str()).collect();
+    let line = format!("  cands={} first=[{}]\n", cands.len(), first.join(","));
+    let mut g = KEY_LOG_FILE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(kf) = g.as_mut() {
+        kf.written += line.len() as u64;
+        let _ = kf.buf.write_all(line.as_bytes());
+        let _ = kf.buf.flush();
     }
 }
 
@@ -1060,6 +1084,9 @@ impl AppState {
             }
         };
         key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
+        if let Some(engine) = self.engine.as_ref() {
+            key_log_candidates(engine);
+        }
         // KIME_DEBUG 状态快照（关着时闭包不会执行，零开销）：键码/字符/outcome +
         // 引擎状态 {letters, preedit, cursor, undo_depth, undo_top}，供远端诊断
         // 逐键还原状态转移。
