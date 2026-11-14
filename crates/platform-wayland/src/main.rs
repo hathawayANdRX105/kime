@@ -112,12 +112,24 @@ struct KeyLogFile {
 static KEY_LOG: AtomicBool = AtomicBool::new(false);
 static KEY_LOG_FILE: LazyLock<Mutex<Option<KeyLogFile>>> = LazyLock::new(|| Mutex::new(None));
 
-fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outcome: &Outcome) {
+fn key_log(
+    code: u32,
+    ch: Option<char>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    outcome: &Outcome,
+    summary: &str,
+) {
     if !KEY_LOG.load(Ordering::Relaxed) {
         return;
     }
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
-    let line = key_log_line(code, ch, ctrl, alt, shift, outcome);
+    let line = format!(
+        "{}{}",
+        key_log_line(code, ch, ctrl, alt, shift, outcome),
+        summary
+    );
     let mut g = KEY_LOG_FILE.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
         *g = OpenOptions::new()
@@ -145,24 +157,17 @@ fn key_log(code: u32, ch: Option<char>, ctrl: bool, alt: bool, shift: bool, outc
     }
 }
 
-/// 逐键日志附一行候选摘要：键处理完的候选首项 + 个数。
+/// 逐键日志的候选摘要：键处理完的候选个数 + 首几项。
 ///
 /// 有了它才能从日志直接判断「按键有没有出候选」「出的候选对不对」——
-///
 /// preedit 只说明键到了引擎，候选才是用户看到的东西。
-fn key_log_candidates(engine: &kime_core::Engine) {
-    if !KEY_LOG.load(Ordering::Relaxed) {
-        return;
-    }
+///
+/// 摘要与按键行**写进同一行**（而不是另起一行）：两处写入共用同一个
+/// `written` 计数与 1MiB 自截断，分开写会让摘要行绕过上限检查。
+fn key_log_candidate_summary(engine: &kime_core::Engine) -> String {
     let cands = engine.candidates();
     let first: Vec<&str> = cands.iter().take(5).map(|c| c.text.as_str()).collect();
-    let line = format!("  cands={} first=[{}]\n", cands.len(), first.join(","));
-    let mut g = KEY_LOG_FILE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(kf) = g.as_mut() {
-        kf.written += line.len() as u64;
-        let _ = kf.buf.write_all(line.as_bytes());
-        let _ = kf.buf.flush();
-    }
+    format!(" cands={} first=[{}]", cands.len(), first.join(","))
 }
 
 /// KIME_DEBUG=1 状态转移日志：追加写 /tmp/kime-ime-debug.log（写失败静默忽略，
@@ -1069,7 +1074,7 @@ impl AppState {
         // 剪贴板模式优先：C-; 触发 / 导航 / 提交都在这里闭环，不进引擎。
         if self.clip_mode_key(code, qh) {
             let (ctrl, alt) = (self.keyboard.ctrl(), self.keyboard.alt());
-            key_log(code, None, ctrl, alt, false, &Outcome::Consumed);
+            key_log(code, None, ctrl, alt, false, &Outcome::Consumed, "");
             return;
         }
         let ch = self.keyboard.key_char(code);
@@ -1083,10 +1088,21 @@ impl AppState {
                 Outcome::Ignored
             }
         };
-        key_log(code, ch, ctrl, alt, matches!(code, 42 | 54), &outcome);
-        if let Some(engine) = self.engine.as_ref() {
-            key_log_candidates(engine);
-        }
+        // 候选摘要与按键行同行：摘要单独写会绕过 1MiB 自截断计数。
+        let summary = self
+            .engine
+            .as_ref()
+            .map(key_log_candidate_summary)
+            .unwrap_or_default();
+        key_log(
+            code,
+            ch,
+            ctrl,
+            alt,
+            matches!(code, 42 | 54),
+            &outcome,
+            &summary,
+        );
         // KIME_DEBUG 状态快照（关着时闭包不会执行，零开销）：键码/字符/outcome +
         // 引擎状态 {letters, preedit, cursor, undo_depth, undo_top}，供远端诊断
         // 逐键还原状态转移。
