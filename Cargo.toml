@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.20.85"
+version = "0.23.87"
 edition = "2021"
 
 # dylint 的 lint 名只在 dylint 运行时注册，且 dylint 用 `--cfg=dylint_lib="<库名>"`
