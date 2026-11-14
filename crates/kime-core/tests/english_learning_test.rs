@@ -324,7 +324,7 @@ fn english_mode_typing_then_space_learns_the_word() {
         alt: false,
     });
     assert_eq!(
-        e.dict_usage("if"),
+        e.english_usage("if"),
         Some(1),
         "空格边界应把累积的英文词学进去"
     );

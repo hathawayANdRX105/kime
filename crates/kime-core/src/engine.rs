@@ -331,7 +331,7 @@ impl Engine {
     /// 英文词的使用次数（诊断/测试用）：该词在 `user_stats` 里的累计次数。
     ///
     /// 没学过返回 `None`；词不在 `english` 表里也返回 `None`（没学过的词）。
-    pub fn dict_usage(&self, word: &str) -> Option<u64> {
+    pub fn english_usage(&self, word: &str) -> Option<u64> {
         self.dict.english_usage(word)
     }
 
