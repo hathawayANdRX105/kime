@@ -613,7 +613,7 @@ impl Dict {
                 eff: 0,
             })
         })?;
-        let mut entries: Vec<EnglishEntry> = rows.collect()?;
+        let mut entries: Vec<EnglishEntry> = rows.collect::<Result<Vec<_>, _>>()?;
         for e in &mut entries {
             e.eff = e.freq.max(0) as u64 + user_bonus_of(user_stats, today, &e.text, &e.text);
         }
