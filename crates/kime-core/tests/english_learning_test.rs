@@ -3,14 +3,13 @@
 //! 契约（任务书 2026-11-14 的 A1..A5）：
 //! - A1：`lookup_english` 的 `eff` = 裸频 + 用户提频加成（与中文路径同一算式）。
 //! - A2：英文词上屏 N 次 → `user_stats` 计数 +N，且 `eff` 相比未使用时上升。
-//! - A3：常用词（`if`/`round`）用过之后排在低频词（`rug`/`gob`）之前。
+//! - A3：常用词（`ruin`）用过之后排在低频词（`rug`/`gob`）之前。
 //! - A4：不在 `english` 表里的串（`zxqv`）不产生任何学习记录，候选集合不变。
 //! - A5：分层契约不被提频打破——层二词（`ifx`）不得插到层一词（`if`）之前。
 //!
 //! 中文候选的排序与学习零改动：这里同时钉「英文计数不进 `user_pinyins`」。
 
 use std::fs;
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kime_core::config::Config;
@@ -27,16 +26,16 @@ const CN: &str = "\
 河\the\t400
 ";
 
-/// 英文表：`if`/`round` 低频，`rug`/`gob` 高频，`ifx` 是 `if` 的补全（层二）。
+/// 英文表：`if`/`ruin` 低频，`rug`/`gob` 高频，`ifx` 是 `if` 的补全（层二）。
 ///
-/// 频率刻意拉开：`round`(200) 低于 `rug`(900)：不学习时 `rug` 在前，
-/// 学习 `round` 之后 `round` 必须反超——这正是用户诉求「我常用的要靠前」。
-/// 同前缀的词才落在同一个候选集里可比：`rug`/`round` 共前缀 `ru`（A3），
+/// 频率刻意拉开：`ruin`(100) 低于 `rug`(900)：不学习时 `rug` 在前，
+/// 学习 `ruin` 之后 `ruin` 必须反超——这正是用户诉求「我常用的要靠前」。
+/// 同前缀的词才落在同一个候选集里可比：`rug`/`ruin` 共前缀 `ru`（A3），
 /// `if`/`ifx` 共前缀 `if`（A5 的层一/层二契约）。
 const EN: &str = "\
 ...
 if\tif\t100
-round\tround\t200
+ruin\truin\t100
 rug\trug\t900
 gob\tgob\t800
 ifx\tifx\t5
@@ -116,31 +115,27 @@ fn repeated_use_raises_count_and_eff() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// A3：用户诉求的直接验收——常用的 `round` 用过之后排在没用过的 `rug` 之前。
+/// A3：用户诉求的直接验收——常用的 `ruin` 用过之后排在没用过的 `rug` 之前。
 ///
-/// `rug`(900) 与 `round`(200) 同前缀 `ru`，才落在同一个候选集里可比；
+/// `rug`(900) 与 `ruin`(100) 同前缀 `ru`，才落在同一个候选集里可比；
 /// `if`/`ifx` 同前缀 `if`，供 A5 的分层契约用。
 #[test]
 fn frequently_used_word_overtakes_unused_words() {
     let (mut d, dir) = seeded("a3");
     let before = texts(&d.lookup_english("ru", 10));
-    assert_eq!(
-        before,
-        ["rug", "round"],
-        "前置条件：未学习时高频的 rug 在前"
-    );
+    assert_eq!(before, ["rug", "ruin"], "前置条件：未学习时高频的 rug 在前");
 
-    d.learn_english("round");
+    d.learn_english("ruin");
     let after = d.lookup_english("ru", 10);
     assert_eq!(
         texts(&after),
-        ["round", "rug"],
-        "常用的 round 应排到没用过的 rug 之前"
+        ["ruin", "rug"],
+        "常用的 ruin 应排到没用过的 rug 之前"
     );
     assert_eq!(
-        eff_of(&after, "round"),
-        200 + 300_000,
-        "round 的 eff 应含首用满额加成"
+        eff_of(&after, "ruin"),
+        100 + 300_000,
+        "ruin 的 eff 应含首用满额加成"
     );
     assert_eq!(eff_of(&after, "rug"), 900, "没用过的 rug 只有裸频");
     fs::remove_dir_all(dir).unwrap();
