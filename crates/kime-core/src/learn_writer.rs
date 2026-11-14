@@ -35,7 +35,10 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::dict::{persist_commit_log, persist_learn, refresh_vocab_cache, today_days, warn_once};
+use crate::dict::{
+    persist_commit_log, persist_english_learn, persist_learn, refresh_vocab_cache, today_days,
+    warn_once,
+};
 
 /// 有界队列容量（承重决策：绝不引入 unbounded channel）。256 ≈ 高频选词下
 /// 数秒的写入量；满即丢，下一次选词的写自然把计数收敛到最新。
@@ -66,6 +69,18 @@ pub(crate) enum LearnJob {
         text: String,
         /// 使用次数与最近使用日：**绝对值**（`learn_mem` 已算好）——队列
         /// 丢一个 job 后下一个 job 仍收敛到最新计数，不做增量。
+        n: u64,
+        day: u64,
+    },
+    /// 一次英文词使用的持久化（**只**写 kime_kv 计数）。
+    ///
+    /// 英文词绝不进 `phrase` 表：那张表按拼音前缀查询，混进英文会污染中文候选
+    /// （`he` 会捞出 `help`）。计数与中文学习同表同格式（key = `词\t词`），
+    /// 开库时由同一条 `load_user_stats` 读回。
+    EnglishLearn {
+        /// 词库写法（如 `OK`）
+        word: String,
+        /// 使用次数与最近使用日：**绝对值**（同上）。
         n: u64,
         day: u64,
     },
@@ -221,5 +236,6 @@ fn run_job(conn: &Connection, state: &mut WriterState, job: LearnJob) -> rusqlit
             n,
             day,
         } => persist_learn(conn, &pinyin, &abbrev, &text, n, day),
+        LearnJob::EnglishLearn { word, n, day } => persist_english_learn(conn, &word, n, day),
     }
 }

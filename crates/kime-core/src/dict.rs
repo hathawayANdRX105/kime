@@ -117,10 +117,14 @@ pub struct IndexEntry {
 
 /// 英文词条目。`key` = `text` 的小写形式（text 恒为纯 ASCII 字母，见 `import_english`）；
 /// 整个 Vec 按 (key ASC, freq DESC, text ASC) 排序，`lookup_english` 的前缀区间靠它二分。
+///
+/// `eff` = 排序用有效频率（裸频 + 用户提频加成），开库时烘焙、学习时重烘——
+/// 与中文 `IndexEntry.eff` 同一套做法：加成不进比较器，热路径零哈希零分配。
 struct EnglishEntry {
     key: String,
     text: String,
     freq: i64,
+    eff: u64,
 }
 
 pub struct Dict {
@@ -151,6 +155,10 @@ pub struct Dict {
     /// `kime_kv(key, value)` 表——选它而不是把计数压进 freq 高位：后者会污染
     /// 所有读 freq 的路径（builder、overlay 权威读回、memory_vs_sql 一致性），
     /// 前者只有这一张几十行的旁表，learn 一次 UPSERT，开库一次全量 SELECT。
+    ///
+    /// 中文键 = `(拼音, 汉字)`；**英文键 = `(词, 词)`**（两段同一个 ASCII 词，
+    /// 与 `english_to_candidate` 的 `pinyin`/`text` 同源，故加成查询侧天然对齐）。
+    /// 两种键空间不重叠：汉字永不等于 ASCII 拼音。
     user_stats: HashMap<(String, String), (u64, u64)>,
     /// 有提频记录的拼音集合（user_stats 键的拼音投影）。查询时 O(1) 判断
     /// 「该拼音块是否可能含提频行」——只有打学到过的拼音才触发块内 eff 重排。
@@ -341,6 +349,21 @@ pub(crate) fn persist_learn(
     Ok(())
 }
 
+/// 英文词使用计数落库：**只**写 `kime_kv` 旁表，不碰 `phrase`。
+///
+/// - `phrase` 是拼音前缀查询的数据源，混进英文词会污染中文候选（打 `he` 捞出 `help`），
+///   所以英文学习只落旁表。
+/// - key = `词\t词`，value = `n,day`（绝对值）：与中文学习同格式，开库时同一条
+///   [`Dict::load_user_stats`] 读回，加成算式完全共用。
+pub(crate) fn persist_english_learn(conn: &Connection, word: &str, n: u64, day: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO kime_kv(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![format!("{word}\t{word}"), format!("{n},{day}")],
+    )?;
+    Ok(())
+}
+
 /// commit_log 落库（离线 LM 第 0 层）。同步 [`Dict::log_commit`] 与后台写线程
 /// 共用（#101：SQL 只有这一份）。
 ///
@@ -524,8 +547,16 @@ impl Dict {
         });
         // 有提频记录的拼音集合：查询时判断「该块是否需要按 eff 重排」的 O(1) 依据
         //（集合是个位到几百条，层一块内重排只在打学到过的拼音时发生）。
-        let user_pinyins: std::collections::HashSet<String> =
-            user_stats.keys().map(|(p, _)| p.clone()).collect();
+        //
+        // 英文学习的计数键是 `(词, 词)`（两段都是 ASCII），中文学习的键是
+        // `(拼音, 汉字)`——汉字永不等于 ASCII 拼音，故按「两段相等」即可把英文
+        // 计数挡在外面：否则英文词（如 `ni`）会让中文拼音块误判为「有提频行」，
+        // 触发块内重排（中文候选顺序零改动的承诺就破了）。
+        let user_pinyins: std::collections::HashSet<String> = user_stats
+            .keys()
+            .filter(|(pinyin, text)| pinyin != text)
+            .map(|(pinyin, _)| pinyin.clone())
+            .collect();
         // FST 模式下用户词 overlay 全量入内存：热路径靠它，不再每键查 SQLite。
         // 纯 SQLite 模式下 `index` 本身就含用户词，overlay 留空。
         let user_overlay = if store.is_some() {
@@ -539,7 +570,7 @@ impl Dict {
             Vec::new()
         };
         let total_freq = Self::query_total_freq(&conn);
-        let english = Self::load_english(&conn)?;
+        let english = Self::load_english(&conn, &user_stats, today)?;
         Ok(Self {
             conn,
             index,
@@ -564,7 +595,14 @@ impl Dict {
     /// 英文表全量入内存。排序交给 SQL：`lower(text)` 就是匹配键（text 恒为 ASCII，
     /// SQLite 的 `lower()` 只处理 ASCII，正好是我们要的语义），省掉 Rust 端一次重排。
     /// 表空/不存在时返回空 Vec，开销是一次 prepare。
-    fn load_english(conn: &Connection) -> Result<Vec<EnglishEntry>> {
+    ///
+    /// `eff` 在这里烘焙（裸频 + 用户提频加成）：加成只影响排序比较器，
+    /// 不改词库频率；与中文 `IndexEntry.eff` 的做法一致。
+    fn load_english(
+        conn: &Connection,
+        user_stats: &HashMap<(String, String), (u64, u64)>,
+        today: u64,
+    ) -> Result<Vec<EnglishEntry>> {
         let mut stmt = conn
             .prepare("SELECT lower(text), text, freq FROM english ORDER BY 1 ASC, 3 DESC, 2 ASC")?;
         let rows = stmt.query_map(params![], |row| {
@@ -572,18 +610,27 @@ impl Dict {
                 key: row.get(0)?,
                 text: row.get(1)?,
                 freq: row.get(2)?,
+                eff: 0,
             })
         })?;
-        rows.collect()
+        let mut entries: Vec<EnglishEntry> = rows.collect::<Result<Vec<_>, _>>()?;
+        for e in &mut entries {
+            e.eff = e.freq.max(0) as u64 + user_bonus_of(user_stats, today, &e.text, &e.text);
+        }
+        Ok(entries)
     }
 
     /// 英文词查询：拿**原始按键串**匹配，不做拼音解码（对齐 rime 的 english translator）。
     ///
     /// 两层契约与中文 `lookup_prefix` 一致：层一 = key 恰等于输入的条目，层二 = 以输入为
-    /// 前缀的补全；**每层各自**按 `(freq DESC, text ASC)`，层一整体在前，绝不跨层打平——
+    /// 前缀的补全；**每层各自**按 `(eff DESC, text ASC)`，层一整体在前，绝不跨层打平——
     /// 否则打 `help` 会被 `helper` 顶掉首候选。层二必须重排：内存 Vec 的主序是 key 升序，
     /// 一段前缀区间里跨了多个 key，天然不是频率序（中文那条路径同理）。
     /// 输入大小写不敏感，上屏文本保持词库原写法（`AA` 与 `aa` 是两条独立条目，都能被 `aa` 命中）。
+    ///
+    /// `eff` = 裸频 + 用户提频加成（与中文路径同一个 [`user_bonus_of`] 算式）：
+    /// 用户常用的英文词往上走，用得少的往下沉。层间仍不跨层打平（层二词再热也不插到
+    /// 层一前面），提频只改层内次序。
     pub fn lookup_english(&self, raw: &str, limit: usize) -> Vec<Candidate> {
         if raw.is_empty() || limit == 0 {
             return Vec::new();
@@ -596,32 +643,128 @@ impl Dict {
             .iter()
             .take_while(|e| e.key == key)
             .count();
+        // 层一：精确块。整块先取全再按 eff 重排再截断——被提频抬上来的词若在
+        // 截断之外就被丢了（同 lookup_prefix 的层一处理）。
         let mut out: Vec<Candidate> = self.english[start..start + exact_len]
             .iter()
             .map(Self::english_to_candidate)
-            .take(limit)
             .collect();
+        out.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
+        out.truncate(limit);
         let mut comps: Vec<Candidate> = self.english[start + exact_len..]
             .iter()
             .take_while(|e| e.key.starts_with(&key))
             .map(Self::english_to_candidate)
             .collect();
         // ponytail: 整段重排（最坏 `a` 命中 ~4k 条，release 下几 µs）；哪天真嫌慢再换 top-k 堆。
-        comps.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
+        comps.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
         comps.truncate(limit - out.len());
         out.extend(comps);
         out
     }
 
+    /// 英文词候选：`eff` = 裸频 + 用户提频加成（同一 [`user_bonus_of`] 算式，
+    /// 开库/学习时烘焙进条目，热路径只比字段）。
+    ///
+    /// 加成的键 = `(词, 词)`：与 `english_to_candidate` 的 `pinyin`/`text` 同为词本身，
+    /// 于是学习侧写入的键与这里查询的键天然对齐（见 [`Dict::learn_english`]）。
     fn english_to_candidate(e: &EnglishEntry) -> Candidate {
         Candidate {
             text: e.text.clone(),
             // pinyin 填词本身：主控的分层判断靠它区分「消耗完输入」与「补全」
             pinyin: e.text.clone(),
             freq: e.freq.max(0) as u64,
-            eff: e.freq.max(0) as u64,
+            eff: e.eff,
             ai: false,
         }
+    }
+
+    /// 英文词学习：把用户实际用过的英文词记进 `user_stats`，供 [`Self::lookup_english`]
+    /// 的提频加成读取。
+    ///
+    /// - `word` 必须是**词库 `english` 表里存在的词**（大小写不敏感，按 `lower(text)`
+    ///   匹配）：不在表里的串（如 `zxqv`）直接忽略，不写任何记录——否则任意误打的
+    ///   串都会进用户词表污染候选。
+    /// - 计数键 = `(词, 词)`，与 `english_to_candidate` 的 `pinyin`/`text` 一致，
+    ///   故加成在查询侧能被查到。
+    /// - 词的大小写按**词库写法**记（`AA` 与 `aa` 是两条独立条目，各记各的）：
+    ///   同一小写键下有多个写法时取词频最高的那条，键与查询侧命中的是同一条。
+    /// - 持久化写 `kime_kv`（key = `词\t词`，value = `n,day`），与中文学习同一张旁表，
+    ///   但**不碰 `phrase` 表**：英文词不是拼音，进 `phrase` 会污染中文前缀查询。
+    ///
+    /// 返回是否真的记了（词库校验失败返回 false）。
+    pub fn learn_english(&mut self, word: &str) -> bool {
+        let Some(spelling) = self.english_spelling(word) else {
+            return false;
+        };
+        self.today = today_days();
+        let key = (spelling.clone(), spelling.clone());
+        let n = self.user_stats.get(&key).map(|(n, _)| n + 1).unwrap_or(1);
+        self.user_stats.insert(key, (n, self.today));
+        self.enqueue_english_learn(&spelling, n, self.today);
+        self.rebake_english_eff(&spelling);
+        true
+    }
+
+    /// 英文词 → 词库写法（大小写不敏感匹配）。
+    ///
+    /// **优先完全同形的写法**（用户敲 `aa` 记在 `aa` 上、`AA` 记在 `AA` 上——
+    /// `AA` 与 `aa` 是两条独立条目，各记各的）；没有同形的才退到大小写不敏感的
+    /// 首条（词频最高，`load_english` 的排序即 freq DESC）。
+    /// 不在表里的词返回 `None`——这正是防污染闸门（乱串不入表）。
+    fn english_spelling(&self, word: &str) -> Option<String> {
+        if word.is_empty() {
+            return None;
+        }
+        let key = word.to_ascii_lowercase();
+        let start = self
+            .english
+            .partition_point(|e| e.key.as_str() < key.as_str());
+        let group: Vec<&EnglishEntry> = self.english[start..]
+            .iter()
+            .take_while(|e| e.key == key)
+            .collect();
+        // 完全同形优先；没有同形的才退到首条（词频最高，`load_english` 的排序即 freq DESC）。
+        group
+            .iter()
+            .find(|e| e.text == word)
+            .or_else(|| group.first())
+            .map(|e| e.text.clone())
+    }
+
+    /// 英文词的使用次数（诊断/测试用）：该词在 `user_stats` 里的累计次数。
+    ///
+    /// 键与 [`Self::learn_english`] 写入的一致（`(词, 词)`，词为词库写法）。
+    /// 没学过返回 `None`。
+    pub fn english_usage(&self, word: &str) -> Option<u64> {
+        let spelling = self.english_spelling(word)?;
+        self.user_stats
+            .get(&(spelling.clone(), spelling))
+            .map(|(n, _)| *n)
+    }
+
+    /// 重烘该词的 `eff`（学习后当帧生效，与中文 `learn_mem` 同语义）。
+    fn rebake_english_eff(&mut self, spelling: &str) {
+        let today = self.today;
+        // 先算加成再改条目：`self.english` 的可变借用与 `self.user_stats` 的只读
+        // 借用不能同时存在（同一 `self`）。
+        let bonus = user_bonus_of(&self.user_stats, today, spelling, spelling);
+        for e in self.english.iter_mut().filter(|e| e.text == spelling) {
+            e.eff = e.freq.max(0) as u64 + bonus;
+        }
+    }
+
+    /// 英文学习持久化入队（键路径零 SQLite 写）。
+    ///
+    /// 只写 `kime_kv` 计数（英文词不进 `phrase`），值是**绝对值** `n,day`——
+    /// 队列丢一个 job 后下一个 job 仍收敛到最新计数。
+    fn enqueue_english_learn(&mut self, word: &str, n: u64, day: u64) {
+        let job = LearnJob::EnglishLearn {
+            word: word.to_string(),
+            n,
+            day,
+        };
+        self.writer.submit(&self.db_path, job);
     }
 
     /// 读出全部 `user = 1` 行，按 pinyin ASC 排序（前缀二分要求）。
@@ -836,7 +979,7 @@ impl Dict {
             )?;
         }
         tx.commit()?;
-        self.english = Self::load_english(&self.conn)?;
+        self.english = Self::load_english(&self.conn, &self.user_stats, self.today)?;
         Ok(count)
     }
 

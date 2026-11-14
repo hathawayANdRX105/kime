@@ -626,3 +626,41 @@ fn backspace_after_commits_releases_to_app() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A7（英文词学习不得吞键）：英文模式下**每个**字母键仍转发给应用，
+/// 首字母与后续字母一个样。
+///
+/// 英文词的学习走引擎内的旁路缓冲（见 kime-core 的 `observe_english_key`），
+/// 但字母键的可见行为必须与改动前逐字一致：`Outcome::Ignored` → `PressAction::Forward`。
+/// 若哪天真改成「引擎吞掉字母键自己上屏」，本用例立刻红。
+#[test]
+fn english_mode_letters_are_forwarded_to_the_app() {
+    let (mut sh, dir) = Shell::new("en_letters");
+    // 切英文模式（引擎的唯一模式翻转入口）。
+    sh.engine.set_chinese(false);
+    for c in ['i', 'f'] {
+        let code = letter_code(c);
+        assert_eq!(
+            sh.press(code),
+            Outcome::Ignored,
+            "英文模式的字母 {c} 必须放行（不得被引擎吞掉）"
+        );
+        sh.release(code);
+    }
+    assert_eq!(
+        sh.forwarded,
+        vec![
+            (letter_code('i'), true),
+            (letter_code('i'), false),
+            (letter_code('f'), true),
+            (letter_code('f'), false),
+        ],
+        "英文模式的字母键必须原样转发给应用：首字母与后续字母一致"
+    );
+    assert!(
+        sh.commits.is_empty(),
+        "英文模式不得由引擎上屏任何文本：{:?}",
+        sh.commits
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
