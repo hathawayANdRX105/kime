@@ -331,3 +331,101 @@ fn english_mode_typing_then_space_learns_the_word() {
     drop(e);
     cleanup(Dict::open(&db_path).unwrap(), dir);
 }
+
+/// 焦点/实例切换（`clear_undo`）必须丢掉英文残段：在应用 A 打了半个词、
+/// 切到 B 再续打，不得把从未连续输入的串攒成一个「词」学进用户词表。
+#[test]
+fn focus_change_discards_partial_english_word() {
+    let (dict, dir) = seeded("focus");
+    let db_path = dir.join("dict.sqlite3");
+    let mut e = Engine::new(dict, Config::default());
+    e.set_chinese(false);
+    // 应用 A：打 "ru"（不是词库词，且刻意不打边界键）
+    for c in "ru".chars() {
+        e.key(letter(c));
+    }
+    // 切应用 = 壳层调 clear_undo（真实焦点边界）
+    e.clear_undo();
+    // 应用 B：续打 "in" + 空格边界
+    for c in "in".chars() {
+        e.key(letter(c));
+    }
+    e.key(boundary());
+    assert_eq!(
+        e.english_usage("ruin"),
+        None,
+        "跨应用边界不得把 ru + in 攒成 ruin 学进去"
+    );
+    drop(e);
+    cleanup(Dict::open(&db_path).unwrap(), dir);
+}
+
+/// 超长串（长按自动重复 / 恶意输入）不得让缓冲无界增长；且超长串本身学不进表。
+#[test]
+fn oversized_english_run_is_bounded_and_not_learned() {
+    let (dict, dir) = seeded("longrun");
+    let db_path = dir.join("dict.sqlite3");
+    let mut e = Engine::new(dict, Config::default());
+    e.set_chinese(false);
+    // 远超缓冲上限的同一字母连发（模拟长按自动重复）
+    for _ in 0..200 {
+        e.key(letter('z'));
+    }
+    e.key(boundary());
+    // 超长 z 串不在词库 → 学不进任何记录（若缓冲无界增长，这里会白烧内存）
+    let kv: i64 = {
+        let d = Dict::open(&db_path).unwrap();
+        d.conn()
+            .query_row("SELECT count(*) FROM kime_kv", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(kv, 0, "超长串不得写入任何学习记录");
+    drop(e);
+    cleanup(Dict::open(&db_path).unwrap(), dir);
+}
+
+/// 测试辅助：一个可打印字母键（无修饰）。
+fn letter(c: char) -> Key {
+    Key {
+        ch: Some(c),
+        code: 0,
+        shift: false,
+        ctrl: false,
+        alt: false,
+    }
+}
+
+/// 测试辅助：分词边界键（空格）。
+fn boundary() -> Key {
+    Key {
+        ch: None,
+        code: 57,
+        shift: false,
+        ctrl: false,
+        alt: false,
+    }
+}
+
+/// 中文模式下选中英文候选（`merge_english` 产出）走 Commit 路径时也要学习：
+/// 用户选「if」上屏，就是用了这个词。词库校验保证拼音残段不会被误学。
+#[test]
+fn committing_english_candidate_in_chinese_mode_learns_it() {
+    let (dict, dir) = seeded("cncommit");
+    let db_path = dir.join("dict.sqlite3");
+    let mut e = Engine::new(dict, Config::default());
+    // 中文模式（默认）下打 "if"：候选列表里会出现英文精确词 "if"
+    for c in "if".chars() {
+        e.key(letter(c));
+    }
+    // 空格 = 选当前页首候选。英文精确词在中文层一之后、中文补全之前，
+    // 此 fixture 没有中文 "if" 读音的词，故页首即英文 "if" → 全覆盖上屏。
+    e.key(boundary());
+    // 若这条路径不学习，english_usage("if") 会是 None。
+    assert_eq!(
+        e.english_usage("if"),
+        Some(1),
+        "中文模式选中英文候选上屏后必须学进用户词表"
+    );
+    drop(e);
+    cleanup(Dict::open(&db_path).unwrap(), dir);
+}

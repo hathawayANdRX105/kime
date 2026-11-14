@@ -39,6 +39,10 @@ const KEY_RIGHTBRACE: u32 = 27;
 /// 默认每页候选数（config.page_size = 0 时生效）
 const DEFAULT_PAGE_SIZE: usize = 10;
 
+/// 英文累积缓冲上限（字符）。英文模式字母键直通应用，长按自动重复逐条进缓冲；
+/// 上限防无界增长。取值远大于任何真实英文词长度，超长串本来也匹配不到词库词。
+const MAX_ENGLISH_BUFFER: usize = 64;
+
 /// 平台无关最小按键。壳负责从 wayland / TSF / IMKit 换算进来。
 #[derive(Clone, Copy, Debug)]
 pub struct Key {
@@ -165,15 +169,20 @@ impl Engine {
         self.undo_consumed.last()
     }
 
-    /// 清空词级撤销栈。
+    /// 清空词级撤销栈**与英文累积缓冲**。
     ///
     /// 壳在「真实切应用 / IM 重连」（全新输入串开始）时调用：栈条目只与
     /// 未释放的预选词配对存活，跨连接/跨应用边界后旧条目失去意义，必须
     /// 随之作废，不得把旧 burst 的撤销历史带进新会话（v0.19.68 回归，
     /// 投诉 2）。Esc / 同实例焦点抖动走 [`Self::clear_composition`]
     /// （连同组合一起清）。
+    ///
+    /// 英文累积缓冲同理：它是「一个词」的观察窗口，跨应用边界后必须把
+    /// 残段丢掉——否则在应用 A 打了半个词、切到 B 再续打，会把从未连续
+    /// 输入的串攒成一个「词」学进用户词表。
     pub fn clear_undo(&mut self) {
         self.undo_consumed.clear();
+        self.english_buffer.clear();
     }
 
     /// 当前页大小：优先 config.page_size，否则 DEFAULT_PAGE_SIZE
@@ -365,7 +374,12 @@ impl Engine {
             return;
         };
         if ch.is_ascii_alphabetic() || ch == '\'' {
-            self.english_buffer.push(ch);
+            // 上限：英文模式字母键直通应用，长按自动重复会逐条进缓冲；
+            // 不设上限时一个超长串会无界增长（且 flush 时要整串切词）。
+            // 超过上限即停止累积——超长串不可能是词库词，学不到东西。
+            if self.english_buffer.len() < MAX_ENGLISH_BUFFER {
+                self.english_buffer.push(ch);
+            }
         } else {
             self.flush_english_buffer();
         }
@@ -385,9 +399,10 @@ impl Engine {
 
     /// 把一段文本里的英文词逐个学习：按非字母字符切成词，每词单独校验入表。
     ///
-    /// **只在英文模式调用**：中文模式下提交的字母串是拼音残段（`nihao` 之类），
-    /// 若也当英文词学习，会把 `if`/`no`/`us` 这类「既是拼音片段又是英文词」的串
-    /// 混进用户词表。英文模式下用户敲的才是真英文。
+    /// 两个调用点：
+    /// - 英文模式的分词边界（`observe_english_key`）——用户直接敲的英文串；
+    /// - `commit_output`——中文模式下选中英文候选（`merge_english` 产出）走 Commit 路径，
+    ///   提交的文本就是用户实际用的英文词。
     ///
     /// 词库校验在 [`Dict::learn_english`] 内部（不在 `english` 表里的串不学），
     /// 所以任意误打的串都不会污染用户词表。
@@ -960,6 +975,12 @@ impl Engine {
         if !starts_cjk {
             self.last_commit = None;
         }
+
+        // 英文词也学习：中文模式下选中英文候选（`merge_english` 产出的 OK/if 等）
+        // 走的是 Commit 路径，这条路上 kime 发出的文本就是用户实际用的英文词。
+        // 词库校验在 `Dict::learn_english` 内部——不在 english 表里的串不学，
+        // 因此中文模式提交的拼音残段（`nihao` 之类）不会污染用户词表。
+        self.learn_english_runs(&text);
 
         let runs = match segment_output_text(self.dict.conn(), &text) {
             Ok(runs) if !runs.is_empty() => runs,
