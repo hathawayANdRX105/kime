@@ -136,10 +136,12 @@ fn xiaohe_single_final_key_lists_ie_series_words() {
     cleanup(&db, &yaml);
 }
 
-/// 末键作**声母位**的意图同样要保留：自然码 `i` = ch 声母位 → chi 系词在列。
+/// 末键作**声母位**的意图（`initial_of` 前缀查询）：自然码 `i` = ch 声母位 →
+/// chi 系词在列。
 ///
-/// 这条覆盖的是修前那条死代码分支（`initial_of(last).is_empty()` 从不触发，
-/// 声母位音节从未进过候选池）。
+/// 这条覆盖的是修前就有的路径：`initial_of('i')` = "ch"，查 "ch*" 前缀命中
+/// 「吃」(chi)。修前出错的不是这条，而是末键作**韵母位**的意图从未实现
+/// （`initial_of(last).is_empty()` 那条分支在两套码表里从不触发）。
 #[test]
 fn ziranma_single_initial_key_lists_complete_syllable_words() {
     let (mut e, db, yaml) = seeded_engine("ziranma_i", Scheme::Ziranma);

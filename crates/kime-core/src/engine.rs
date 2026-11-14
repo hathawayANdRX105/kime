@@ -1015,30 +1015,22 @@ impl Engine {
                         }
                     }
                 } else {
-                    // 最后一个键还没凑成键对，它代表的**声母意图**是「拼音字母前缀」：
+                    // 最后一个键还没凑成键对，它的**声母意图**是「拼音字母前缀」：
                     // 直接拿它当拼音前缀去查，等于查 "u" 开头的词，半截状态必出垃圾。
                     let last = self.letters[len - 1..].chars().next();
                     let last = last.unwrap_or(' ');
-                    // 末键还有第二种意图：**韵母位**。同一键在两套码表里身兼
-                    // 声母位与韵母位（自然码 p 作韵母位是 un/ün 系列：小鹤 p 是
-                    // ie 系列），只按声母查会丢掉这批候选——敲 p 单键查拼音 "p"
-                    // 零命中，用户看到的就是「p 键完全没反应」。
-                    //
-                    // 两套音节都枚举：声母位（末键作第一键，如 i → chi/chai/chu…
-                    // 与 p → pa/pai/pan…）+ 韵母位（末键作第二键，如 p →
-                    // lun/jun/chun/run…）。候选按频率竞争，用户想要哪一类由
-                    // 词频决定谁在前。
-                    //
-                    // 注：此处原有一条 `initial_of(last).is_empty()` 分支走
-                    // `syllables_of_initial`——但两套码表 26 键的 initial_of 全
-                    // 非空，该分支从不触发（死代码），所以声母位音节此前根本没
-                    // 进过候选池。
-                    let mut half_key_syls = table.syllables_of_initial(last);
-                    half_key_syls.extend(table.final_syllables_of(last));
                     (
                         table.to_syllables(&self.letters[..len - 1]),
                         table.initial_of(last),
-                        half_key_syls,
+                        // 末键的第二种意图：**韵母位**。同一键在两套码表里身兼
+                        // 声母位与韵母位（自然码 p 作韵母位是 un/ün 系列：小鹤 p
+                        // 是 ie 系列），只按声母前缀查时这批词永远查不到。
+                        //
+                        // 这批音节只在**声母前缀查不到东西时**才用（见下方兜底）：
+                        // 声母位键（如自然码 u=sh）的韵母位意图（wu 系）一旦混进
+                        // 候选，就会把「乌/优」这类拼音以裸字母开头的词塞给用户
+                        // （既有契约：半截键 u 不该出 u 开头的词）。
+                        table.final_syllables_of(last),
                     )
                 }
             };
@@ -1063,23 +1055,25 @@ impl Engine {
                         .unwrap_or_default();
                     // 半截键的**韵母位补全**：末键作韵母位能拼出的完整音节（如自然码
                     // p → lun/jun/chun/run…），逐个作为已完成的末音节补查。用户敲
-                    // 末键的意图是「末音节是这个韵母」，末音节完整的词（ke+l → kelun
-                    // 之类）比任意 ke* 词更贴合意图——补全命中排在前，其余裸前缀
-                    // 结果去重后续后。
+                    // 末键的意图是「末音节是这个韵母」，末音节完整的词比任意
+                    // 前缀词更贴合意图。
                     //
-                    // 注意：这批音节与 pending 的声母前缀是**两种不同意图**（末键在
-                    // 码表里身兼声母位与韵母位），两条都查、都给候选——查完统一按
-                    // 频率重排，让用户想要的那一类自然靠前，而不是被「先查的赢」。
+                    // 与 pending 的声母前缀是**两种不同意图**（末键在码表里身兼声母位
+                    // 与韵母位）：两类都查、都给候选，查完**按频率统一重排**——
+                    // 各批内部有序、批间无序，不重排就变成「先查的意图恒在前」。
                     if !half_key_syls.is_empty() {
                         let mut seen: std::collections::HashSet<String> =
                             cands.iter().map(|c| c.text.clone()).collect();
                         let mut completions: Vec<Candidate> = Vec::new();
+                        // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p
+                        // 有 18 个），若让第一个音节按 candidate_limit 独占，后面的
+                        // 音节（用户可能正想要的那类，如 lun/jun）就被挤掉了。
+                        // 每音节配额 × 音节数 ≈ 一个页的量，最终再按频率统一重排。
+                        let per_syllable = (self.config.candidate_limit / 4).max(1);
                         for s in &half_key_syls {
                             let mut r = syllables.clone();
                             r.push((*s).to_string());
-                            if let Ok(mut vc) =
-                                self.dict.lookup_prefix(&r, "", self.config.candidate_limit)
-                            {
+                            if let Ok(mut vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
                                 vc.retain(|c| seen.insert(c.text.clone()));
                                 completions.extend(vc);
                             }
@@ -1088,11 +1082,11 @@ impl Engine {
                             }
                         }
                         // 补全候选 + 原前缀结果，**按频率统一重排**：两类意图的
-                        // 候选是多次查询拼起来的，各批内部有序、批间无序，不重排
-                        // 就变成「先枚举的意图恒在前」（自然码 p 的声母位 pa/pai…
-                        // 会把韵母位 lun/jun… 整批压到后面，而用户按 p 想要的
-                        // 恰恰可能是 lun/jun）。排序口径与 Dict::cand_cmp 一致：
-                        // eff + lm_boost 降序，同频按文本升序。
+                        // 候选分属多次查询，批间无序，不重排就变成「先枚举的意图
+                        // 恒在前」（自然码 p 的声母位 pa/pai… 会把韵母位
+                        // lun/jun… 整批压到后面，而用户按 p 想要的恰恰可能是
+                        // lun/jun）。排序口径与 Dict::cand_cmp 一致：eff +
+                        // lm_boost 降序，同频按文本升序。
                         let mut merged = completions;
                         merged.extend(cands);
                         merged.sort_by(|a, b| {
