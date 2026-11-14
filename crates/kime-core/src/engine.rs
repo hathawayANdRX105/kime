@@ -1026,10 +1026,11 @@ impl Engine {
                         // 声母位与韵母位（自然码 p 作韵母位是 un/ün 系列：小鹤 p
                         // 是 ie 系列），只按声母前缀查时这批词永远查不到。
                         //
-                        // 这批音节只在**声母前缀查不到东西时**才用（见下方兜底）：
-                        // 声母位键（如自然码 u=sh）的韵母位意图（wu 系）一旦混进
-                        // 候选，就会把「乌/优」这类拼音以裸字母开头的词塞给用户
-                        // （既有契约：半截键 u 不该出 u 开头的词）。
+                        // 两类意图都查、都给候选，查完按频率统一重排（见下方补全
+                        // 路径）。「乌」(wu) 这类词因此会进候选——它的拼音是完整
+                        // 音节 wu（声母键 w 还没按），与「按字母 u 查」不是同一条
+                        // 路；但 u 是 sh 声母键，按 u 想要的是 sh 系，所以排序时
+                        // sh 系必须在前（既有测试钉住这条）。
                         table.final_syllables_of(last),
                     )
                 }
@@ -1066,19 +1067,19 @@ impl Engine {
                             cands.iter().map(|c| c.text.clone()).collect();
                         let mut completions: Vec<Candidate> = Vec::new();
                         // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p
-                        // 有 18 个），若让第一个音节按 candidate_limit 独占，后面的
-                        // 音节（用户可能正想要的那类，如 lun/jun）就被挤掉了。
-                        // 每音节配额 × 音节数 ≈ 一个页的量，最终再按频率统一重排。
-                        let per_syllable = (self.config.candidate_limit / 4).max(1);
+                        // 有 18 个），取太多会让第一个音节独占整页。
+                        //
+                        // **不按累计条数早退**：早退会让排在后面的音节永远查不到
+                        // （自然码 p 的 un 系里 lun 排第 8，累计到上限时正好错过，
+                        // 用户按 p 就看不到「论」）。音节数有界（≤26），全部查完
+                        // 的成本是几十次内存查询，可接受。
+                        let per_syllable = (self.config.candidate_limit / 8).max(2);
                         for s in &half_key_syls {
                             let mut r = syllables.clone();
                             r.push((*s).to_string());
                             if let Ok(mut vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
                                 vc.retain(|c| seen.insert(c.text.clone()));
                                 completions.extend(vc);
-                            }
-                            if completions.len() >= self.config.candidate_limit {
-                                break;
                             }
                         }
                         // 补全候选 + 原前缀结果，**按频率统一重排**：两类意图的

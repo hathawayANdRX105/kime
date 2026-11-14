@@ -157,6 +157,20 @@ fn ziranma_single_initial_key_lists_complete_syllable_words() {
     cleanup(&db, &yaml);
 }
 
+/// 韵母位音节**靠后**的也要查到：自然码 p 作韵母位有 18 个音节（cun/dun/…
+/// lun/jun…），lun 排在第 8 位。若补全循环按「累计条数」早退，第一个音节就把
+/// 上限吃满，lun 永远查不到——用户按 p 就看不到「论」。
+#[test]
+fn ziranma_late_final_syllable_is_still_queried() {
+    let (mut e, db, yaml) = seeded_engine("ziranma_lun", Scheme::Ziranma);
+    let cands = type_keys(&mut e, "p");
+    assert!(
+        cands.contains(&"论".to_string()),
+        "un 韵母位里排第 8 的 lun（论）不能被早退漏掉，实际: {cands:?}"
+    );
+    cleanup(&db, &yaml);
+}
+
 /// 偶数键（完整键对）路径不受影响：完整键对照常按音节查词。
 #[test]
 fn even_length_decode_is_unaffected() {
