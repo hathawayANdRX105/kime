@@ -749,6 +749,10 @@ fn legacy_main(argv: &[String]) -> ExitCode {
             let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
             return handle_debug_cmd(&sub_args);
         }
+        Some("typing") => {
+            let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
+            return handle_typing_cmd(&sub_args);
+        }
         Some("mine-lm") => {
             let mut dict_path: Option<PathBuf> = None;
             let mut jev_enabled = false;
@@ -1004,4 +1008,115 @@ fn legacy_main(argv: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `kime typing <文本文件>` —— 打字语料回放：逐词统计候选名次并落一份 markdown 报告。
+///
+///   kime typing <file> [--dict <库>] [--out <报告.md>] [--limit N] [--json]
+///                   [--mode full|ziranma|xiaohe]
+///
+/// 为什么单独做一个命令：候选顺序的回归测试用的是短串 fixture，而用户抱怨的是
+/// 「打一整段话时顺序不对」。这个命令把整段文本当成一次连续输入跑，产出可持久化
+/// 的数字，让改前/改后能对照。
+fn handle_typing_cmd(args: &[String]) -> ExitCode {
+    let mut dict_path: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut limit: usize = 40;
+    let mut json = false;
+    let mut mode: Option<Option<kime_core::Scheme>> = Some(None); // 默认全拼
+    let mut inputs: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dict" => dict_path = it.next().map(PathBuf::from),
+            "--out" => out = it.next().map(PathBuf::from),
+            "--limit" => limit = it.next().and_then(|s| s.parse().ok()).unwrap_or(40),
+            "--json" => json = true,
+            "--mode" => {
+                mode = it.next().and_then(|m| match m.as_str() {
+                    "full" => Some(None),
+                    "ziranma" => Some(Some(kime_core::Scheme::Ziranma)),
+                    "xiaohe" => Some(Some(kime_core::Scheme::Xiaohe)),
+                    _ => None,
+                });
+                if mode.is_none() {
+                    eprintln!("--mode 只支持 full | ziranma | xiaohe");
+                    return ExitCode::from(2);
+                }
+            }
+            other => inputs.push(other.to_string()),
+        }
+    }
+    if inputs.is_empty() {
+        eprintln!("no input file: kime typing <file> [--dict <库>] [--out <报告.md>]");
+        return ExitCode::from(2);
+    }
+    let path = dict_path.unwrap_or_else(default_dict_path);
+    let mut failures = 0usize;
+    for file in &inputs {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to read {file}: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        // 每个文件重开一次词库：Dict 不是 Clone（持有 SQLite 连接），
+        // 而 typing::run 会消费它来建引擎。少量文件 = 少量开库，可接受。
+        let dict = match Dict::open(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("failed to open dict {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
+        };
+        // 语料里的键是**拼音字母**，因此默认按全拼回放；用户配置里的双拼
+        // 不继承——否则同一份语料在双拼用户机器上会被解码成别的音节
+        // （实测 "jin" 被解成 ji+n，候选全是 技能/继续 之类）。
+        let mut config = Config::load();
+        config.shuangpin = mode.expect("mode 有默认值");
+        let report = kime_core::typing::run(dict, config, &text);
+        if json {
+            let rows: Vec<String> = report
+                .cases
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"text\":{},\"lang\":{:?},\"keys\":{},\"rank\":{},\"cands\":{}}}",
+                        json_str(&c.text),
+                        c.lang,
+                        json_str(&c.keys),
+                        c.rank
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "null".into()),
+                        c.cands
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"file\":{},\"summary\":{},\"cases\":[{}]}}",
+                json_str(file),
+                json_str(&report.summary()),
+                rows.join(",")
+            );
+        } else {
+            let md = kime_core::typing::render_markdown(file, &report, limit);
+            print!("{md}");
+            if let Some(p) = &out {
+                match std::fs::write(p, &md) {
+                    Ok(()) => println!("报告已写入 {}", p.display()),
+                    Err(e) => {
+                        eprintln!("failed to write {}: {e}", p.display());
+                        failures += 1;
+                    }
+                }
+            }
+        }
+    }
+    if failures > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
