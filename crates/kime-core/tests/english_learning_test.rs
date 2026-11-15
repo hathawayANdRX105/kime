@@ -417,7 +417,7 @@ fn committing_english_candidate_in_chinese_mode_learns_it() {
     for c in "if".chars() {
         e.key(letter(c));
     }
-    // 空格 = 选当前页首候选。英文精确词在中文层一之后、中文补全之前，
+    // 空格 = 选当前页首候选。英文候选统一排在全部中文候选之后；
     // 此 fixture 没有中文 "if" 读音的词，故页首即英文 "if" → 全覆盖上屏。
     e.key(boundary());
     // 若这条路径不学习，english_usage("if") 会是 None。

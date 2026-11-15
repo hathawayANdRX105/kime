@@ -1,8 +1,7 @@
-//! 英文精确词优先于中文补全（例如 `ok` 的 OK），但中文精确命中仍在最前。
+//! 中文候选统一置于英文候选之前（例如 `ok`：哦可、哦可哦可 在 OK、okay 之前），
 //!
-//! 契约：英文精确匹配插到中文层一之后、中文补全之前；英文前缀补全仍放在末尾，
-//! 两字母门槛不变。
-//! `ok` 与 `an` 回归覆盖精确和补全之间的层级顺序。
+//! 中文内部保持精确→补全，英文内部保持精确→补全；两字母门槛不变。
+//! `ok` 与 `an` 回归覆盖中文整块在前、英文块内层序。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,8 +10,8 @@ use kime_core::config::Config;
 use kime_core::dict::{Candidate, Dict};
 use kime_core::{Engine, Key, Outcome};
 
-/// 线上事故形态：打 `ok` 时中文只有层二补全（哦可 o'ke、哦可哦可 o'ke'o'ke，频率一个比一个高），
-/// 精确英文词 OK 频率再低也必须排它们前面。`an` 一则是中文层一非空：安/按 之后才是 an，再之后才是补全。
+/// `ok` 时中文只有层二补全（哦可 o'ke、哦可哦可 o'ke'o'ke）：中文整块在英文块之前。
+/// `an` 时中文层一非空（安/按/安排），英文候选落在中文整块之后。
 const CN: &str = "\
 ...
 哦	o	3000000
@@ -23,7 +22,7 @@ const CN: &str = "\
 安排	an pai	7000000
 ";
 
-/// OK 是精确词但频率最低——精确优先一旦退化成频率序，它立刻被 okay/哦可 顶掉。
+/// 英文块只含 exact（OK/an）与补全（okay），内部精确优先于补全，整块接在中文候选之后。
 const EN: &str = "\
 ...
 OK	OK	10
@@ -84,39 +83,38 @@ fn texts(cands: &[Candidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
 
-/// 中文层一空（`ok` 没有任何词读音恰为 o'k）：英文精确命中 OK 插到层一块之后、
-/// 中文补全块之前，即整体打头；英文块内精确 OK 仍先于补全 okay。
+/// 中文层一为空（`ok` 无读音恰为 o'k 的词）：中文补全块（哦可、哦可哦可）在英文块之前；
+/// 英文块内精确 OK 仍先于补全 okay。
 #[test]
-fn english_exact_leads_when_chinese_layer_one_empty() {
+fn chinese_leads_english_when_layer_one_empty() {
     let (mut e, dir) = engine("ok");
     type_letters(&mut e, "ok");
     let got = texts(e.candidates());
     let ok_pos = got.iter().position(|t| *t == "OK").unwrap();
     let oke_pos = got.iter().position(|t| *t == "哦可").unwrap();
+    let okeoke_pos = got.iter().position(|t| *t == "哦可哦可").unwrap();
     let okay_pos = got.iter().position(|t| *t == "okay").unwrap();
-    assert_eq!(
-        got.first().copied(),
-        Some("OK"),
-        "英文精确 OK 应打头，实际列表 {got:?}"
-    );
+    // 中文候选统一在英文候选之前；英文块内精确仍先于补全。
+    assert!(oke_pos < ok_pos, "中文补全 哦可 不得落后于英文 OK：{got:?}");
     assert!(
-        ok_pos < oke_pos,
-        "英文精确 OK 不得落后于中文补全 哦可：{got:?}"
+        okeoke_pos < ok_pos,
+        "中文补全 哦可哦可 不得落后于英文 OK：{got:?}"
     );
     assert!(ok_pos < okay_pos, "英文块内精确仍先于补全：{got:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 中文精确命中仍先于英文精确词，英文精确词再先于中文补全。
+/// 中文层一非空（安/按）：中文精确 → 中文补全（安排）→ 英文精确（an），
+/// 即中文整块在英文候选之前，英文块内只有一条 exact。
 #[test]
-fn chinese_exact_then_english_exact_then_chinese_completion() {
+fn chinese_exact_then_completion_then_english() {
     let (mut e, dir) = engine("an");
     type_letters(&mut e, "an");
     let got = texts(e.candidates());
     assert_eq!(
         got,
-        ["安", "按", "an", "安排"],
-        "中文精确 → 英文精确 → 中文补全：{got:?}"
+        ["安", "按", "安排", "an"],
+        "中文整块在英文候选之前：{got:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }

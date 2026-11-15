@@ -1333,9 +1333,10 @@ impl Engine {
     /// 所以双拼/全拼下行为一致。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声
     /// 灌进每一次按键。
     ///
-    /// 落位（用户裁定）：英文精确命中（key 等于原始输入，大小写不敏感）插到中文层一
-    /// 精确块之后、中文补全块之前；英文前缀补全仍整体挂列表末尾。块内“精确在前、
-    /// 补全在后”不变，单字母噪声闸不变；中文层一「精确命中优先于补全」的内部规则
+    /// 落位（用户裁定）：全部中文字典候选（层一精确 + 层二补全）恒在全部英文候选
+    /// 之前，防止英文词（如 `rug`）插队到中文完整词（如打 `ru` 时的「如果」）前面。
+    /// 英文内部仍保持「精确块 → 补全块」及 `(eff DESC, text ASC)` 的内部排序，并
+    /// 统一接在中文列表末尾；单字母噪声闸不变；中文候选的内部频率/层序规则
     /// 完全不受影响。
     fn merge_english(&mut self) {
         if self.letters.len() < 2 {
@@ -1348,20 +1349,12 @@ impl Engine {
             return;
         }
         // lookup_english 已按「精确块 → 补全块」返回；pinyin 存的是词本身，用
-        // 大小写不敏感比对拆成精确与补全两段。
+        // 大小写不敏感比对拆成精确与补全两段。英文内部层序不变，整块接到
+        // 中文候选之后（不再插到中文精确块与补全块之间）。
         let (exact, comps): (Vec<Candidate>, Vec<Candidate>) = en
             .into_iter()
             .partition(|c| c.pinyin.eq_ignore_ascii_case(&self.letters));
-        // 插入点 = 中文层一精确块末尾（精确词条 pinyin 恒等于查词键 last_joined），
-        // 即「中文精确之后、中文补全之前」；逐条 insert 保持精确段内部先后。
-        let l1_end = self
-            .candidates
-            .iter()
-            .take_while(|c| c.pinyin == self.last_joined)
-            .count();
-        for (i, c) in exact.into_iter().enumerate() {
-            self.candidates.insert(l1_end + i, c);
-        }
+        self.candidates.extend(exact);
         self.candidates.extend(comps);
     }
 

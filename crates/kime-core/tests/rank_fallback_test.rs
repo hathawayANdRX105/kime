@@ -1,5 +1,5 @@
-//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；英文精确词高于中文补全。
-//!
+//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；英文候选统一排在全部中文候选之后，
+//! 不再插队到中文精确块与补全块之间。
 //! fixture 刻意只放单词且第二音节无字——Viterbi 拼不出全覆盖句，正是缺陷 A 的
 //! 触发条件（修复前列表为空）。preedit 语义单列断言钉住：回退只补候选，不改显示。
 
@@ -98,9 +98,9 @@ fn single_syllable_input_needs_no_fallback() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 全拼中英文精确命中优先于不匹配拼音的中文补全。
+/// 全拼：英文精确词 day 排在全部中文候选（打印、大约）之后，不再插队到中文候选中间。
 #[test]
-fn full_pinyin_english_exact_precedes_chinese_completion() {
+fn full_pinyin_english_exact_after_chinese_candidates() {
     let (mut e, dir) = engine_at("en_full", None);
     type_letters(&mut e, "day");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -112,13 +112,13 @@ fn full_pinyin_english_exact_precedes_chinese_completion() {
         .iter()
         .position(|t| t == "打印")
         .expect("中文补全 打印 在场");
-    assert!(en_pos < chinese_pos, "英文精确词应先于中文补全：{texts:?}");
+    assert!(chinese_pos < en_pos, "中文补全应先于英文精确词：{texts:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 双拼模式同样按原始按键串匹配英文精确词，且优先于中文补全。
+/// 双拼模式同样按原始按键串匹配英文精确词，英文精确词排在全部中文候选之后。
 #[test]
-fn shuangpin_english_exact_precedes_chinese_completion() {
+fn shuangpin_english_exact_after_chinese_candidates() {
     let (mut e, dir) = engine_at("en_sp", Some(kime_shuangpin::Scheme::Ziranma));
     type_letters(&mut e, "day");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -131,8 +131,8 @@ fn shuangpin_english_exact_precedes_chinese_completion() {
         .position(|t| t == "打印" || t == "大约")
         .expect("中文补全在场");
     assert!(
-        en_pos < chinese_pos,
-        "双拼英文精确词应先于中文补全：{texts:?}"
+        chinese_pos < en_pos,
+        "双拼中文补全应先于英文精确词：{texts:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }
