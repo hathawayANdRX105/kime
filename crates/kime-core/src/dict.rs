@@ -541,13 +541,20 @@ impl Dict {
         // 为什么必须分开取最大值：中文词条频率 10⁵~10⁷、英文词频 10³ 量级，
         // 直接比原始数值等于「中文恒赢」，退化成按语言分块。对数归一化后两边
         // 都是「在本语言内部的相对位置」，才谈得上按分数竞争。
-        let zh_max = index
-            .iter()
-            .map(|e| e.eff)
-            .chain(user_overlay.iter().map(|e| e.eff))
-            .max()
-            .unwrap_or(0);
-        let en_max = english.iter().map(|e| e.eff).max().unwrap_or(0);
+        // 基准 = 库内语料最大频 与 内存条目最大有效频率 取大者。
+        // 语料最大值必须查库：FST 模式下 index 是空的，只看内存会把基准算成
+        // 「用户词里最大的那条」，中文分数整体贴近上限、英文被系统性压住。
+        let zh_max = Self::query_max_freq(&conn, "phrase")
+            .max(
+                index
+                    .iter()
+                    .map(|e| e.eff)
+                    .chain(user_overlay.iter().map(|e| e.eff))
+                    .max()
+                    .unwrap_or(0),
+            );
+        let en_max = Self::query_max_freq(&conn, "english")
+            .max(english.iter().map(|e| e.eff).max().unwrap_or(0));
         Ok(Self {
             zh_max,
             en_max,
@@ -847,6 +854,19 @@ impl Dict {
         &self.index
     }
 
+    /// 某表的最大频率（跨语言分数归一化的基准之一）。
+    ///
+    /// 为什么必须查库而不是只看内存索引：FST 模式下内存里只有用户词 overlay
+    /// （个位到几十条），拿它当基准会让中文分数整体贴近上限、英文被系统性压住——
+    /// 而 FST 是生产路径（dict.bin 与词库同库存在）。
+    /// 无 freq 索引，2M 行约 0.4s；只在开库/导入时各一次，不在键路径。
+    fn query_max_freq(conn: &Connection, table: &str) -> u64 {
+        let sql = format!("SELECT COALESCE(MAX(freq), 0) FROM {table}");
+        conn.query_row(&sql, [], |r| r.get::<_, i64>(0))
+            .map(|m| m.max(0) as u64)
+            .unwrap_or(0)
+    }
+
     fn query_total_freq(conn: &Connection) -> u64 {
         // rusqlite 不为 u64 实现 FromSql，SUM 只能按 i64 取
         conn.query_row("SELECT COALESCE(SUM(freq), 0) FROM phrase", [], |r| {
@@ -945,6 +965,8 @@ impl Dict {
         self.total_freq = Self::query_total_freq(&self.conn);
         // 跨语言分数基准跟着抬高：导入的词可能比原有最大频还高，
         // 不更新的话新词的校准分会算错（导入在 open 之后发生，开库时算的基准已过期）。
+        // FST 模式下 index 是空的，所以同时查一次库内最大值。
+        self.bump_zh_max(Self::query_max_freq(&self.conn, "phrase"));
         if let Some(max) = self.index.iter().map(|e| e.eff).max() {
             self.bump_zh_max(max);
         }
@@ -996,6 +1018,7 @@ impl Dict {
         }
         tx.commit()?;
         self.english = Self::load_english(&self.conn, &self.user_stats, self.today)?;
+        self.bump_en_max(Self::query_max_freq(&self.conn, "english"));
         if let Some(max) = self.english.iter().map(|e| e.eff).max() {
             self.bump_en_max(max);
         }
