@@ -12,13 +12,9 @@ use platform_x11::Renderer;
 const BG: [u8; 4] = [38, 30, 30, 255];
 
 fn cand(text: &str) -> Candidate {
-    Candidate {
-        text: text.to_string(),
-        pinyin: String::new(),
-        freq: 0,
-        eff: 0,
-        ai: false,
-    }
+    // 渲染测试只关心文本与布局：候选的语言/层/来源用模型层构造函数给默认值，
+    // 避免手写字面量时漏掉新增字段。
+    Candidate::zh(text, "", 0, 0)
 }
 
 fn cands(n: usize) -> Vec<Candidate> {
