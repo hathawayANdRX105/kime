@@ -1023,7 +1023,9 @@ fn handle_typing_cmd(args: &[String]) -> ExitCode {
     let mut out: Option<PathBuf> = None;
     let mut limit: usize = 40;
     let mut json = false;
-    let mut mode: Option<Option<kime_core::Scheme>> = Some(None); // 默认全拼
+    // `None` = 全拼（语料里的键是拼音字母）；`Some(scheme)` = 双拼。
+    // 用单层 Option，避免「解析失败」与「合法的全拼」挤在同一个类型里。
+    let mut mode: Option<kime_core::Scheme> = None;
     let mut inputs: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1032,18 +1034,15 @@ fn handle_typing_cmd(args: &[String]) -> ExitCode {
             "--out" => out = it.next().map(PathBuf::from),
             "--limit" => limit = it.next().and_then(|s| s.parse().ok()).unwrap_or(40),
             "--json" => json = true,
-            "--mode" => {
-                mode = it.next().and_then(|m| match m.as_str() {
-                    "full" => Some(None),
-                    "ziranma" => Some(Some(kime_core::Scheme::Ziranma)),
-                    "xiaohe" => Some(Some(kime_core::Scheme::Xiaohe)),
-                    _ => None,
-                });
-                if mode.is_none() {
-                    eprintln!("--mode 只支持 full | ziranma | xiaohe");
+            "--mode" => match it.next().map(|m| m.to_ascii_lowercase()).as_deref() {
+                Some("full") | None => mode = None,
+                Some("ziranma") => mode = Some(kime_core::Scheme::Ziranma),
+                Some("xiaohe") => mode = Some(kime_core::Scheme::Xiaohe),
+                Some(other) => {
+                    eprintln!("--mode 只支持 full | ziranma | xiaohe（收到 {other:?}）");
                     return ExitCode::from(2);
                 }
-            }
+            },
             other => inputs.push(other.to_string()),
         }
     }
@@ -1075,7 +1074,7 @@ fn handle_typing_cmd(args: &[String]) -> ExitCode {
         // 不继承——否则同一份语料在双拼用户机器上会被解码成别的音节
         // （实测 "jin" 被解成 ji+n，候选全是 技能/继续 之类）。
         let mut config = Config::load();
-        config.shuangpin = mode.expect("mode 有默认值");
+        config.shuangpin = mode;
         let report = kime_core::typing::run(dict, config, &text);
         if json {
             let rows: Vec<String> = report
