@@ -67,6 +67,9 @@ fn identity_punct_commits_top_candidate() {
     type_letters(&mut e, "ni");
     assert_eq!(press(&mut e, '@'), Outcome::Commit("你@".into()));
     assert!(e.preedit().is_empty(), "顶字后组合必须清空");
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -77,6 +80,9 @@ fn identity_punct_commits_raw_letters_without_candidates() {
     type_letters(&mut e, "xq");
     assert!(e.candidates().is_empty(), "种子词库下 xq 应无候选");
     assert_eq!(press(&mut e, '#'), Outcome::Commit("xq#".into()));
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -86,6 +92,9 @@ fn identity_punct_without_composition_commits_self() {
     let (mut e, dir) = engine();
     assert_eq!(press(&mut e, '@'), Outcome::Commit("@".into()));
     assert_eq!(press(&mut e, '/'), Outcome::Commit("/".into()));
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -116,6 +125,9 @@ fn ctrl_alt_symbol_chords_pass_through() {
     chord.ctrl = true;
     chord.ch = Some(',');
     assert_eq!(e.key(chord), Outcome::Ignored, "Ctrl+, 不再被吞为 ，");
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -131,6 +143,9 @@ fn dot_after_digit_stays_halfwidth() {
         "数字后的 . 必须直通半角（旧行为：Commit(\"。\")）"
     );
     assert_eq!(press(&mut e, '8'), Outcome::Ignored);
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -149,6 +164,9 @@ fn comma_and_colon_after_digit() {
     assert_eq!(press(&mut e, ':'), Outcome::Commit("：".into()));
     assert_eq!(press(&mut e, '9'), Outcome::Ignored);
     assert_eq!(press(&mut e, ':'), Outcome::Ignored, "数字后 : 半角直通");
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -159,6 +177,9 @@ fn punct_mapping_outside_digit_context_unchanged() {
     assert_eq!(press(&mut e, '.'), Outcome::Commit("。".into()));
     type_letters(&mut e, "ni");
     assert_eq!(press(&mut e, '.'), Outcome::Commit("你。".into()));
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -180,5 +201,8 @@ fn digit_separator_cleared_after_selection_commit() {
         Outcome::Commit("。".into()),
         "组合空后标点全角（不被 digit_sep 放行半角）"
     );
+    // 先释放引擎：Dict 持有后台写线程，删目录时它可能重建 -wal/-shm，
+    // 导致 remove_dir_all 报 DirectoryNotEmpty（异步学习的已知竞态）。
+    drop(e);
     fs::remove_dir_all(dir).unwrap();
 }
