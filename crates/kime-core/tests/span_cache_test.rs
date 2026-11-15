@@ -175,13 +175,7 @@ fn cache_evicts_at_capacity() {
     assert!(cache.len() <= MAX_SPAN_CACHE_ENTRIES, "缓存不得无界增长");
     // 超限后旧的被清掉：k0 不再命中（重新 compute 也能工作）
     let v = cache.get_or_compute("k0".to_string(), || {
-        vec![kime_core::dict::Candidate {
-            text: "rebuilt".to_string(),
-            pinyin: String::new(),
-            freq: 1,
-            eff: 1,
-            ai: false,
-        }]
+        vec![kime_core::dict::Candidate::zh("rebuilt", "", 1, 1)]
     });
     assert_eq!(v[0].text, "rebuilt");
 }

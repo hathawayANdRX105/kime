@@ -996,13 +996,7 @@ fn llm_merge_adds_candidates() {
     }
     let original_len = e.candidates().len();
 
-    let ai = vec![Candidate {
-        text: "你好世界".to_string(),
-        pinyin: "ni'hao".to_string(),
-        freq: 1,
-        eff: 1,
-        ai: true,
-    }];
+    let ai = vec![Candidate::zh("你好世界", "ni'hao", 1, 1).with_source(kime_core::SourceKind::Ai)];
     e.merge_ai(ai);
 
     assert_eq!(e.candidates().len(), original_len + 1);
@@ -1020,13 +1014,7 @@ fn llm_dedupe_existing() {
     let original_len = e.candidates().len();
 
     // Merge a candidate that already exists
-    let ai = vec![Candidate {
-        text: "你好".to_string(),
-        pinyin: "ni'hao".to_string(),
-        freq: 1,
-        eff: 1,
-        ai: true,
-    }];
+    let ai = vec![Candidate::zh("你好", "ni'hao", 1, 1).with_source(kime_core::SourceKind::Ai)];
     e.merge_ai(ai);
 
     // Should not add duplicate

@@ -30,42 +30,23 @@ use crate::learn_writer::{LearnJob, LearnWriter};
 fn io_to_sqlite(e: std::io::Error) -> SqliteError {
     SqliteError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
-/// 用户词提频（第五轮调频方案 B：使用即提升 + 时间衰减，rime user_freq 同款语义）。
+/// 用户词提频：算式、常量与键类型都归 [`crate::learn`]（中英文共用一套语义）。
 ///
-/// 语料计数是 10⁵~10⁷ 量级（常见词「我们」freq=509,405），旧版 learn 一次 +1
-/// 对排序毫无作用。第 n 次使用给该词叠加 `n × USER_BOOST × 0.5^(age/半衰期)`
-/// 的**排序用**有效频率。首用即满额是用户拍板（2026-09-15）：rime 手感——
-/// 选过的词立刻要有存在感；`tests/dict.rs` 钉「等量加成相抵、排序仍由裸频定」。
-///
-/// 校准：BOOST=300_000 ⇒ 第 1 次使用（300k）压过 10⁵ 级长尾词、压不过 50 万级
-/// 语料词；第 2 次（600k）压过 freq=500,000 的普通语料词。
-const USER_BOOST: u64 = 300_000;
-/// 提频半衰期（天）：连续 30 天不再使用，加成减半；60 天降到 1/4，回落语料位。
-const USER_BOOST_HALF_LIFE_DAYS: f64 = 30.0;
+/// 这里只留一个薄封装，让既有调用点保持 `(stats, today, pinyin, text)` 形状；
+/// 加成永不写回 `freq`，只落排序用 `eff`。
+fn user_bonus_of(stats: &crate::learn::UserStats, today: u64, pinyin: &str, text: &str) -> u64 {
+    stats.bonus_of(today, pinyin, text)
+}
 
 /// 「今天」= UNIX 纪元以来的天数。衰减窗口按天推进即可（半衰期本身 30 天粒度）。
+///
+/// 放在持久层是因为开库烘焙与学习当帧生效都按它算衰减；`learn_writer` 的后台写
+/// 线程也用它给落盘计数盖日期。
 pub(crate) fn today_days() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0)
-}
-
-/// 某词的提频加成。`stats[(pinyin, text)] = (使用次数 n, 最近使用日)`；
-/// 无记录 → 0；n=1 即满额（首用即加成，用户拍板 2026-09-15）。纯函数（除查表），
-/// learn/开库共用同一条算式，无第二份语义。
-fn user_bonus_of(
-    stats: &HashMap<(String, String), (u64, u64)>,
-    today: u64,
-    pinyin: &str,
-    text: &str,
-) -> u64 {
-    let Some(&(n, last)) = stats.get(&(pinyin.to_string(), text.to_string())) else {
-        return 0;
-    };
-    let age = today.saturating_sub(last) as f64;
-    let factor = 0.5f64.powf(age / USER_BOOST_HALF_LIFE_DAYS);
-    (n as f64 * USER_BOOST as f64 * factor) as u64
 }
 
 /// 烘焙进条目的有效频率：user 行 = 裸频 + 提频加成（每行一次 powf，开库/learn 时算），
@@ -83,19 +64,11 @@ fn entry_cmp(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
         .then_with(|| b.eff.cmp(&a.eff))
         .then_with(|| a.text.cmp(&b.text))
 }
-/// 候选词 — 全链路统一货币：dict 查询产出、engine 排序翻页、AI 层追加
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Candidate {
-    pub text: String,
-    /// 音节 `'` 连接（"ni'hao"）— learn 回写 / 上下文线索用
-    pub pinyin: String,
-    pub freq: u64,
-    /// 排序用有效频率（语料裸频 + 用户提频加成，开库/learn 时烘焙）。
-    /// `freq` 恒为库内原始值（导出契约），加成只落在这里。
-    pub eff: u64,
-    /// true = 来自 AI 预测（UI 标注用）
-    pub ai: bool,
-}
+/// 候选词 —— 全链路统一货币（定义见 [`crate::model::Candidate`]）。
+///
+/// 再导出而非重复定义：`kime_core::dict::Candidate` 是历史公开路径，平台壳与测试
+/// 都按这个路径引用。模型本身（语言/层/来源三个字段）属于候选模型层，不属于持久层。
+pub use crate::model::{Candidate, Lang, Layer, SourceKind};
 
 /// 内存排序索引条目，按 (pinyin ASC, freq DESC, text ASC) 排序；
 /// `eff` = 排序用有效频率（开库/learn 烘焙，比较器纯字段比较，热路径零哈希零 powf）
@@ -149,19 +122,20 @@ pub struct Dict {
     /// 英文词全量常驻内存：rime-ice 两表去重后 21,708 条、约 2 MB。开库时一次性读出来
     /// （见 `load_english`，实测多花 28ms），之后每次按键只做二分，绝不再碰 SQLite。
     english: Vec<EnglishEntry>,
-    /// 用户使用计数：(pinyin, text) → (累计使用次数 n, 最近使用日)。
-    /// 语料计数与用户计数分开的「独立空间」：phrase.freq 不动，排序加成
-    /// 由 (n, 日期) 现算（见 `user_bonus_of`）。持久化在无 schema 迁移的
-    /// `kime_kv(key, value)` 表——选它而不是把计数压进 freq 高位：后者会污染
-    /// 所有读 freq 的路径（builder、overlay 权威读回、memory_vs_sql 一致性），
-    /// 前者只有这一张几十行的旁表，learn 一次 UPSERT，开库一次全量 SELECT。
+    /// 用户学习统计（中英文共用一套计数与加成算式，见 [`crate::learn`]）。
     ///
-    /// 中文键 = `(拼音, 汉字)`；**英文键 = `(词, 词)`**（两段同一个 ASCII 词，
-    /// 与 `english_to_candidate` 的 `pinyin`/`text` 同源，故加成查询侧天然对齐）。
-    /// 两种键空间不重叠：汉字永不等于 ASCII 拼音。
-    user_stats: HashMap<(String, String), (u64, u64)>,
-    /// 有提频记录的拼音集合（user_stats 键的拼音投影）。查询时 O(1) 判断
-    /// 「该拼音块是否可能含提频行」——只有打学到过的拼音才触发块内 eff 重排。
+    /// 语料计数与用户计数分开的「独立空间」：phrase.freq 不动，排序加成由
+    /// (n, 日期) 现算。持久化在无 schema 迁移的 `kime_kv(key, value)` 表——
+    /// 选它而不是把计数压进 freq 高位：后者会污染所有读 freq 的路径
+    /// （builder、overlay 权威读回、memory_vs_sql 一致性）。
+    ///
+    /// 键是带语言标签的 [`crate::learn::LearnKey`]：中文 = (读音, 文本)，
+    /// 英文 = (词, 词)。语言是键类型的一部分，不再靠「读音是否等于文本」这类
+    /// 内容判据区分——旧实现正是用那条判据把英文计数挡在中文重排之外。
+    user_stats: crate::learn::UserStats,
+    /// 有提频记录的中文读音集合（user_stats 中文键的读音投影）。查询时 O(1) 判断
+    /// 「该拼音块是否可能含提频行」——只有打学到过的拼音才触发块内 eff 重排；
+    /// 英文计数永不进这个集合（`LearnKey::En` 不参与投影）。
     user_pinyins: std::collections::HashSet<String>,
     /// `today_days()` 在开库/learn 时刷新的缓存值（比较器热路径不碰系统时钟）。
     today: u64,
@@ -182,22 +156,6 @@ pub struct Dict {
     db_path: PathBuf,
     /// 后台词库写线程句柄（懒 spawn；队满丢 job，键路径零 SQLite 写）。
     writer: LearnWriter,
-}
-
-/// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
-/// 同语义：末字符 +1，`'z'` 进 `'{'`——只对小写字母串求上界，`'` 结尾进 `'a'`。
-/// 旧版对 `'z'` 返回 None，SQLite 回退路径据此把整个补全区间塌缩成空集，与 store 路径
-/// 行为不一致；None 现在只可能出现在空串上，而空 joined 在查询入口就被挡掉。）
-fn increment_prefix(prefix: &str) -> Option<String> {
-    let mut chars: Vec<char> = prefix.chars().collect();
-    let last_idx = chars.len().checked_sub(1)?;
-    let c = chars[last_idx];
-    chars[last_idx] = if c == '\'' {
-        'a'
-    } else {
-        char::from_u32(c as u32 + 1).unwrap_or(c)
-    };
-    Some(chars.into_iter().collect())
 }
 
 /// 打开 rime `.dict.yaml`，交回 `...` 分隔线**之后**的正文行。中文/英文两条导入路径共用。
@@ -545,17 +503,17 @@ impl Dict {
                 .then_with(|| b.eff.cmp(&a.eff))
                 .then_with(|| a.text.cmp(&b.text))
         });
-        // 有提频记录的拼音集合：查询时判断「该块是否需要按 eff 重排」的 O(1) 依据
-        //（集合是个位到几百条，层一块内重排只在打学到过的拼音时发生）。
+        // 有提频记录的中文读音集合：查询时判断「该块是否需要按 eff 重排」的 O(1)
+        // 依据（集合是个位到几百条，层一块内重排只在打学到过的拼音时发生）。
         //
-        // 英文学习的计数键是 `(词, 词)`（两段都是 ASCII），中文学习的键是
-        // `(拼音, 汉字)`——汉字永不等于 ASCII 拼音，故按「两段相等」即可把英文
-        // 计数挡在外面：否则英文词（如 `ni`）会让中文拼音块误判为「有提频行」，
-        // 触发块内重排（中文候选顺序零改动的承诺就破了）。
+        // 语言过滤在这里是**类型自带**的：`UserStats` 的键是带语言标签的
+        // `LearnKey`，`zh_pinyins()` 只投影中文键。旧实现靠「两段相等 ⇒ 英文」
+        // 的内容判据过滤，一旦英文导入规则变化就会把英文计数当成中文提频，
+        // 触发不必要的块内重排。
         let user_pinyins: std::collections::HashSet<String> = user_stats
-            .keys()
-            .filter(|(pinyin, text)| pinyin != text)
-            .map(|(pinyin, _)| pinyin.clone())
+            .zh_pinyins()
+            .into_iter()
+            .map(str::to_string)
             .collect();
         // FST 模式下用户词 overlay 全量入内存：热路径靠它，不再每键查 SQLite。
         // 纯 SQLite 模式下 `index` 本身就含用户词，overlay 留空。
@@ -600,7 +558,7 @@ impl Dict {
     /// 不改词库频率；与中文 `IndexEntry.eff` 的做法一致。
     fn load_english(
         conn: &Connection,
-        user_stats: &HashMap<(String, String), (u64, u64)>,
+        user_stats: &crate::learn::UserStats,
         today: u64,
     ) -> Result<Vec<EnglishEntry>> {
         let mut stmt = conn
@@ -643,21 +601,23 @@ impl Dict {
             .iter()
             .take_while(|e| e.key == key)
             .count();
-        // 层一：精确块。整块先取全再按 eff 重排再截断——被提频抬上来的词若在
-        // 截断之外就被丢了（同 lookup_prefix 的层一处理）。
+        // 层一：精确块。整块先取全再按分数重排再截断——被提频抬上来的词若在
+        // 截断之外就被丢了（同 lookup_prefix 的层一处理）。层归属在这里定型，
+        // 不靠返回顺序推断。
+        let ranker = self.ranker();
         let mut out: Vec<Candidate> = self.english[start..start + exact_len]
             .iter()
-            .map(Self::english_to_candidate)
+            .map(|e| Self::english_to_candidate(e).with_layer(Layer::Exact))
             .collect();
-        out.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
+        ranker.sort_within_batch(&mut out);
         out.truncate(limit);
         let mut comps: Vec<Candidate> = self.english[start + exact_len..]
             .iter()
             .take_while(|e| e.key.starts_with(&key))
-            .map(Self::english_to_candidate)
+            .map(|e| Self::english_to_candidate(e).with_layer(Layer::Completion))
             .collect();
-        // ponytail: 整段重排（最坏 `a` 命中 ~4k 条，release 下几 µs）；哪天真嫌慢再换 top-k 堆。
-        comps.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
+        // 批内重排（最坏 `a` 命中 ~4k 条，release 下几 µs）；哪天真嫌慢再换 top-k 堆。
+        ranker.sort_within_batch(&mut comps);
         comps.truncate(limit - out.len());
         out.extend(comps);
         out
@@ -666,17 +626,13 @@ impl Dict {
     /// 英文词候选：`eff` = 裸频 + 用户提频加成（同一 [`user_bonus_of`] 算式，
     /// 开库/学习时烘焙进条目，热路径只比字段）。
     ///
-    /// 加成的键 = `(词, 词)`：与 `english_to_candidate` 的 `pinyin`/`text` 同为词本身，
+    /// 加成的键 = `(词, 词)`：与 `english_to_candidate` 的读音键/`text` 同为词本身，
     /// 于是学习侧写入的键与这里查询的键天然对齐（见 [`Dict::learn_english`]）。
+    ///
+    /// 层与语言在这里定型（`Lang::En` + 由调用方覆盖的层）：英文候选的层判断不再
+    /// 依赖「读音键 == 按键串」这条隐含约定，跨语言顺序由 `Lang` 在排序键高位表达。
     fn english_to_candidate(e: &EnglishEntry) -> Candidate {
-        Candidate {
-            text: e.text.clone(),
-            // pinyin 填词本身：主控的分层判断靠它区分「消耗完输入」与「补全」
-            pinyin: e.text.clone(),
-            freq: e.freq.max(0) as u64,
-            eff: e.eff,
-            ai: false,
-        }
+        Candidate::en(e.text.clone(), e.freq.max(0) as u64, e.eff)
     }
 
     /// 英文词学习：把用户实际用过的英文词记进 `user_stats`，供 [`Self::lookup_english`]
@@ -698,9 +654,11 @@ impl Dict {
             return false;
         };
         self.today = today_days();
-        let key = (spelling.clone(), spelling.clone());
-        let n = self.user_stats.get(&key).map(|(n, _)| n + 1).unwrap_or(1);
-        self.user_stats.insert(key, (n, self.today));
+        // 英文键由类型表达：`LearnKey::En`，永不与中文键混淆，也永不进 phrase 表。
+        let key = crate::learn::LearnKey::En {
+            word: spelling.clone(),
+        };
+        let n = self.user_stats.record(key, self.today);
         self.enqueue_english_learn(&spelling, n, self.today);
         self.rebake_english_eff(&spelling);
         true
@@ -739,8 +697,8 @@ impl Dict {
     pub fn english_usage(&self, word: &str) -> Option<u64> {
         let spelling = self.english_spelling(word)?;
         self.user_stats
-            .get(&(spelling.clone(), spelling))
-            .map(|(n, _)| *n)
+            .count_of(&crate::learn::LearnKey::En { word: spelling })
+            .map(|(n, _)| n)
     }
 
     /// 重烘该词的 `eff`（学习后当帧生效，与中文 `learn_mem` 同语义）。
@@ -787,12 +745,15 @@ impl Dict {
 
     /// 读出用户提频计数（`kime_kv` 全表，几十行）。value 格式 n,day；
     /// 解析不出的行跳过（该表只有 learn 写，出现坏行说明文件被外部改过）。
-    fn load_user_stats(conn: &Connection) -> Result<HashMap<(String, String), (u64, u64)>> {
+    ///
+    /// 磁盘格式不变（`pinyin \t text`）：语言标签由 [`crate::learn::LearnKey::from_storage`]
+    /// 在载入时重建，因此老数据可直接读回，无需迁移。
+    fn load_user_stats(conn: &Connection) -> Result<crate::learn::UserStats> {
         let mut stmt = conn.prepare("SELECT key, value FROM kime_kv")?;
         let rows = stmt.query_map(params![], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut out = HashMap::new();
+        let mut out = Vec::new();
         for (key, value) in rows.collect::<Result<Vec<_>, _>>()? {
             let Some((pinyin, text)) = key.split_once('\t') else {
                 continue;
@@ -804,24 +765,31 @@ impl Dict {
             ) else {
                 continue;
             };
-            out.insert((pinyin.to_string(), text.to_string()), (n, day));
+            out.push(((pinyin.to_string(), text.to_string()), (n, day)));
         }
-        Ok(out)
+        Ok(crate::learn::UserStats::from_storage(out))
     }
 
-    /// 候选的排序用有效频率。eff 在条目构造/learn 时烘焙（含用户提频加成），
-    /// `Candidate::freq` 本身恒为库内原始值——加成不改导出值。
+    /// 候选排序比较器：委托给排序内核（唯一实现）。
+    ///
+    /// 保留这个方法是因为 `lm_boost` 是词典的上下文加成来源，由它实现
+    /// [`crate::rank::CtxBoost`]；比较本身只在 [`crate::rank::Ranker`] 里发生，
+    /// 这里不再有第二份比较逻辑。
+    pub fn ranker(&self) -> crate::rank::Ranker<'_> {
+        crate::rank::Ranker::with_boost(self)
+    }
+
+    /// 候选的排序用有效频率（裸频 + 用户学习加成，开库/learn 时烘焙）。
+    /// 只读访问器：加成永远不写回 `freq`（导出契约）。
     pub fn effective_freq(&self, c: &Candidate) -> u64 {
         c.eff
     }
 
-    /// (有效频率 + LM 上下文加成 DESC, text ASC)——候选层的统一排序键。
-    /// eff 是烘焙好的字段（零哈希零 powf）；lm_boost 是两次内存 HashMap 查找，
-    /// 无上下文/空计数时 O(1) 短路为 0，排序退化为纯 eff。
+    /// (分数 + LM 上下文加成 DESC, text ASC) —— 候选层的统一排序键。
+    /// 比较实现见 [`crate::rank::Ranker::compare`]（唯一比较器）。
+    #[allow(dead_code)]
     fn cand_cmp(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-        let ka = a.eff as i64 + self.lm_boost(a);
-        let kb = b.eff as i64 + self.lm_boost(b);
-        kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
+        self.ranker().compare(a, b)
     }
 
     /// 语料总词频。见字段注释：为什么在开库时算。
@@ -984,6 +952,9 @@ impl Dict {
     }
 
     /// 用户词 overlay：精确 pinyin 命中。`user_overlay` 按 pinyin ASC，二分定位后线性取等值段。
+    ///
+    /// 层归属 = 精确层：用户词只在「读音与输入完全一致」时进精确层，学习提频不得让
+    /// 它借补全层插队（`user_word_cannot_jump_layers`）。
     fn overlay_exact(&self, joined: &str) -> Vec<Candidate> {
         let start = self
             .user_overlay
@@ -991,11 +962,12 @@ impl Dict {
         self.user_overlay[start..]
             .iter()
             .take_while(|e| e.pinyin == joined)
-            .map(Self::entry_to_candidate)
+            .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Exact))
             .collect()
     }
 
     /// 用户词 overlay：pinyin 前缀区间 `[lower, upper)`。`upper` 为 None 表示无上界（前缀以 z 结尾）。
+    /// 层由调用方按精确/补全分别覆盖（同一段前缀可能同时喂给两层）。
     fn overlay_prefix(&self, lower: &str, upper: Option<&str>) -> Vec<Candidate> {
         let start = self
             .user_overlay
@@ -1013,36 +985,47 @@ impl Dict {
     /// 用户词 overlay 的层二（补全）切分，与 store 的两层谓词完全一致：
     /// tail 为空 → 只收以 `joined + "'"` 开头的 key；tail 非空 → 开区间去掉精确 key。
     fn overlay_comps(&self, joined: &str, tail: &str) -> Vec<Candidate> {
-        if tail.is_empty() {
+        let mut v = if tail.is_empty() {
             let lower = format!("{joined}'");
-            let upper = increment_prefix(&lower);
+            let upper = crate::model::prefix_upper_bound(&lower);
             self.overlay_prefix(&lower, upper.as_deref())
         } else {
-            let upper = increment_prefix(joined);
+            let upper = crate::model::prefix_upper_bound(joined);
             let mut v = self.overlay_prefix(joined, upper.as_deref());
             v.retain(|c| c.pinyin != joined);
             v
+        };
+        for c in &mut v {
+            c.layer = Layer::Completion;
         }
+        v
     }
 
     /// 用户词 overlay：abbrev 前缀命中。overlay 按 pinyin 排序，abbrev 只能全扫——
-    /// 集合是个位到几十条，扫一遍比维护第二份排序便宜。
+    /// 集合是个位到几十条，扫一遍比维护第二份排序便宜。层 = 兜底（缩写只在主查询
+    /// 无结果时使用）。
     fn overlay_abbrev(&self, initials: &str) -> Vec<Candidate> {
         self.user_overlay
             .iter()
             .filter(|e| e.abbrev.starts_with(initials))
-            .map(Self::entry_to_candidate)
+            .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Fallback))
             .collect()
     }
 
+    /// 中文词典条目 → 候选。层由调用方按产生阶段覆盖（精确块 / 补全块 / 缩写兜底）。
     fn entry_to_candidate(e: &IndexEntry) -> Candidate {
-        Candidate {
-            text: e.text.clone(),
-            pinyin: e.pinyin.clone(),
-            freq: e.freq as u64,
-            eff: e.eff,
-            ai: false,
-        }
+        let source = if e.user == 1 {
+            SourceKind::User
+        } else {
+            SourceKind::Dict
+        };
+        Candidate::zh(
+            e.text.clone(),
+            e.pinyin.clone(),
+            e.freq.max(0) as u64,
+            e.eff,
+        )
+        .with_source(source)
     }
 
     /// 单层合并：用户词覆盖基底同文本（以用户词频为准），结果仅在本层内按
@@ -1091,15 +1074,9 @@ impl Dict {
             if entry.pinyin != joined {
                 break;
             }
-            candidates.push(Candidate {
-                text: entry.text.clone(),
-                pinyin: entry.pinyin.clone(),
-                freq: entry.freq as u64,
-                eff: entry.eff,
-                ai: false,
-            });
+            candidates.push(Self::entry_to_candidate(entry).with_layer(Layer::Exact));
         }
-        candidates.sort_by(|a, b| self.cand_cmp(a, b));
+        self.ranker().sort(&mut candidates);
         candidates.truncate(limit);
         Ok(candidates)
     }
@@ -1161,8 +1138,17 @@ impl Dict {
         let mut user_comps = self.overlay_comps(&joined, tail);
 
         if let Some(store) = &self.store {
-            let (mut base_exact, mut base_comps) =
-                store.lookup_prefix_layers(syllables, tail, limit);
+            let (base_exact, base_comps) = store.lookup_prefix_layers(syllables, tail, limit);
+            // 存储层只负责取词，层归属在这里定型：两条存储路径因此不可能给出
+            // 不同的层语义（历史 bug 正出在「谁定层」分散在两处）。
+            let mut base_exact: Vec<Candidate> = base_exact
+                .into_iter()
+                .map(|c| c.with_layer(Layer::Exact))
+                .collect();
+            let mut base_comps: Vec<Candidate> = base_comps
+                .into_iter()
+                .map(|c| c.with_layer(Layer::Completion))
+                .collect();
             // 用户词文本命中层一基底（哪怕学的时候用的是别的读音）：
             // 频率以用户词为准，层归属沿用原条目，并从层二候选里剔除，不许复制。
             let mut exact_dirty = false;
@@ -1175,12 +1161,14 @@ impl Dict {
                 None => true,
             });
             if exact_dirty {
-                base_exact.sort_by(|a, b| self.cand_cmp(a, b));
+                self.ranker().sort(&mut base_exact);
             }
+            // 层一预算 = 总名额 − 补全保留名额；tail 为空（音节已收口）时层一独占。
+            let reserve = crate::rank::reserve_for_completion(limit);
             let l1_cap = if tail.is_empty() {
                 limit
             } else {
-                limit.div_ceil(2)
+                crate::rank::exact_budget(limit, reserve)
             };
             let mut out = self.merge_overlay(base_exact, user_exact, l1_cap);
             let l1_texts: std::collections::HashSet<&str> =
@@ -1206,33 +1194,34 @@ impl Dict {
         let cap = if tail.is_empty() {
             limit
         } else {
-            limit.div_ceil(2)
+            crate::rank::exact_budget(limit, crate::rank::reserve_for_completion(limit))
         };
+        let ranker = self.ranker();
         let mut out: Vec<Candidate> = if self.user_pinyins.contains(joined.as_str()) {
             let mut block: Vec<Candidate> = self.index[start..start + exact_len]
                 .iter()
-                .map(Self::entry_to_candidate)
+                .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Exact))
                 .collect();
-            block.sort_by(|a, b| self.cand_cmp(a, b));
+            ranker.sort(&mut block);
             block.truncate(cap);
             block
         } else {
             self.index[start..]
                 .iter()
                 .take_while(|e| e.pinyin == joined)
-                .map(Self::entry_to_candidate)
+                .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Exact))
                 .take(cap)
                 .collect()
         };
         let (lo, hi) = if tail.is_empty() {
             let lower = format!("{joined}'");
-            let upper = increment_prefix(&lower).unwrap_or_else(|| lower.clone());
+            let upper = crate::model::prefix_upper_bound(&lower).unwrap_or_else(|| lower.clone());
             (
                 self.index.partition_point(|e| e.pinyin < lower),
                 self.index.partition_point(|e| e.pinyin < upper),
             )
         } else {
-            let upper = increment_prefix(&joined).unwrap_or_else(|| joined.clone());
+            let upper = crate::model::prefix_upper_bound(&joined).unwrap_or_else(|| joined.clone());
             (
                 start + exact_len,
                 self.index.partition_point(|e| e.pinyin < upper),
@@ -1253,14 +1242,14 @@ impl Dict {
             }
         }
         if l1_dirty {
-            out.sort_by(|a, b| self.cand_cmp(a, b));
+            ranker.sort(&mut out);
         }
         let mut comps: Vec<Candidate> = self.index[lo..hi]
             .iter()
-            .map(Self::entry_to_candidate)
+            .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Completion))
             .filter(|c| !out.iter().any(|o| o.text == c.text))
             .collect();
-        comps.sort_by(|a, b| self.cand_cmp(a, b));
+        ranker.sort(&mut comps);
         comps.truncate(limit - out.len());
         out.extend(comps);
         Ok(out)
@@ -1292,17 +1281,11 @@ impl Dict {
             let slice = &self.abbrev_index[lower..upper];
             let mut candidates: Vec<Candidate> = slice
                 .iter()
-                .map(|e| Candidate {
-                    text: e.text.clone(),
-                    pinyin: e.pinyin.clone(),
-                    freq: e.freq as u64,
-                    eff: e.eff,
-                    ai: false,
-                })
+                .map(|e| Self::entry_to_candidate(e).with_layer(Layer::Fallback))
                 .collect();
             // 与 FST 分支同语义：缩写查询也按有效频率（裸频 + 提频加成）排序，
             // 否则用户打缩写时「使用频率高的在前」不生效，两条路径行为分裂。
-            candidates.sort_by(|a, b| self.cand_cmp(a, b));
+            self.ranker().sort(&mut candidates);
             candidates.truncate(limit);
             Ok(candidates)
         }
@@ -1360,13 +1343,13 @@ impl Dict {
         // （n×300k，用户拍板 2026-09-15）——选过的词立刻要有存在感；
         // `tests/dict.rs` 钉「等量加成相抵、排序仍由裸频定」。
         self.today = today_days();
-        let stats_key = (joined.clone(), text.to_string());
-        let n = self
-            .user_stats
-            .get(&stats_key)
-            .map(|(n, _)| n + 1)
-            .unwrap_or(1);
-        self.user_stats.insert(stats_key.clone(), (n, self.today));
+        // 中文键由类型表达：`LearnKey::Zh`（读音 + 文本）。与英文键是同一个枚举的
+        // 两个变体，因此「英文计数不得触发中文重排」由类型保证，而非内容判据。
+        let stats_key = crate::learn::LearnKey::Zh {
+            pinyin: joined.clone(),
+            text: text.to_string(),
+        };
+        let _n = self.user_stats.record(stats_key, self.today);
 
         // FST 模式：dict.bin 只读，用户词的查询数据源是 user_overlay，必须当场同步，
         // 否则刚学的词要等到下次开库才查得到。
@@ -1436,7 +1419,7 @@ impl Dict {
         } else {
             let eff = 1u64 + user_bonus_of(&self.user_stats, self.today, &joined, text);
             let new_entry = IndexEntry {
-                pinyin: joined,
+                pinyin: joined.clone(),
                 text: text.to_string(),
                 freq: 1,
                 abbrev,
@@ -1452,12 +1435,14 @@ impl Dict {
         }
         // 使用即提升当场生效：层一候选直接按 index 的块序吐，本轮统计变了就得重排
         // joined 块（旧 +1 语义几乎不换序，加成让 n≥2 的选词立刻顶到块首）。
+        // joined 在本函数开头已算好，这里不再从键里取读音（键是带语言标签的枚举，
+        // 读音只在 `LearnKey::Zh` 变体里）。
         let lo = self
             .index
-            .partition_point(|e| e.pinyin.as_str() < stats_key.0.as_str());
+            .partition_point(|e| e.pinyin.as_str() < joined.as_str());
         let hi = self
             .index
-            .partition_point(|e| e.pinyin.as_str() <= stats_key.0.as_str());
+            .partition_point(|e| e.pinyin.as_str() <= joined.as_str());
         self.index[lo..hi].sort_by(entry_cmp);
         Ok(())
     }
@@ -1475,7 +1460,10 @@ impl Dict {
             return None;
         }
         let pinyin = reading.join("'");
-        let &(n, day) = self.user_stats.get(&(pinyin.clone(), text.to_string()))?;
+        let (n, day) = self.user_stats.count_of(&crate::learn::LearnKey::Zh {
+            pinyin: pinyin.clone(),
+            text: text.to_string(),
+        })?;
         Some((pinyin, abbrev_of(reading), n, day))
     }
 
@@ -1606,7 +1594,7 @@ impl Dict {
     }
 
     /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
-    /// 加成直接落排序比较，不碰 eff/导出频率。
+    /// 加成只落排序比较（[`crate::rank::CtxBoost`]），不碰 `eff`/导出频率。
     /// 热路径：两次 &str HashMap 查找，零分配。
     pub fn lm_boost(&self, c: &Candidate) -> i64 {
         if self.lm_counts.is_empty() || c.pinyin.is_empty() {
@@ -1617,5 +1605,17 @@ impl Dict {
             .and_then(|m| m.get(c.pinyin.as_str()))
             .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
             .unwrap_or(0)
+    }
+}
+
+/// 词典作为排序内核的上下文加成来源。
+///
+/// 加成在这里做一次无符号饱和转换：旧实现把 `eff: u64` 直接 `as i64` 再与
+/// `i64` 加成相加，超过 `i64::MAX` 时会截断成负数并反转高频段顺序。饱和到
+/// `u64` 后不存在回绕，比较键再由 [`crate::rank::Ranker`] 统一饱和。
+impl crate::rank::CtxBoost for Dict {
+    #[inline]
+    fn boost(&self, c: &Candidate) -> u64 {
+        self.lm_boost(c).max(0) as u64
     }
 }

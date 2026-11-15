@@ -361,13 +361,15 @@ impl FstStore {
                 Some(k) => String::from_utf8_lossy(k).into_owned(),
                 None => String::new(),
             };
-            out.push(Candidate {
-                text: String::from_utf8_lossy(text).into_owned(),
+            // 存储层只产出词条与裸频（eff = 裸频：用户加成由词典层在 overlay 合并时
+            // 烘焙）。语言固定为中文（dict.bin 只存中文词条），层由词典层按精确/补全
+            // 覆盖——存储层不再决定层语义。
+            out.push(Candidate::zh(
+                String::from_utf8_lossy(text).into_owned(),
                 pinyin,
                 freq,
-                eff: freq,
-                ai: false,
-            });
+                freq,
+            ));
         }
         out
     }
@@ -536,7 +538,7 @@ impl FstStore {
         limit: usize,
         exclude: Option<&[u8]>,
     ) -> Vec<Candidate> {
-        let upper = increment_prefix(prefix);
+        let upper = crate::model::prefix_upper_bound(prefix);
         let stream_builder = if let Some(up) = &upper {
             self.fst.range().ge(prefix).lt(up.as_str())
         } else {
@@ -663,20 +665,6 @@ fn finish(top: BinaryHeap<Worst>) -> Vec<Candidate> {
     candidates
 }
 
-/// 计算前缀的排他上界（末字符 +1）。'z' 进 '{'（紧随小写表之后），
-/// 保证宽区间查询有界——v2 对 'z' 返回 None（开区间到 EOF），全量归并下代价不可接受。
-fn increment_prefix(prefix: &str) -> Option<String> {
-    let mut chars: Vec<char> = prefix.chars().collect();
-    let last_idx = chars.len().checked_sub(1)?;
-    let c = chars[last_idx];
-    chars[last_idx] = if c == '\'' {
-        'a'
-    } else {
-        char::from_u32(c as u32 + 1).unwrap_or(c)
-    };
-    Some(chars.into_iter().collect())
-}
-
 /// 读块头候选计数（u32 LE）；越界返回 None。
 fn block_count(data: &[u8], start: usize) -> Option<usize> {
     let b = data.get(start..start + COUNT_LEN)?;
@@ -759,13 +747,7 @@ fn decode_block(data: &[u8], pinyin: &str, limit: usize) -> Vec<Candidate> {
                 .expect("freq is exactly 4 bytes: bounds checked above"),
         ) as u64;
         pos += FREQ_LEN;
-        out.push(Candidate {
-            text,
-            pinyin: pinyin.to_string(),
-            freq,
-            eff: freq,
-            ai: false,
-        });
+        out.push(Candidate::zh(text, pinyin.to_string(), freq, freq));
     }
     out
 }
