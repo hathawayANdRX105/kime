@@ -424,10 +424,18 @@ pub fn merge_append(
             (None, Some(_)) => false,
             (None, None) => break,
         };
+        // 用 if let 而不是 expect：本函数不返回 Result/Option，expect 无法用 `?`
+        // 传播，只会 panic（仓库 dylint 的 expect-in-non-result 就是拦这个）。
         if take_head {
-            out.push(head.next().expect("peeked head"));
+            match head.next() {
+                Some(c) => out.push(c),
+                None => break,
+            }
         } else {
-            out.push(append.next().expect("peeked append"));
+            match append.next() {
+                Some(c) => out.push(c),
+                None => break,
+            }
         }
     }
     out

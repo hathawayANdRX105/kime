@@ -91,8 +91,9 @@ impl TypingReport {
 /// 只认这两类：数字与标点当分隔符。混合文本因此被拆成若干段，每段单独回放。
 pub fn split_runs(text: &str) -> Vec<(Lang, String)> {
     let mut out: Vec<(Lang, String)> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_lang: Option<Lang> = None;
+    // 当前段：`(语言, 文本)`。用「有值/无值」代替 Option + expect——
+    // 仓库 dylint 的 expect-in-non-result 禁止在返回非 Result 的函数里 expect。
+    let mut cur: Option<(Lang, String)> = None;
     for ch in text.chars() {
         let lang = if is_cjk(ch) {
             Some(Lang::Zh)
@@ -101,31 +102,33 @@ pub fn split_runs(text: &str) -> Vec<(Lang, String)> {
         } else {
             None
         };
-        match (lang, cur_lang) {
-            (Some(l), Some(c)) if l == c => cur.push(ch),
-            (Some(l), _) => {
-                if !cur.is_empty() {
-                    out.push((
-                        cur_lang.expect("cur_lang set when cur non-empty"),
-                        std::mem::take(&mut cur),
-                    ));
+        match (lang, cur.as_ref().map(|(l, _)| *l)) {
+            (Some(l), Some(c)) if l == c => {
+                if let Some((_, buf)) = cur.as_mut() {
+                    buf.push(ch);
                 }
-                cur_lang = Some(l);
-                cur.push(ch);
+            }
+            (Some(l), _) => {
+                if let Some(prev) = cur.take() {
+                    if !prev.1.is_empty() {
+                        out.push(prev);
+                    }
+                }
+                cur = Some((l, ch.to_string()));
             }
             (None, _) => {
-                if !cur.is_empty() {
-                    out.push((
-                        cur_lang.expect("cur_lang set when cur non-empty"),
-                        std::mem::take(&mut cur),
-                    ));
+                if let Some(prev) = cur.take() {
+                    if !prev.1.is_empty() {
+                        out.push(prev);
+                    }
                 }
-                cur_lang = None;
             }
         }
     }
-    if !cur.is_empty() {
-        out.push((cur_lang.expect("cur_lang set when cur non-empty"), cur));
+    if let Some(last) = cur {
+        if !last.1.is_empty() {
+            out.push(last);
+        }
     }
     out
 }

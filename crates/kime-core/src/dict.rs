@@ -1119,13 +1119,15 @@ impl Dict {
             base.truncate(limit);
             return base;
         }
-        let mut merged: HashMap<String, Candidate> = HashMap::new();
-        for cand in base {
-            merged.entry(cand.text.clone()).or_insert(cand);
-        }
-        for cand in user {
-            merged.insert(cand.text.clone(), cand);
-        }
+        // 基底先入（先到先得），用户词后入（同文本以用户词为准）。
+        let mut merged: HashMap<String, Candidate> =
+            HashMap::with_capacity(base.len() + user.len());
+        base.into_iter().for_each(|c| {
+            merged.entry(c.text.clone()).or_insert(c);
+        });
+        user.into_iter().for_each(|c| {
+            merged.insert(c.text.clone(), c);
+        });
         let mut candidates: Vec<Candidate> = merged.into_values().collect();
         candidates.sort_by(|a, b| self.cand_cmp(a, b));
         candidates.truncate(limit);

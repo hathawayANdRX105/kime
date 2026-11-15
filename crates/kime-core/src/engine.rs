@@ -1179,44 +1179,7 @@ impl Engine {
                     // 与 pending 的声母前缀是**两种不同意图**（末键在码表里身兼声母位
                     // 与韵母位）：两类都查、都给候选，查完**按频率统一重排**——
                     // 各批内部有序、批间无序，不重排就变成「先查的意图恒在前」。
-                    if !half_key_syls.is_empty() {
-                        // 跨批去重集合由排序内核提供（`rank::Seen`）：韵母位各音节
-                        // 的候选共享同一份记录，先到先得。
-                        let mut seen = rank::Seen::of(&cands);
-                        let mut completions: Vec<Candidate> = Vec::new();
-                        // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p
-                        // 有 18 个），取太多会让第一个音节独占整页。
-                        //
-                        // **不按累计条数早退**：早退会让排在后面的音节永远查不到
-                        // （自然码 p 的 un 系里 lun 排第 8，累计到上限时正好错过，
-                        // 用户按 p 就看不到「论」）。音节数有界（≤26），全部查完
-                        // 的成本是几十次内存查询，可接受。
-                        let per_syllable = (self.config.candidate_limit / 8).max(2);
-                        for s in &half_key_syls {
-                            let mut r = syllables.clone();
-                            r.push((*s).to_string());
-                            if let Ok(vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
-                                rank::append_unique(&mut completions, vc, &mut seen);
-                            }
-                        }
-                        // 两种意图合批：统一标成**同一层**（补全层），批内只按分数重排。
-                        //
-                        // 为什么统一层号：这两批候选来自两次不同查询（「声母位 + 半截键」
-                        // 与「韵母位完整音节」），层号之间没有可比性；若各自保留原层，
-                        // 「韵母位查询的精确命中」会凭层号压过「声母位查询的补全命中」，
-                        // 而用户按 u（sh 声母键）要的恰恰是 sh 系。半截键本身就是
-                        // 「还没打完」的状态，两种解释都属于补全，因此同层是正确的语义，
-                        // 而不是为了让测试通过打的补丁。
-                        let ranker = self.dict.ranker();
-                        let mut merged = completions;
-                        merged.extend(cands);
-                        for c in &mut merged {
-                            c.layer = Layer::Completion;
-                        }
-                        ranker.sort_within_batch(&mut merged);
-                        merged.truncate(self.config.candidate_limit);
-                        cands = merged;
-                    }
+                    self.merge_half_key_intents(&mut cands, &syllables, &half_key_syls);
                     self.candidates = cands;
                     if self.candidates.is_empty() {
                         if let Ok(ab) = self
@@ -1645,6 +1608,51 @@ impl Engine {
             }
         }
         self.candidates = cands;
+    }
+
+    /// 双拼末键的**韵母位补全**：末键作韵母位能拼出的完整音节，逐个作为已完成的
+    /// 末音节补查，与「声母位 + 半截键」的查询结果合并。
+    ///
+    /// 两种意图统一标成 [`Layer::Completion`]：它们来自两次不同查询，层号之间没有
+    /// 可比性；若各自保留原层，「韵母位查询的精确命中」会凭层号压过「声母位查询的
+    /// 补全命中」，而用户按 u（sh 声母键）要的恰恰是 sh 系。半截键本身就是「还没
+    /// 打完」的状态，两种解释都属于补全，因此同层才是正确语义。
+    fn merge_half_key_intents(
+        &self,
+        cands: &mut Vec<Candidate>,
+        syllables: &[String],
+        half_key_syls: &[&str],
+    ) {
+        if half_key_syls.is_empty() {
+            return;
+        }
+        // 跨批去重集合由排序内核提供（`rank::Seen`）：韵母位各音节共享同一份记录，
+        // 先到先得。
+        let mut seen = rank::Seen::of(cands.iter());
+        let mut completions: Vec<Candidate> = Vec::new();
+        // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p 有 18 个），
+        // 取太多会让第一个音节独占整页。
+        //
+        // **不按累计条数早退**：早退会让排在后面的音节永远查不到（自然码 p 的 un 系里
+        // lun 排第 8，累计到上限时正好错过，用户按 p 就看不到「论」）。音节数有界
+        // （≤26），全部查完的成本是几十次内存查询，可接受。
+        let per_syllable = (self.config.candidate_limit / 8).max(2);
+        for s in half_key_syls {
+            let mut r = syllables.to_vec();
+            r.push((*s).to_string());
+            if let Ok(vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
+                rank::append_unique(&mut completions, vc, &mut seen);
+            }
+        }
+        let ranker = self.dict.ranker();
+        let mut merged = completions;
+        merged.append(cands);
+        for c in &mut merged {
+            c.layer = Layer::Completion;
+        }
+        ranker.sort_within_batch(&mut merged);
+        merged.truncate(self.config.candidate_limit);
+        *cands = merged;
     }
 
     /// 缺陷 A：整串无词条、补全/缩写/Viterbi 全都拼不出候选时的最后一道回退——
