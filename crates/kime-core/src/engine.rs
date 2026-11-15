@@ -1180,8 +1180,9 @@ impl Engine {
                     // 与韵母位）：两类都查、都给候选，查完**按频率统一重排**——
                     // 各批内部有序、批间无序，不重排就变成「先查的意图恒在前」。
                     if !half_key_syls.is_empty() {
-                        let mut seen: std::collections::HashSet<String> =
-                            cands.iter().map(|c| c.text.clone()).collect();
+                        // 跨批去重集合由排序内核提供（`rank::Seen`）：韵母位各音节
+                        // 的候选共享同一份记录，先到先得。
+                        let mut seen = rank::Seen::of(&cands);
                         let mut completions: Vec<Candidate> = Vec::new();
                         // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p
                         // 有 18 个），取太多会让第一个音节独占整页。
@@ -1194,9 +1195,8 @@ impl Engine {
                         for s in &half_key_syls {
                             let mut r = syllables.clone();
                             r.push((*s).to_string());
-                            if let Ok(mut vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
-                                vc.retain(|c| seen.insert(c.text.clone()));
-                                completions.extend(vc);
+                            if let Ok(vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
+                                rank::append_unique(&mut completions, vc, &mut seen);
                             }
                         }
                         // 补全候选 + 原前缀结果：**跨查询意图合批，只按分数重排**。
@@ -1386,18 +1386,18 @@ impl Engine {
         // 模糊音变体：对完整音节与尾部半截串做「首（声母）/尾（韵母）替换」，
         // 每处替换独立成一路查询，结果按文本去重合并。fuzzy_map 为空时整块跳过。
         if !self.fuzzy_map.is_empty() {
-            let mut seen: std::collections::HashSet<String> =
-                cands.iter().map(|c| c.text.clone()).collect();
+            // 跨批去重集合由排序内核提供（`rank::Seen`）：各模糊音变体共享同一份
+            // 记录，首切分的结果先占位，变体只能补新文本。
+            let mut seen = rank::Seen::of(&cands);
             let push_variant = |reading: &[String],
                                 tail: &str,
-                                seen: &mut std::collections::HashSet<String>,
+                                seen: &mut rank::Seen,
                                 cands: &mut Vec<Candidate>| {
-                if let Ok(mut vc) =
-                    self.dict
-                        .lookup_prefix(reading, tail, self.config.candidate_limit)
+                if let Ok(vc) = self
+                    .dict
+                    .lookup_prefix(reading, tail, self.config.candidate_limit)
                 {
-                    vc.retain(|c| seen.insert(c.text.clone()));
-                    cands.extend(vc);
+                    rank::append_unique(cands, vc, seen);
                 }
             };
             // 完整音节变体
@@ -1426,24 +1426,13 @@ impl Engine {
         // （≤12 字母实测 2–4 条，Fibonacci 级），每条同样带 candidate_limit 查询；
         // 结果按文本去重后**续在首切分之后**——首切分总序零变化（preedit/层一/英文
         // 层一的落位契约都不受影响），重复文本保留频率更高的出现。
-        let mut seen_at: std::collections::HashMap<String, usize> = cands
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.text.clone(), i))
-            .collect();
+        // 多切分合并走 `rank::merge_unique(HighestEff)`：位置以首切分为准，同文本
+        // 保留频率更高的出现（与旧实现等价，但去重口径只剩一处定义）。
         for extra in segs.iter().skip(1) {
             let mut r = extra.clone();
             let t = r.pop().unwrap_or_default();
             if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
-                for c in vc {
-                    match seen_at.get(&c.text).copied() {
-                        Some(i) => cands[i].freq = cands[i].freq.max(c.freq),
-                        None => {
-                            seen_at.insert(c.text.clone(), cands.len());
-                            cands.push(c);
-                        }
-                    }
-                }
+                cands = rank::merge_unique(&self.dict.ranker(), cands, vc, rank::Dedup::HighestEff);
             }
         }
         // 邻键纠错：直查（主路径/模糊/多切分）候选不足时，对按键串生成编辑距离 1
@@ -1458,8 +1447,9 @@ impl Engine {
             && self.letters.len() <= crate::correction::MAX_CORRECTION_INPUT
             && cands.len() < crate::correction::CORRECTION_TRIGGER_MIN
         {
-            let mut corrected_seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            // 纠错批次内先到先得 + 不与已有候选重复：同一个 `rank::Seen` 承担两件事
+            // （旧实现用 `corrected_seen` + `seen_at` 两个容器表达同一意图）。
+            let mut corrected_seen = rank::Seen::of(&cands);
             let baseline = segs.first().cloned().unwrap_or_default();
             let mut variants = crate::correction::corrected_keys(&self.letters);
             // 替换/转位在前、缺字母插入在后：插入是更大偏离，纠错候选
@@ -1481,12 +1471,7 @@ impl Engine {
                 let mut r = full;
                 let t = r.pop().unwrap_or_default();
                 if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
-                    for c in vc {
-                        if corrected_seen.insert(c.text.clone()) && !seen_at.contains_key(&c.text) {
-                            seen_at.insert(c.text.clone(), cands.len());
-                            cands.push(c);
-                        }
-                    }
+                    rank::append_unique(&mut cands, vc, &mut corrected_seen);
                 }
                 if cands.len() >= self.config.candidate_limit {
                     break;
@@ -1548,17 +1533,15 @@ impl Engine {
             // 前提：切分数有界（实测 ≤12 字母 2–4 条，Fibonacci 级），组句调用
             // 次数 = 合格切分数，同一 SpanCache 复用跨切分共有的跨度查词；故不为
             // 无限切分做额外防御。
-            let mut seen: std::collections::HashSet<String> =
-                cands.iter().map(|c| c.text.clone()).collect();
+            let mut seen = rank::Seen::of(&cands);
             for extra in rest {
-                let mut extra_sents = crate::lattice::viterbi_sentences_seeded(
+                let extra_sents = crate::lattice::viterbi_sentences_seeded(
                     &self.dict,
                     extra,
                     seed.clone(),
                     &mut self.span_cache,
                 );
-                extra_sents.retain(|s| seen.insert(s.text.clone()));
-                cands.extend(extra_sents);
+                rank::append_unique(&mut cands, extra_sents, &mut seen);
             }
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
@@ -1662,7 +1645,8 @@ impl Engine {
         let Ok(mut extra) = dict.lookup_prefix(&syllables[..1], "", limit) else {
             return;
         };
-        extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
+        // 追加池不得与主列表重复：去重口径由排序内核统一提供。
+        rank::retain_unseen(&mut extra, &mut rank::Seen::of(cands.iter()));
         if extra.is_empty() {
             return;
         }
@@ -1758,9 +1742,12 @@ impl Engine {
             .count();
         // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
         // 否则频率折算会把更优的切分反-sort 到后面。
+        // 句子去重与「已有候选不重复」用同一个 `rank::Seen`：句子是逐条插入的，
+        // 每条都要对当前列表去重。
+        let mut seen = rank::Seen::of(cands.iter());
         let mut cursor = l1_end;
         for mut sentence in sentences {
-            if cands.iter().any(|c| c.text == sentence.text) {
+            if !seen.insert(&sentence.text) {
                 continue;
             }
             // 层归属在这里定型，而不是靠插入位置隐式表达：覆盖完整输入 →
@@ -1790,18 +1777,12 @@ impl Engine {
     /// 「不参与排序」这件事显式化——若沿用精确层，任何一次重排都会把 AI 候选
     /// 提到前面。
     pub fn merge_ai(&mut self, ai: Vec<Candidate>) {
-        let mut seen = std::collections::HashSet::new();
-        // 先加入现有候选文本集合
-        for c in &self.candidates {
-            seen.insert(c.text.clone());
-        }
-        // 去重合并 AI 候选
-        for c in ai {
-            if seen.insert(c.text.clone()) {
-                self.candidates
-                    .push(c.with_layer(Layer::Append).with_source(SourceKind::Ai));
-            }
-        }
+        let mut seen = rank::Seen::of(&self.candidates);
+        let batch: Vec<Candidate> = ai
+            .into_iter()
+            .map(|c| c.with_layer(Layer::Append).with_source(SourceKind::Ai))
+            .collect();
+        rank::append_unique(&mut self.candidates, batch, &mut seen);
     }
 }
 /// 连续 CJK 汉字：与 `crate::lm::is_cjk_word_char` 同口径（基本区 + 扩展 A）。

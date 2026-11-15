@@ -50,7 +50,7 @@
 //! 排序（数十条），分配次数在这个量级上可测量。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{Candidate, Layer, RankKey, SourceKind};
 
@@ -206,6 +206,95 @@ pub fn dedup(ranker: &Ranker<'_>, cands: Vec<Candidate>, policy: Dedup) -> Vec<C
         }
     }
     out
+}
+
+/// 「已见文本」集合：跨多批候选共享的去重记录。
+///
+/// 存在的理由：engine 的多路查询（模糊音、邻键纠错、多切分、韵母位补全）各自产出
+/// 一批候选，需要一个**共享的**已见集合才能跨批去重。旧实现每处手写一个
+/// `HashSet<String>` + 一段 `retain`/`insert` 循环，保留规则与时机各不相同；现在
+/// 集合与「追加」动作绑在一起，策略只能显式选择。
+#[derive(Debug, Default)]
+pub struct Seen {
+    set: HashSet<String>,
+}
+
+impl Seen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 用已有候选预填（新批次不得重复它们）。
+    pub fn of<'a>(cands: impl IntoIterator<Item = &'a Candidate>) -> Self {
+        Self {
+            set: cands.into_iter().map(|c| c.text.clone()).collect(),
+        }
+    }
+
+    /// 记录一条文本；首次出现返回 `true`。
+    pub fn insert(&mut self, text: &str) -> bool {
+        self.set.insert(text.to_string())
+    }
+
+    pub fn contains(&self, text: &str) -> bool {
+        self.set.contains(text)
+    }
+}
+
+/// 追加一批候选，跨批按文本去重（保留先出现者）。
+///
+/// `seen` 由调用方持有，因此同一轮按键里的多批查询共享同一份记录——这是「先到
+/// 先得」语义（首切分优先于模糊音/纠错变体）唯一正确的表达方式。
+pub fn append_unique(cands: &mut Vec<Candidate>, batch: Vec<Candidate>, seen: &mut Seen) {
+    for c in batch {
+        if seen.insert(&c.text) {
+            cands.push(c);
+        }
+    }
+}
+
+/// 把一批候选并入已有列表：位置以已有列表为准，同文本按 `policy` 决定是否替换载荷。
+///
+/// 用途：多切分合并（同文本保留频率更高的出现，但位置留在首次出现处）、用户词
+/// overlay 合并。与 [`dedup`] 的区别是它**保留已有顺序**而不是重新收集。
+pub fn merge_unique(
+    ranker: &Ranker<'_>,
+    base: Vec<Candidate>,
+    extra: Vec<Candidate>,
+    policy: Dedup,
+) -> Vec<Candidate> {
+    let mut out = base;
+    let mut pos: HashMap<String, usize> = out
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.text.clone(), i))
+        .collect();
+    for c in extra {
+        match pos.get(c.text.as_str()).copied() {
+            None => {
+                pos.insert(c.text.clone(), out.len());
+                out.push(c);
+            }
+            Some(i) => {
+                let replace = match policy {
+                    Dedup::FirstWins => false,
+                    Dedup::HighestEff => c.eff > out[i].eff,
+                    Dedup::BestRank => ranker.compare(&c, &out[i]) == Ordering::Less,
+                };
+                if replace {
+                    out[i] = c;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 过滤掉 `seen` 中已存在的文本，并把保留下来的记进 `seen`。
+///
+/// 用途：候选池需要「与主列表不重复」时使用（首音节单字追加、句子落位）。
+pub fn retain_unseen(cands: &mut Vec<Candidate>, seen: &mut Seen) {
+    cands.retain(|c| seen.insert(&c.text));
 }
 
 /// 是否是首音节单字追加候选（唯一允许跨层归并的来源）。
