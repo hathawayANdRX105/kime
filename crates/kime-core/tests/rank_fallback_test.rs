@@ -1,5 +1,5 @@
-//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；英文候选统一排在全部中文候选之后，
-//! 不再插队到中文精确块与补全块之间。
+//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；跨语言候选按**分数**交错
+//! （不再有「中文整块在前」或「英文整块在前」的语言分块）。
 //! fixture 刻意只放单词且第二音节无字——Viterbi 拼不出全覆盖句，正是缺陷 A 的
 //! 触发条件（修复前列表为空）。preedit 语义单列断言钉住：回退只补候选，不改显示。
 
@@ -9,8 +9,12 @@ use kime_core::engine::{Engine, Key};
 use std::fs;
 use std::path::PathBuf;
 
-const CN: &str = "...\n你\tni\n泥\tni\n打印\tda yin\n大约\tda yue\n";
-const EN: &str = "...\nday\tday\t500\nhelp\thelp\t400\n";
+// 频率刻意拉开：你 = 中文表内最高频，打印/大约 居中，英文 day 是英文表内最高频、
+// dab 是长尾。跨语言只比校准分数，因此这四条能同时证明「英文能插到中文前面」
+// 与「中文也能压过英文长尾」。
+const CN: &str =
+    "...\n你\tni\t9000000\n泥\tni\t8000000\n打印\tda yin\t500000\n大约\tda yue\t400000\n";
+const EN: &str = "...\nday\tday\t500\ndab\tdab\t1\nhelp\thelp\t400\n";
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -98,41 +102,48 @@ fn single_syllable_input_needs_no_fallback() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 全拼：英文精确词 day 排在全部中文候选（打印、大约）之后，不再插队到中文候选中间。
+/// 跨语言按分数交错：英文 day（英文表内最高频）排在中文 打印 之前，
+/// 中文 打印 又排在英文长尾 dab 之前。
+///
+/// 这条断言同时否掉两种语言分块：若「中文整块在前」则 day 会在 打印 之后；
+/// 若「英文整块在前」则 dab 会在 打印 之前。
 #[test]
-fn full_pinyin_english_exact_after_chinese_candidates() {
-    let (mut e, dir) = engine_at("en_full", None);
-    type_letters(&mut e, "day");
+fn cross_language_candidates_order_by_score() {
+    let (mut e, dir) = engine_at("cross_full", None);
+    type_letters(&mut e, "da");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
-    let en_pos = texts
-        .iter()
-        .position(|t| t.eq_ignore_ascii_case("day"))
-        .expect("英文精确词 day 在场");
-    let chinese_pos = texts
-        .iter()
-        .position(|t| t == "打印")
-        .expect("中文补全 打印 在场");
-    assert!(chinese_pos < en_pos, "中文补全应先于英文精确词：{texts:?}");
+    let pos = |t: &str| {
+        texts
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(t))
+            .unwrap_or_else(|| panic!("候选里缺少 {t}：{texts:?}"))
+    };
+    let (day, da_yin, dab) = (pos("day"), pos("打印"), pos("dab"));
+    assert!(day < da_yin, "英文高分词应排在中文中频词之前：{texts:?}");
+    assert!(da_yin < dab, "中文中频词应排在英文长尾词之前：{texts:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 双拼模式同样按原始按键串匹配英文精确词，英文精确词排在全部中文候选之后。
+/// 双拼模式下同一结论：跨语言顺序只看分数，与解码方式无关。
 #[test]
-fn shuangpin_english_exact_after_chinese_candidates() {
-    let (mut e, dir) = engine_at("en_sp", Some(kime_shuangpin::Scheme::Ziranma));
-    type_letters(&mut e, "day");
+fn shuangpin_cross_language_candidates_order_by_score() {
+    let (mut e, dir) = engine_at("cross_sp", Some(kime_shuangpin::Scheme::Ziranma));
+    type_letters(&mut e, "da");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
-    let en_pos = texts
-        .iter()
-        .position(|t| t.eq_ignore_ascii_case("day"))
-        .expect("英文精确词 day 在场");
-    let chinese_pos = texts
-        .iter()
-        .position(|t| t == "打印" || t == "大约")
-        .expect("中文补全在场");
+    let pos = |t: &str| {
+        texts
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(t))
+            .unwrap_or_else(|| panic!("候选里缺少 {t}：{texts:?}"))
+    };
+    let (day, da_yin, dab) = (pos("day"), pos("打印"), pos("dab"));
     assert!(
-        chinese_pos < en_pos,
-        "双拼中文补全应先于英文精确词：{texts:?}"
+        day < da_yin,
+        "双拼下英文高分词仍应排在中文中频词之前：{texts:?}"
+    );
+    assert!(
+        da_yin < dab,
+        "双拼下中文中频词仍应排在英文长尾词之前：{texts:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }

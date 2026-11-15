@@ -11,10 +11,13 @@
 //!
 //! ## 2. 层完整性由排序键保证，而不是由调用顺序保证
 //!
-//! 排序键高位是 `(lang, layer)`，分数在第三位。因此「精确层整体在补全层之前」是
-//! 一个**结构性事实**：任何有效频率、任何 LM 加成都无法把补全候选提到精确候选
-//! 之前。这条契约历史上靠「先查精确块、再 append 补全块」的约定维持，任何一次
-//! `sort`/`insert` 都可能打破；现在打破它需要显式改 [`Layer`] 序号。
+//! 同语言时排序键是 `(layer, score DESC, text ASC, source)`：层在分数之前，所以
+//! 「精确层整体在补全层之前」是**结构性事实**，任何频率、任何 LM 加成都无法把
+//! 补全候选提到精确候选之前。这条契约历史上靠「先查精确块、再 append 补全块」的
+//! 约定维持，任何一次 `sort`/`insert` 都可能打破；现在打破它需要显式改 [`Layer`] 序号。
+//!
+//! 跨语言时排序键退化成 `(score DESC, text ASC, source)`——只比分。层是「单次查询
+//! 内部」的概念，跨语言比层等于把语言分块换个位置重演一遍。
 //!
 //! ## 3. 上下文加成是**比较时**的量，不污染导出值
 //!
@@ -52,7 +55,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Candidate, Layer, RankKey, SourceKind};
+use crate::model::{Candidate, Lang, Layer, RankKey, SourceKind};
 
 /// 排序时叠加的上下文加成（LM bigram 先验）。
 ///
@@ -74,51 +77,137 @@ impl CtxBoost for NoBoost {
     }
 }
 
-/// 排序器：唯一比较入口。持有可选的上下文加成来源。
+/// 跨语言分数校准：把各语言的原始频率映射到同一把尺上。
 ///
-/// 构造开销为零（只存一个引用），可在热路径上按需创建。
-pub struct Ranker<'ctx> {
-    boost: Option<&'ctx dyn CtxBoost>,
+/// # 为什么必须校准
+///
+/// 中文词条频率来自音节统计（常见词 10⁵~10⁷），英文词频来自英文词表（常见词 10³ 量级）。
+/// 直接比原始数值，中文永远压英文——那就退化成「中文整块在前」，只是换了个说法。
+/// 校准后两边都是「在本语言内部的相对位置」，才谈得上「谁分高谁在前」。
+///
+/// # 用对数压缩
+///
+/// 频率分布是长尾的：线性归一化会让 99% 的词挤在 0 附近（最大值 10⁷ 时，
+/// freq=10⁴ 只有 0.001）。对数压缩后 freq=10⁴ 与 10⁷ 的差距是 4/7 ≈ 0.57，
+/// 与「数量级」的直觉一致。
+///
+/// # 边界
+///
+/// - `max` 为 0 或 1 时退化为线性（`eff` 直接当分数），避免除零与「全 0 分」。
+/// - 分数上限 [`SCORE_MAX`]，留出与上下文加成相加的余量。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoreScale {
+    zh_max: u64,
+    en_max: u64,
 }
 
-/// 比较键的上限：有效频率 + 上下文加成不得超过此值，留出加法余量。
+/// 分数上限：校准后的分数落在 `[0, SCORE_MAX]`。
+pub const SCORE_MAX: u64 = 1_000_000_000;
+
+/// 与上下文加成相加时的总上限。
 const SCORE_CAP: u64 = u64::MAX / 2;
 
+impl ScoreScale {
+    /// 不做校准（分数 = 有效频率）。用于无词典上下文的场景（单测、诊断）。
+    pub const IDENTITY: ScoreScale = ScoreScale {
+        zh_max: 0,
+        en_max: 0,
+    };
+
+    /// 用各语言的最大有效频率建尺。
+    pub fn new(zh_max: u64, en_max: u64) -> Self {
+        ScoreScale { zh_max, en_max }
+    }
+
+    /// 某语言某有效频率 → 可比分数。
+    ///
+    /// 单调性是硬要求：`eff_a > eff_b` 必须推出 `score_a >= score_b`。
+    /// 所以这里**不截断到上界**——早期实现把 `eff` 截到 `max` 再归一化，
+    /// 用户提频超过词表最大频时（ BOOST 叠加后常见）所有超额词并列满分，
+    /// 排序退化成文本序，提频直接失效（`freq_boost_test` 钉死）。
+    pub fn score(&self, lang: Lang, eff: u64) -> u64 {
+        // 退化：任一语言没有频率数据（空词表 / 全 0 频）时校准无意义，
+        // 直接比原始频率——对数会把 600010 与 500000 压成同一个整数 13，精度全丢。
+        if self.zh_max <= 1 || self.en_max <= 1 {
+            return eff.min(SCORE_CAP);
+        }
+        let k = self.factor(lang);
+        let raw = (1.0 + eff as f64).ln() * k;
+        if raw <= 0.0 {
+            return 0;
+        }
+        if raw >= u64::MAX as f64 / 2.0 {
+            return u64::MAX / 2;
+        }
+        raw as u64
+    }
+
+    /// 该语言的缩放系数。
+    fn factor(&self, lang: Lang) -> f64 {
+        let max = match lang {
+            Lang::Zh => self.zh_max,
+            Lang::En => self.en_max,
+        };
+        SCORE_MAX as f64 / (1.0 + max as f64).ln()
+    }
+}
+
+/// 排序器：唯一比较入口。持有上下文加成来源与跨语言分数尺。
+///
+/// 构造开销为零（两个引用/一个 Copy 值），可在热路径上按需创建。
+pub struct Ranker<'ctx> {
+    boost: Option<&'ctx dyn CtxBoost>,
+    scale: ScoreScale,
+}
+
 impl<'ctx> Ranker<'ctx> {
-    /// 无上下文加成的排序器（纯有效频率序）。
+    /// 无上下文加成、无校准（分数 = 有效频率）。
     #[inline]
     pub fn plain() -> Ranker<'static> {
-        Ranker { boost: None }
+        Ranker {
+            boost: None,
+            scale: ScoreScale::IDENTITY,
+        }
     }
 
     /// 带上下文加成的排序器。
     #[inline]
     pub fn with_boost(boost: &'ctx dyn CtxBoost) -> Ranker<'ctx> {
-        Ranker { boost: Some(boost) }
-    }
-
-    /// 比较键分数：有效频率 + 上下文加成，饱和。
-    #[inline]
-    pub fn score(&self, c: &Candidate) -> u64 {
-        match self.boost {
-            Some(b) => c.eff.saturating_add(b.boost(c)).min(SCORE_CAP),
-            None => c.eff,
+        Ranker {
+            boost: Some(boost),
+            scale: ScoreScale::IDENTITY,
         }
     }
 
-    /// 唯一比较器：`(lang, layer, score DESC, text ASC, source ASC)`。
+    /// 带上下文加成 + 跨语言校准（词典查询的主路径）。
+    #[inline]
+    pub fn new(boost: &'ctx dyn CtxBoost, scale: ScoreScale) -> Ranker<'ctx> {
+        Ranker {
+            boost: Some(boost),
+            scale,
+        }
+    }
+
+    /// 校准尺（诊断/测试用）。
+    #[inline]
+    pub fn scale(&self) -> ScoreScale {
+        self.scale
+    }
+
+    /// 比较键分数：校准后的有效频率 + 上下文加成，饱和。
+    #[inline]
+    pub fn score(&self, c: &Candidate) -> u64 {
+        let base = self.scale.score(c.lang, c.eff);
+        match self.boost {
+            Some(b) => base.saturating_add(b.boost(c)).min(SCORE_CAP),
+            None => base,
+        }
+    }
+
+    /// 唯一比较器：同语言比 `(layer, score)`，跨语言只比 `score`。
     #[inline]
     pub fn compare(&self, a: &Candidate, b: &Candidate) -> Ordering {
-        let (ka, kb) = (self.score(a), self.score(b));
-        a.lang
-            .cmp(&b.lang)
-            .then_with(|| a.layer.cmp(&b.layer))
-            // 层内：分数降序
-            .then_with(|| kb.cmp(&ka))
-            // 同分：文本升序（与输入顺序无关，保证结果可复现）
-            .then_with(|| a.text.cmp(&b.text))
-            // 同文本同分：来源优先级
-            .then_with(|| a.source.cmp(&b.source))
+        RankKey::of(a, self.score(a)).cmp(&RankKey::of(b, self.score(b)))
     }
 
     /// 稳定排序（Rust `sort_by` 稳定：同键保持输入相对顺序）。
@@ -159,13 +248,7 @@ impl<'ctx> Ranker<'ctx> {
 
     /// 排序键视图（诊断/测试用）。
     pub fn key<'a>(&self, c: &'a Candidate) -> RankKey<'a> {
-        RankKey {
-            lang: c.lang,
-            layer: c.layer,
-            eff: self.score(c),
-            text: c.text.as_str(),
-            source: c.source,
-        }
+        RankKey::of(c, self.score(c))
     }
 }
 

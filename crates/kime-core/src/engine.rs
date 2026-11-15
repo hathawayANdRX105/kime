@@ -13,7 +13,7 @@ use crate::context::append_tail;
 use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
 use crate::lm::segment_output_text;
-use crate::model::{Layer, SourceKind};
+use crate::model::{Lang, Layer, SourceKind};
 use crate::punct;
 use crate::rank;
 use kime_pinyin::segment;
@@ -1331,21 +1331,67 @@ impl Engine {
     /// 所以双拼/全拼下行为一致。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声
     /// 灌进每一次按键。
     ///
-    /// 落位由排序键表达，不再由拼接位置表达：候选自携 [`Lang`] 与 [`Layer`]，而排序键
-    /// 是 `(lang, layer, score DESC, text ASC, source)`。于是「中文整体在英文之前」
-    /// 是排序语义的一个推论（`Lang::Zh < Lang::En`），而不是「先把英文块 append 到
-    /// 中文块之后」这条约定；英文块内部的精确→补全层序同样来自 `Layer`。
+    /// 落位由**分数**决定，不再由「中文块在前」这条约定决定：候选自携 [`Lang`] 与
+    /// [`Layer`]，跨语言时排序键只比校准后的分数（[`crate::rank::ScoreScale`]）。
+    /// 于是「中文『如果』压过英文 `rug`」是因为它分数更高，而不是因为中文被强制排前；
+    /// 高频英文词同样能压过低频中文词。
     ///
-    /// 这里只做拼接：两段各自已在自己的 `(lang, layer)` 内排好序，拼接即两条有序run
-    /// 的连接，无需（也不允许）再跨语言重排。
+    /// 这里合并后统一重排：中英文各自内部本来有序，但跨语言交错必须重新比较。
+    /// 首音节单字（[`Layer::Append`]）不参与重排——见 [`Engine::sort_candidates`]。
     fn merge_english(&mut self) {
-        if self.letters.len() < 2 {
-            return;
+        if self.letters.len() >= 2 {
+            let en = self
+                .dict
+                .lookup_english(&self.letters, self.config.candidate_limit);
+            self.candidates.extend(en);
         }
-        let en = self
-            .dict
-            .lookup_english(&self.letters, self.config.candidate_limit);
-        self.candidates.extend(en);
+        self.sort_candidates();
+    }
+
+    /// 跨语言合并：中文块与英文块按**分数**交错，各自内部顺序原样保留。
+    ///
+    /// 为什么不是一次 `sort_by(rank_key)`：候选列表不是单一有序run——中文块的顺序
+    /// 由「层 + 分数」决定（精确 → 补全，跨意图合批时只看分数），英文块同理。用
+    /// 一个全局比较器重排会把「同语言内已定好的顺序」打散（例如双拼半截键下
+    /// 声母位补全必须排在韵母位精确词之前），那是有测试钉死的语义。
+    ///
+    /// 所以这里做**两段有序run 的归并**：同语言的两条从不互相比较（保持原序），
+    /// 只有跨语言才比分。`Layer::Append`（首音节单字）原槽位不动——它的落点本身
+    /// 携带 #87 的交错结果。
+    fn sort_candidates(&mut self) {
+        let ranker = self.dict.ranker();
+        let mut slots: Vec<usize> = Vec::new();
+        let mut zh: Vec<Candidate> = Vec::new();
+        let mut en: Vec<Candidate> = Vec::new();
+        for (i, c) in self.candidates.iter().enumerate() {
+            if rank::is_append(c) {
+                continue;
+            }
+            slots.push(i);
+            match c.lang {
+                Lang::Zh => zh.push(c.clone()),
+                Lang::En => en.push(c.clone()),
+            }
+        }
+        if en.is_empty() || zh.is_empty() {
+            return; // 单语言：内部顺序已经是对的，无需归并
+        }
+        let mut merged: Vec<Candidate> = Vec::with_capacity(zh.len() + en.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < zh.len() && j < en.len() {
+            if ranker.score(&zh[i]) >= ranker.score(&en[j]) {
+                merged.push(zh[i].clone());
+                i += 1;
+            } else {
+                merged.push(en[j].clone());
+                j += 1;
+            }
+        }
+        merged.extend(zh[i..].iter().cloned());
+        merged.extend(en[j..].iter().cloned());
+        for (slot, c) in slots.into_iter().zip(merged) {
+            self.candidates[slot] = c;
+        }
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
@@ -1541,6 +1587,16 @@ impl Engine {
                     seed.clone(),
                     &mut self.span_cache,
                 );
+                // 次切分的句标记为 `Layer::Tail`：它们只能落在列表尾，
+                // 不得越过首切分的句（层 `SentenceCovers`）与层一精确命中。
+                // 不设层的后果是它们以默认精确层参与排序，高频次切分句会反超首切分句。
+                let extra_sents: Vec<Candidate> = extra_sents
+                    .into_iter()
+                    .map(|mut c| {
+                        c.layer = Layer::Tail;
+                        c
+                    })
+                    .collect();
                 rank::append_unique(&mut cands, extra_sents, &mut seen);
             }
         }

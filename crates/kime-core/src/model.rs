@@ -202,10 +202,23 @@ impl Candidate {
     }
 }
 
-/// 排序键：`(lang, layer, eff DESC, text ASC, source ASC)`。
+/// 排序键：`(score DESC, text ASC, source ASC)`，跨语言与同语言**用同一把尺**。
 ///
 /// 这是**唯一**的排序语义定义处。历史上的两个不等价比较器（一个带读音主键、一个
 /// 带 LM 加成）以及 engine 里内联的第三份比较，全部归并到这里。
+///
+/// # 为什么不是「中文整块在前」
+///
+/// 曾经把 `lang` 放在排序键最高位，等价于「中文候选恒在英文之前」。那不是排序，
+/// 是分块——英文词再常用也永远排在最后一个中文字后面，用户不切模式就打不出英文。
+/// 现在跨语言只比 `score`（校准后的可比分数，见 [`crate::rank::ScoreScale`]），
+/// 谁分高谁在前：中文「如果」凭分数压过 `rug`，高频英文词也能压过低频中文词。
+///
+/// # 层（layer）只在同语言内生效
+///
+/// 「精确命中必须整体在补全之前」是**词典内部**的契约（同一次查询的层一 vs 层二），
+/// 因此只在 `lang` 相同时比较 layer。跨语言时 layer 不参与——否则「英文精确词」
+/// 又会被「中文补全词」按层号压住，等于把分块换个位置重演一遍。
 ///
 /// 借用 `&Candidate` 的字段而非拥有 `String`，避免每次比较发生分配——热路径是
 /// 每键一次候选排序（数十条），分配会成为可测量的开销。
@@ -213,7 +226,7 @@ impl Candidate {
 pub struct RankKey<'a> {
     pub lang: Lang,
     pub layer: Layer,
-    /// 有效频率（降序比较）
+    /// 校准后的可比分数（降序比较）
     pub eff: u64,
     /// 同分文本升序（确定性）
     pub text: &'a str,
@@ -221,11 +234,11 @@ pub struct RankKey<'a> {
 }
 
 impl<'a> RankKey<'a> {
-    pub fn of(c: &'a Candidate) -> Self {
+    pub fn of(c: &'a Candidate, score: u64) -> Self {
         Self {
             lang: c.lang,
             layer: c.layer,
-            eff: c.eff,
+            eff: score,
             text: c.text.as_str(),
             source: c.source,
         }
@@ -234,10 +247,14 @@ impl<'a> RankKey<'a> {
 
 impl Ord for RankKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.lang
-            .cmp(&other.lang)
-            .then_with(|| self.layer.cmp(&other.layer))
-            // 层内：有效频率降序
+        // 跨语言：只比分。同语言：先比层（词典内部 exact → completion），再比分。
+        let layer_cmp = if self.lang == other.lang {
+            self.layer.cmp(&other.layer)
+        } else {
+            Ordering::Equal
+        };
+        layer_cmp
+            // 分数降序：唯一跨语言可比的量
             .then_with(|| other.eff.cmp(&self.eff))
             // 同分：文本升序（与输入顺序无关，保证结果可复现）
             .then_with(|| self.text.cmp(other.text))

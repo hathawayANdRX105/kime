@@ -31,15 +31,18 @@ full	nihao	first=你好
 full	shenme	first=什么
 full	zongguo	has=中国
 
-# 核心回归：中文候选（含补全）整体在英文候选之前
-# 「ru」的中文候选是 ru' 前缀补全（如果、软件…），英文候选是 rug 起的前缀块。
-# 首候选是谁由中文频率决定（真实库是「如」，fixture 是「如果」），不在这里钉。
-full	ru	如果<rug
-full	rug	如果<rug
+# 跨语言顺序由**校准分数**决定（每个语言在自己的频率分布里归一化后比较），
+# 不是「中文整块在前」也不是「英文整块在前」。因此这里不钉固定顺序——
+# 那会把某一份词库的频率分布固化成契约。要断言两语言之间的先后，用
+# `kime debug --json` 看 lang/layer/eff 三个字段，按实际分数判断。
+#
+# 这里只断言与频率无关的部分：中文候选必须可达（不被英文挤出候选窗）。
+full	ru	has=如果
+full	rug	has=如果
 
 # 双拼：同一输入在双拼下的中文结论与全拼一致
 shuangpin:ziranma	nihao	first=你好
-shuangpin:ziranma	rug	如果<rug
+shuangpin:ziranma	rug	has=如果
 
 # 单字母不查英文（噪声闸在引擎层）
 full	a	absent=a

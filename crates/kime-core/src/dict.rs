@@ -102,6 +102,13 @@ struct EnglishEntry {
 
 pub struct Dict {
     conn: Connection,
+    /// 中文表内最大有效频率（跨语言分数归一化的基准）。
+    ///
+    /// 见 [`crate::rank::ScoreScale`]：为什么必须校准、为什么用对数压缩。
+    /// 导入/学习会抬高它，所以是字段而不是开库时算死的常量。
+    zh_max: u64,
+    /// 英文表内最大有效频率（同上）。
+    en_max: u64,
     /// 内存排序索引：按 (pinyin ASC, freq DESC, text ASC) 排序
     index: Vec<IndexEntry>,
     /// 二级索引：同一批条目按 (abbrev ASC, freq DESC, text ASC) 排序——abbrev 前缀二分用
@@ -529,7 +536,21 @@ impl Dict {
         };
         let total_freq = Self::query_total_freq(&conn);
         let english = Self::load_english(&conn, &user_stats, today)?;
+        // 跨语言分数尺：各语言取最大有效频率做归一化基准。
+        //
+        // 为什么必须分开取最大值：中文词条频率 10⁵~10⁷、英文词频 10³ 量级，
+        // 直接比原始数值等于「中文恒赢」，退化成按语言分块。对数归一化后两边
+        // 都是「在本语言内部的相对位置」，才谈得上按分数竞争。
+        let zh_max = index
+            .iter()
+            .map(|e| e.eff)
+            .chain(user_overlay.iter().map(|e| e.eff))
+            .max()
+            .unwrap_or(0);
+        let en_max = english.iter().map(|e| e.eff).max().unwrap_or(0);
         Ok(Self {
+            zh_max,
+            en_max,
             conn,
             index,
             abbrev_index,
@@ -776,7 +797,26 @@ impl Dict {
     /// [`crate::rank::CtxBoost`]；比较本身只在 [`crate::rank::Ranker`] 里发生，
     /// 这里不再有第二份比较逻辑。
     pub fn ranker(&self) -> crate::rank::Ranker<'_> {
-        crate::rank::Ranker::with_boost(self)
+        crate::rank::Ranker::new(self, crate::rank::ScoreScale::new(self.zh_max, self.en_max))
+    }
+
+    /// 排序分数尺（跨语言可比）。见 [`crate::rank::ScoreScale`]。
+    pub fn score_scale(&self) -> crate::rank::ScoreScale {
+        crate::rank::ScoreScale::new(self.zh_max, self.en_max)
+    }
+
+    /// 抬高中文基准（导入/学习之后调用）。
+    fn bump_zh_max(&mut self, eff: u64) {
+        if eff > self.zh_max {
+            self.zh_max = eff;
+        }
+    }
+
+    /// 抬高英文基准（导入/学习之后调用）。
+    fn bump_en_max(&mut self, eff: u64) {
+        if eff > self.en_max {
+            self.en_max = eff;
+        }
     }
 
     /// 候选的排序用有效频率（裸频 + 用户学习加成，开库/learn 时烘焙）。
@@ -881,6 +921,9 @@ impl Dict {
             })
         })?;
         let mut index: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        // stmt 借用 self.conn，必须在改 self 之前释放，否则后面的 self.index 赋值
+        // 与 self.bump_zh_max 会和它冲突。
+        drop(stmt);
         for e in &mut index {
             e.eff = if e.user == 1 {
                 e.freq.max(0) as u64
@@ -900,6 +943,11 @@ impl Dict {
         self.abbrev_index = abbrev_index;
         // 批量灌词后总量变了，缓存必须跟着刷新（否则刚导入的库整句代价用旧概率）
         self.total_freq = Self::query_total_freq(&self.conn);
+        // 跨语言分数基准跟着抬高：导入的词可能比原有最大频还高，
+        // 不更新的话新词的校准分会算错（导入在 open 之后发生，开库时算的基准已过期）。
+        if let Some(max) = self.index.iter().map(|e| e.eff).max() {
+            self.bump_zh_max(max);
+        }
         Ok(count)
     }
 
@@ -948,6 +996,9 @@ impl Dict {
         }
         tx.commit()?;
         self.english = Self::load_english(&self.conn, &self.user_stats, self.today)?;
+        if let Some(max) = self.english.iter().map(|e| e.eff).max() {
+            self.bump_en_max(max);
+        }
         Ok(count)
     }
 
