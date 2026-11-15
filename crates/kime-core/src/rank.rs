@@ -11,13 +11,15 @@
 //!
 //! ## 2. 层完整性由排序键保证，而不是由调用顺序保证
 //!
-//! 同语言时排序键是 `(layer, score DESC, text ASC, source)`：层在分数之前，所以
-//! 「精确层整体在补全层之前」是**结构性事实**，任何频率、任何 LM 加成都无法把
-//! 补全候选提到精确候选之前。这条契约历史上靠「先查精确块、再 append 补全块」的
-//! 约定维持，任何一次 `sort`/`insert` 都可能打破；现在打破它需要显式改 [`Layer`] 序号。
+//! 排序键是 `(tier, score DESC, text ASC, source)`：层在分数之前，所以「精确层整体
+//! 在补全层之前」是**结构性事实**，任何频率、任何 LM 加成都无法把补全候选提到精确
+//! 候选之前。这条契约历史上靠「先查精确块、再 append 补全块」的约定维持，任何一次
+//! `sort`/`insert` 都可能打破；现在打破它需要显式改 [`Layer`] 序号。
 //!
-//! 跨语言时排序键退化成 `(score DESC, text ASC, source)`——只比分。层是「单次查询
-//! 内部」的概念，跨语言比层等于把语言分块换个位置重演一遍。
+//! 语言不是排序维度。曾经试过「同语言比层、跨语言只比分」——那看着更「纯按分数」，
+//! 但它不是全序：`(Zh,精确,10) < (Zh,补全,100) < (En,精确,50) < (Zh,精确,10)` 成环，
+//! 比较器成环后 `sort_by` 的结果不再由输入唯一决定。跨语言竞争因此发生在**同层之内**：
+//! 同为精确层时按校准分数交错，同为补全层时同理。
 //!
 //! ## 3. 上下文加成是**比较时**的量，不污染导出值
 //!
@@ -204,7 +206,10 @@ impl<'ctx> Ranker<'ctx> {
         }
     }
 
-    /// 唯一比较器：同语言比 `(layer, score)`，跨语言只比 `score`。
+    /// 唯一比较器：`(tier, score DESC, text ASC, source ASC)`。
+    ///
+    /// 语言不是排序维度：见 [`RankKey`] 的注释——「层完整性 + 跨语言只比分 + 可传递」
+    /// 三条不可兼得，这里保留层完整性，让跨语言竞争发生在同层之内。
     #[inline]
     pub fn compare(&self, a: &Candidate, b: &Candidate) -> Ordering {
         RankKey::of(a, self.score(a)).cmp(&RankKey::of(b, self.score(b)))
@@ -228,7 +233,11 @@ impl<'ctx> Ranker<'ctx> {
         });
     }
 
-    /// **跨查询意图**合批重排：只按分数降序、同分文本升序，**不看层**。
+    /// 同一层内的批内重排：按分数降序、同分文本升序。
+    ///
+    /// 用于「同一层的多个来源合批」：双拼末键的声母位意图 + 韵母位意图、模糊音变体、
+    /// 邻键纠错变体。这些批次在合批时统一标成同一层（见 `engine` 的半截键合批），
+    /// 因此批内只比分就是正确语义，且结果可复现。
     ///
     /// 为什么需要一个「不看层」的排序：层是「单次查询内部」的概念——一次查询的精确块
     /// 与另一次查询的补全块之间，层号没有可比性。engine 把多次查询的结果合成一批时
@@ -395,9 +404,14 @@ pub fn is_append(c: &Candidate) -> bool {
 /// - 主列表头部（精确块 / 覆盖句）受保护——调用方只把「头部之后的候选」传进来。
 pub fn merge_append(
     ranker: &Ranker<'_>,
-    head: Vec<Candidate>,
-    append: Vec<Candidate>,
+    mut head: Vec<Candidate>,
+    mut append: Vec<Candidate>,
 ) -> Vec<Candidate> {
+    // 归并前提是两段都按分数降序。调用方给的 head 是主列表去掉保护首段后的尾部
+    // （层优先拼接，非分数序），append 是查询结果直接打标（同样非分数序）——
+    // 不预排序的话，同一多重集换个输入顺序就换个交错结果。
+    ranker.sort_within_batch(&mut head);
+    ranker.sort_within_batch(&mut append);
     let mut head = head.into_iter().peekable();
     let mut append = append.into_iter().peekable();
     let mut out: Vec<Candidate> = Vec::with_capacity(head.len() + append.len());

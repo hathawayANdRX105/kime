@@ -1199,15 +1199,21 @@ impl Engine {
                                 rank::append_unique(&mut completions, vc, &mut seen);
                             }
                         }
-                        // 补全候选 + 原前缀结果：**跨查询意图合批，只按分数重排**。
-                        // 两次查询的层号不可比（一次查「声母位 + 半截键」、一次查
-                        // 「韵母位完整音节」），按层排序会让韵母位查询的精确命中压过
-                        // 声母位查询的补全命中——用户按 u（sh 声母键）要的是 sh 系。
-                        // 层完整性只在单次查询内部成立；跨意图合批只看分数。
+                        // 两种意图合批：统一标成**同一层**（补全层），批内只按分数重排。
+                        //
+                        // 为什么统一层号：这两批候选来自两次不同查询（「声母位 + 半截键」
+                        // 与「韵母位完整音节」），层号之间没有可比性；若各自保留原层，
+                        // 「韵母位查询的精确命中」会凭层号压过「声母位查询的补全命中」，
+                        // 而用户按 u（sh 声母键）要的恰恰是 sh 系。半截键本身就是
+                        // 「还没打完」的状态，两种解释都属于补全，因此同层是正确的语义，
+                        // 而不是为了让测试通过打的补丁。
                         let ranker = self.dict.ranker();
                         let mut merged = completions;
                         merged.extend(cands);
-                        ranker.sort_by_score(&mut merged);
+                        for c in &mut merged {
+                            c.layer = Layer::Completion;
+                        }
+                        ranker.sort_within_batch(&mut merged);
                         merged.truncate(self.config.candidate_limit);
                         cands = merged;
                     }

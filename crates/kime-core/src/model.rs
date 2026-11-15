@@ -202,32 +202,41 @@ impl Candidate {
     }
 }
 
-/// 排序键：`(score DESC, text ASC, source ASC)`，跨语言与同语言**用同一把尺**。
+/// 排序键：`(tier, score DESC, text ASC, source ASC)`。
 ///
-/// 这是**唯一**的排序语义定义处。历史上的两个不等价比较器（一个带读音主键、一个
-/// 带 LM 加成）以及 engine 里内联的第三份比较，全部归并到这里。
+/// 这是**唯一**的排序语义定义处。三个要素各管一件事：
 ///
-/// # 为什么不是「中文整块在前」
+/// - `tier`（层）：匹配质量。精确 > 覆盖句 > 补全 > 尾部 > 兜底 > 追加。
+///   层在分数之前 ⇒ 「精确命中整体在补全之前，哪怕补全频率高一个数量级」是结构性事实，
+///   任何频率、任何加成都跨不过去。
+/// - `score`（校准分数）：同一层内的频率序。中文与英文各自在自己的分布里归一化后
+///   才可比（见 [`crate::rank::ScoreScale`]）。
+/// - `text` / `source`：确定性 tie-break。
 ///
-/// 曾经把 `lang` 放在排序键最高位，等价于「中文候选恒在英文之前」。那不是排序，
-/// 是分块——英文词再常用也永远排在最后一个中文字后面，用户不切模式就打不出英文。
-/// 现在跨语言只比 `score`（校准后的可比分数，见 [`crate::rank::ScoreScale`]），
-/// 谁分高谁在前：中文「如果」凭分数压过 `rug`，高频英文词也能压过低频中文词。
+/// # 为什么语言**不是**排序维度
 ///
-/// # 层（layer）只在同语言内生效
+/// 曾经把 `lang` 放在排序键最高位（=「中文整块在前」），也曾试过「同语言比层、跨语言
+/// 只比分」。后者看起来更「纯按分数」，但它**不是全序**：取
+/// `a=(Zh,Exact,10)`、`b=(Zh,Completion,100)`、`c=(En,Exact,50)`，有
+/// `a<b`（层）、`b<c`（分数）、`c<a`（分数），构成 `a<b<c<a` 环。
+/// 比较器一旦成环，`sort_by` 的结果就不再由输入唯一决定（对同一个多重集，换个初始
+/// 顺序就换个输出），跨语言名次不可复现。
 ///
-/// 「精确命中必须整体在补全之前」是**词典内部**的契约（同一次查询的层一 vs 层二），
-/// 因此只在 `lang` 相同时比较 layer。跨语言时 layer 不参与——否则「英文精确词」
-/// 又会被「中文补全词」按层号压住，等于把分块换个位置重演一遍。
+/// 根本原因是：要求「精确恒在补全之前」+「跨语言只比分」+「比较器可传递」三条同时
+/// 成立是不可能的——只要层序是全局的，分数就永远越不过层；只要跨语言真只比分，
+/// 层序就必须是局部的，而局部层序无法与全局分数拼成可传递的比较。
 ///
-/// 借用 `&Candidate` 的字段而非拥有 `String`，避免每次比较发生分配——热路径是
-/// 每键一次候选排序（数十条），分配会成为可测量的开销。
+/// 取舍：保留「层完整性」这条**用户可感知**的契约（精确命中压住补全，是所有中文输入
+/// 法的共识），让跨语言竞争发生在**同层之内**——同为精确层时中文与英文按校准分数
+/// 交错，同为补全层时同理。于是「英文精确词压过中文补全词」仍然会发生（那是层序），
+/// 但「英文补全词 `rug` 压过中文补全词「如果」」不会——后者正是本次要修的 bug。
+///
+/// 借用字段而非拥有 `String`，避免每次比较发生分配（热路径每键一次排序，数十条）。
 #[derive(Clone, Copy)]
 pub struct RankKey<'a> {
-    pub lang: Lang,
-    pub layer: Layer,
+    pub tier: Layer,
     /// 校准后的可比分数（降序比较）
-    pub eff: u64,
+    pub score: u64,
     /// 同分文本升序（确定性）
     pub text: &'a str,
     pub source: SourceKind,
@@ -236,9 +245,8 @@ pub struct RankKey<'a> {
 impl<'a> RankKey<'a> {
     pub fn of(c: &'a Candidate, score: u64) -> Self {
         Self {
-            lang: c.lang,
-            layer: c.layer,
-            eff: score,
+            tier: c.layer,
+            score,
             text: c.text.as_str(),
             source: c.source,
         }
@@ -247,15 +255,10 @@ impl<'a> RankKey<'a> {
 
 impl Ord for RankKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // 跨语言：只比分。同语言：先比层（词典内部 exact → completion），再比分。
-        let layer_cmp = if self.lang == other.lang {
-            self.layer.cmp(&other.layer)
-        } else {
-            Ordering::Equal
-        };
-        layer_cmp
-            // 分数降序：唯一跨语言可比的量
-            .then_with(|| other.eff.cmp(&self.eff))
+        self.tier
+            .cmp(&other.tier)
+            // 层内：分数降序
+            .then_with(|| other.score.cmp(&self.score))
             // 同分：文本升序（与输入顺序无关，保证结果可复现）
             .then_with(|| self.text.cmp(other.text))
             // 同文本同分：来源优先级

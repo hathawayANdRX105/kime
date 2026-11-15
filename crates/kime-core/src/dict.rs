@@ -544,15 +544,14 @@ impl Dict {
         // 基准 = 库内语料最大频 与 内存条目最大有效频率 取大者。
         // 语料最大值必须查库：FST 模式下 index 是空的，只看内存会把基准算成
         // 「用户词里最大的那条」，中文分数整体贴近上限、英文被系统性压住。
-        let zh_max = Self::query_max_freq(&conn, "phrase")
-            .max(
-                index
-                    .iter()
-                    .map(|e| e.eff)
-                    .chain(user_overlay.iter().map(|e| e.eff))
-                    .max()
-                    .unwrap_or(0),
-            );
+        let zh_max = Self::query_max_freq(&conn, "phrase").max(
+            index
+                .iter()
+                .map(|e| e.eff)
+                .chain(user_overlay.iter().map(|e| e.eff))
+                .max()
+                .unwrap_or(0),
+        );
         let en_max = Self::query_max_freq(&conn, "english")
             .max(english.iter().map(|e| e.eff).max().unwrap_or(0));
         Ok(Self {
@@ -735,9 +734,12 @@ impl Dict {
         // 先算加成再改条目：`self.english` 的可变借用与 `self.user_stats` 的只读
         // 借用不能同时存在（同一 `self`）。
         let bonus = user_bonus_of(&self.user_stats, today, spelling, spelling);
+        let mut max_eff = 0;
         for e in self.english.iter_mut().filter(|e| e.text == spelling) {
             e.eff = e.freq.max(0) as u64 + bonus;
+            max_eff = max_eff.max(e.eff);
         }
+        self.bump_en_max(max_eff);
     }
 
     /// 英文学习持久化入队（键路径零 SQLite 写）。
@@ -1518,6 +1520,11 @@ impl Dict {
             .index
             .partition_point(|e| e.pinyin.as_str() <= joined.as_str());
         self.index[lo..hi].sort_by(entry_cmp);
+        // 学习会抬高 eff（可能超过开库时算的基准），基准必须跟着抬，
+        // 否则该语言的分母被低估、校准分系统性偏高。
+        if let Some(max) = self.index[lo..hi].iter().map(|e| e.eff).max() {
+            self.bump_zh_max(max);
+        }
         Ok(())
     }
 
