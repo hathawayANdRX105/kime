@@ -8,6 +8,7 @@ members = [
     "bin/kime",
     "crates/platform-wayland",
     "crates/platform-x11",
+    "crates/kime-typing-probe",
 ]
 
 [workspace.package]
