@@ -198,14 +198,19 @@ impl<'ctx> Ranker<'ctx> {
         self.scale
     }
 
-    /// 比较键分数：校准后的有效频率 + 上下文加成，饱和。
+    /// 比较键分数：`(有效频率 + 上下文加成)` 再做跨语言归一化，饱和。
+    ///
+    /// **加成必须在归一化之前加**。加成与 `eff` 同量纲（都是「频率」：次数 × 常量），
+    /// 先算分再加成会让加成变成一个小尾巴——对数压缩后 10 倍频率差对应约 2.3 倍
+    /// 分数差，固定的 +1.5M 再也翻不过来（实测：LM 上下文「高」后「频」无法顶到
+    /// 第一，回归 `lm_context_reorders_candidates`）。
     #[inline]
     pub fn score(&self, c: &Candidate) -> u64 {
-        let base = self.scale.score(c.lang, c.eff);
-        match self.boost {
-            Some(b) => base.saturating_add(b.boost(c)).min(SCORE_CAP),
-            None => base,
-        }
+        let raw = match self.boost {
+            Some(b) => c.eff.saturating_add(b.boost(c)),
+            None => c.eff,
+        };
+        self.scale.score(c.lang, raw)
     }
 
     /// 唯一比较器：`(tier, score DESC, text ASC, source ASC)`。
