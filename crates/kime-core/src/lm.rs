@@ -12,6 +12,7 @@
 //!   事务里原子提交，IME 读侧要么旧状态要么新状态，永不见半成品。
 
 use crate::llm::LlmClient;
+use rusqlite::params;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -35,6 +36,18 @@ pub const BIGRAM_BUDGET: i64 = 500_000;
 /// count=1 的 bigram 给 30 万，足以把低频后继顶到高频词前面；
 /// count=2 → 60 万。与 USER_BOOST 同源，但独立累积互不干扰。
 pub const LM_BOOST_UNIT: i64 = 300_000;
+/// 片段/句子召回：同一片段需在 commit_log 中重复出现 ≥ 次才入库，
+/// 挡掉一次性打错的句子（与 bigram 的 MIN_ADMISSION 同语义，更保守）。
+pub const FRAGMENT_ADMISSION: i64 = 3;
+/// 片段最大长度（词数）：防止长链回溯导致组合爆炸，实践中句级片段
+/// 很少超过 6 词，上限只挡病态输入。
+pub const FRAGMENT_MAX_WORDS: usize = 6;
+/// 片段加成单位：count=1 给 15 万，与 LM_BOOST_UNIT 同量级但更保守，
+/// 避免整段前移覆盖掉精确词库命中（频率为主）。
+pub const FRAGMENT_BOOST_UNIT: i64 = 150_000;
+/// 片段加成上限：即便 count 很高，整段加成也不超过此值，保证
+/// 「中文精确 → 英文精确 → 中文补全 → 英文补全」分块内重排不跨层。
+pub const FRAGMENT_BOOST_CAP: i64 = 600_000;
 
 /// 挖掘结果统计。
 #[derive(Debug, Default, PartialEq)]
@@ -53,6 +66,8 @@ pub struct MineStats {
     pub purged_rows: i64,
     /// 自动组词新学的用户词数
     pub phrases_learned: i64,
+    /// 本轮新并入的片段数（lm_fragment 路径）。
+    pub fragments_mined: i64,
     /// 被 jev 门控拒绝的对数（置信度低于阈值，未准入；bigram 与组词两档合计）
     pub jev_gated: i64,
     /// 因 jev 端点失败/超时而降级回退纯计数的对数（降级路径不失败挖掘）
@@ -176,6 +191,9 @@ pub fn mine_gated(conn: &Connection, gate: Option<&Jeving>) -> rusqlite::Result<
         params![BIGRAM_BUDGET],
     )?;
     st.evicted = conn.query_row("SELECT changes()", [], |r| r.get(0))?;
+    // 离线片段挖掘：在清日志之前调用，确保读到本轮日志。
+    st.fragments_mined = mine_fragments(conn, today)?;
+
 
     // 清日志：**只删已合并进主表的行**（对计数 ≥ MIN_ADMISSION）。
     // 未达门槛的行保留——它们下轮可能凑够准入线；已合并的必须删，
@@ -265,6 +283,234 @@ pub fn mine_gated(conn: &Connection, gate: Option<&Jeving>) -> rusqlite::Result<
         .unwrap_or(0);
     Ok(st)
 }
+/// commit_log 单行：逐词提交的文本与读音，按 ts 顺序排列，用于恢复片段序列。
+#[derive(Clone, Debug)]
+struct FragmentRow {
+    text: String,
+    reading: String,
+}
+
+/// 挖掘出的片段候选：片段文本、整段读音、出现次数、可解释加成。
+#[derive(Clone, Debug)]
+pub struct FragmentCandidate {
+    /// 片段上屏文本（如 "项目进度"）
+    pub text: String,
+    /// 整段读音（如 "xiang'mu'jin'du"）
+    pub reading: String,
+    /// 在 commit_log 中重复出现的次数
+    pub count: i64,
+    /// 可解释加成：count × FRAGMENT_BOOST_UNIT，被 FRAGMENT_BOOST_CAP 封顶
+    pub boost: i64,
+}
+
+/// 纯函数：从逐条提交记录中提取片段计数（无 DB，可单测）。
+///
+/// 规则：
+/// - 仅在连续提交序列内提取（text 为空或 reading 为空视为序列边界，不跨序列拼接）。
+/// - 对每个位置 i，向后取长度 2..=FRAGMENT_MAX_WORDS 的子序列作为候选片段。
+/// - 片段文本 = 逐词拼接，片段读音 = 逐音节 `'` 连接。
+/// 返回：(文本, 读音) → 出现次数。
+fn fragment_counts_from_rows(rows: &[FragmentRow]) -> std::collections::HashMap<(String, String), i64> {
+    let mut counts: std::collections::HashMap<(String, String), i64> = std::collections::HashMap::new();
+    let n = rows.len();
+    let mut i = 0;
+    while i < n {
+        // 找到一个连续序列的起点：text/reading 都非空
+        if rows[i].text.is_empty() || rows[i].reading.is_empty() {
+            i += 1;
+            continue;
+        }
+        // 向前扩展，收集连续非空行构成的序列
+        let mut seq_start = i;
+        while i < n && !rows[i].text.is_empty() && !rows[i].reading.is_empty() {
+            i += 1;
+        }
+        let seq_end = i; // [seq_start, seq_end) 是连续序列
+        let seq_len = seq_end - seq_start;
+        if seq_len < 2 {
+            continue;
+        }
+        // 对序列内每个起始位置，取长度 2..=FRAGMENT_MAX_WORDS 的子序列
+        for s in seq_start..seq_end {
+            let mut text = String::new();
+            let mut reading = String::new();
+            for len in 1..=FRAGMENT_MAX_WORDS {
+                let e = s + len;
+                if e > seq_end {
+                    break;
+                }
+                let row = &rows[e - 1];
+                if !text.is_empty() {
+                    text.push_str(row.text.as_str());
+                } else {
+                    text = row.text.clone();
+                }
+                if !reading.is_empty() {
+                    reading.push('\'');
+                    reading.push_str(row.reading.as_str());
+                } else {
+                    reading = row.reading.clone();
+                }
+                if len >= 2 {
+                    *counts.entry((text.clone(), reading.clone())).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// 离线片段挖掘（事务内）：
+/// 1. 从 commit_log 读取全部 (text, reading)，按 ts 顺序；
+/// 2. 纯函数 `fragment_counts_from_rows` 统计重复片段；
+/// 3. 对 lm_fragment 全体 count /= 2 实现老化，归零行清掉；
+/// 4. 出现次数 >= FRAGMENT_ADMISSION 的片段 UPSERT 进 lm_fragment；
+/// 5. 超预算按 count ASC, last_seen ASC 淘汰（预算与 bigram 分离，此处只做软兜底）。
+///
+/// 在清日志（purge commit_log）之前调用，确保读到本轮日志。
+/// 返回新并入的片段数（供 MineStats.fragments_mined）。
+fn mine_fragments(conn: &Connection, today: i64) -> rusqlite::Result<i64> {
+    // 只读预扫：commit_log 全部 (text, reading)，按 ts 升序
+    let rows: Vec<FragmentRow> = {
+        let mut stmt = conn.prepare("SELECT text, reading FROM commit_log ORDER BY ts ASC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FragmentRow {
+                text: r.get::<_, String>(0)?,
+                reading: r.get::<_, String>(1)?,
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // 纯函数统计片段计数
+    let counts = fragment_counts_from_rows(&rows);
+
+    // 老化：全体减半，归零清掉
+    conn.execute_batch(
+        "UPDATE lm_fragment SET count = count / 2;
+         DELETE FROM lm_fragment WHERE count <= 0;",
+    )?;
+
+    // 准入：count >= FRAGMENT_ADMISSION 的片段合并进 lm_fragment，
+    // 统计真实新增行数（既有行只 bump count 不计入新增）。
+    let mut merged = 0i64;
+    for ((text, reading), cnt) in &counts {
+        if *cnt < FRAGMENT_ADMISSION {
+            continue;
+        }
+        let before = conn.query_row(
+            "SELECT count FROM lm_fragment WHERE text = ?1 AND reading = ?2",
+            params![text, reading],
+            |r| r.get::<_, i64>(0),
+        );
+        conn.execute(
+            "INSERT INTO lm_fragment(text, reading, count, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(text, reading) DO UPDATE SET
+               count = count + excluded.count,
+               last_seen = excluded.last_seen",
+            params![text, reading, cnt, today],
+        )?;
+        // 只有之前不存在的行才算新增
+        if before.is_err() {
+            merged += 1;
+        }
+    }
+
+    // 软预算兜底：lm_fragment 行数过多时按 count ASC, last_seen ASC 淘汰
+    const FRAGMENT_BUDGET: i64 = 100_000;
+    conn.execute(
+        "DELETE FROM lm_fragment WHERE id IN (
+           SELECT id FROM lm_fragment
+           ORDER BY count ASC, last_seen ASC
+           LIMIT max(0, (SELECT count(*) FROM lm_fragment) - ?1)
+         )",
+        params![FRAGMENT_BUDGET],
+    )?;
+
+    Ok(merged)
+}
+
+/// 只读查询 API：按当前读音前缀/精确匹配召回相关历史片段。
+///
+/// - 输入：当前用户输入的读音 `current_reading`（如 "gao"）、限制数 `limit`。
+/// - 匹配：lm_fragment.reading 以 `current_reading` 为前缀，或 `current_reading`
+///   以片段读音为前缀（用户可能已输入整段读音的前半部分），或精确相等。
+/// - 返回：按 (count DESC, last_seen DESC) 排序的片段候选，每条带可解释加成。
+///
+/// engine 侧调用此函数，将返回的片段作为额外候选参与分块内重排；
+/// 加成不跨层（仅在各分块内按既有比较器叠加）。
+pub fn query_fragments_by_reading(
+    conn: &Connection,
+    current_reading: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<FragmentCandidate>> {
+    if current_reading.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let like_prefix = format!("{current_reading}%");
+    let mut stmt = conn.prepare(
+        "SELECT text, reading, count, last_seen
+         FROM lm_fragment
+         WHERE reading LIKE ?1
+            OR ?2 LIKE reading || '%'
+            OR reading = ?3
+         ORDER BY count DESC, last_seen DESC
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![like_prefix, current_reading, current_reading, limit as i64],
+        |r| {
+            let count: i64 = r.get(2)?;
+            let boost = (count as f64 * FRAGMENT_BOOST_UNIT as f64)
+                .clamp(0.0, FRAGMENT_BOOST_CAP as f64) as i64;
+            Ok(FragmentCandidate {
+                text: r.get::<_, String>(0)?,
+                reading: r.get::<_, String>(1)?,
+                count,
+                boost,
+            })
+        },
+    )?;
+    rows.flatten().collect()
+}
+
+/// 纯加成助手：给定候选与当前读音，若候选与某历史片段匹配则返回加成。
+///
+/// - `fragments`：由 `query_fragments_by_reading` 返回的片段列表（已由 engine 传入）。
+/// - `current_reading`：当前用户输入读音。
+/// - `c`：待评分 Candidate（text + pinyin）。
+/// - 匹配条件：c.text == 片段文本 且 (c.pinyin == 片段读音 或 c.pinyin 是片段读音前缀)。
+/// - 返回：片段 boost（已被 FRAGMENT_BOOST_CAP 封顶），无匹配返回 0。
+///
+/// 纯函数（无 DB），便于 engine 侧在 cand_cmp 中直接调用。
+pub fn fragment_boost_for_reading(
+    fragments: &[FragmentCandidate],
+    current_reading: &str,
+    c: &crate::dict::Candidate,
+) -> i64 {
+    if fragments.is_empty() || current_reading.is_empty() {
+        return 0;
+    }
+    let mut best: i64 = 0;
+    for frag in fragments {
+        if frag.text != c.text {
+            continue;
+        }
+        // 当前读音与片段读音匹配：精确相等或前缀关系
+        let reading_match = frag.reading == c.pinyin
+            || frag.reading.starts_with(c.pinyin.as_str())
+            || c.pinyin.starts_with(frag.reading.as_str());
+        if reading_match {
+            best = best.max(frag.boost);
+        }
+    }
+    best
+}
+
 
 /// 前缀切分候选词最大长度（按字符）。词库词常规 2–4 字，上限只挡病态长
 /// 词条，实践中不可达（同 mine_phrases 的长度防线思路）。
