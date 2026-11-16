@@ -1945,7 +1945,21 @@ impl Dict {
         }
 
         // 2. 新增三路：合并后封顶，保持 tie-breaker 性质。
+        //
+        // 三路都**只在存在上下文时**才计分（`lm_prev_text` / `context_tail` 有值）。
+        // 没有上下文 = 用户刚开始一句新输入，此时必须退回裸频序——
+        // 否则「历史提交过的高频片段」会无条件压过语料频率，清上下文也不恢复
+        // （`lm_mine_test::lm_context_reorders_candidates` 钉的就是这条）。
+        let has_context = self.lm_prev_text.is_some() || self.context_tail.is_some();
         let mut extra: i64 = 0;
+        if has_context {
+            self.push_context_boost(&mut extra, c);
+        }
+        boost.saturating_add(extra.min(CONTEXT_BOOST_CAP))
+    }
+
+    /// 三路上下文加成之和（调用方负责「有上下文」门控与封顶）。
+    fn push_context_boost(&self, extra: &mut i64, c: &Candidate) {
         // 实时 bigram：上一词（lm_prev_text）→ 本候选读音。
         // 查表方向必须是「上一词 → 候选」；按候选自己的文本查等于永远命中不了。
         if let Some(m) = self
@@ -1953,7 +1967,7 @@ impl Dict {
             .as_deref()
             .and_then(|prev| self.realtime_bigram.get(prev))
         {
-            extra = extra.saturating_add(
+            *extra = extra.saturating_add(
                 m.get(c.pinyin.as_str())
                     .copied()
                     .unwrap_or(0)
@@ -1961,12 +1975,12 @@ impl Dict {
             );
         }
         // 上下文召回：历史提交文本与当前输入读音匹配。
-        extra = extra.saturating_add(
+        *extra = extra.saturating_add(
             self.context_recall
                 .boost_for(c, self.current_input_reading.borrow().as_deref()),
         );
         // 离线片段：历史片段读音与当前输入读音匹配。
-        extra = extra.saturating_add(crate::lm::fragment_boost_for_reading(
+        *extra = extra.saturating_add(crate::lm::fragment_boost_for_reading(
             &self.fragment_cache.borrow(),
             self.current_input_reading.borrow().as_deref().unwrap_or(""),
             c,
@@ -1975,11 +1989,9 @@ impl Dict {
         // 与读音类证据不同，这条按**文本**匹配，与 CJK 关键词同现即加分。
         if let Some(tail) = self.context_tail.as_deref() {
             if !tail.is_empty() && tail.contains(c.text.as_str()) {
-                extra = extra.saturating_add(CONTEXT_BIGRAM_UNIT);
+                *extra = extra.saturating_add(CONTEXT_BIGRAM_UNIT);
             }
         }
-
-        boost.saturating_add(extra.min(CONTEXT_BOOST_CAP))
     }
 }
 
