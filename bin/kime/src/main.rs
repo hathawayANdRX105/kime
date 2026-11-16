@@ -552,8 +552,8 @@ fn legacy_main(argv: &[String]) -> ExitCode {
                 Ok(d) => match kime_core::lm::mine_gated(d.conn(), gate.as_ref()) {
                     Ok(st) => {
                         eprintln!(
-                            "mined: log {} rows, admitted {} pairs, tail_mined {} pairs, evicted {}, purged {}, gen {} in {:?}",
-                            st.log_rows, st.admitted, st.tail_mined, st.evicted, st.purged_rows,
+                            "mined: log {} rows, admitted {} pairs, tail_mined {} pairs, fragments_mined {}, evicted {}, purged {}, gen {} in {:?}",
+                            st.log_rows, st.admitted, st.tail_mined, st.fragments_mined, st.evicted, st.purged_rows,
                             st.generation, start.elapsed()
                         );
                         // 无 --jev 时不打印这行：无门控路径输出与合入前一致

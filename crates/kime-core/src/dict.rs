@@ -42,6 +42,16 @@ fn io_to_sqlite(e: std::io::Error) -> SqliteError {
 const USER_BOOST: u64 = 300_000;
 /// 提频半衰期（天）：连续 30 天不再使用，加成减半；60 天降到 1/4，回落语料位。
 const USER_BOOST_HALF_LIFE_DAYS: f64 = 30.0;
+/// 上下文加成上限：必须是 tie-breaker / 有限加成，不压过裸频。
+/// USER_BOOST=300_000（首次使用提频），上下文加成取其一半=150_000：
+/// 足以让等频/近频候选中「上下文相关」者排前，但不足以让低频历史词
+/// 无脑压过高频语料词（150k < 300k < 500k 语料词）。常量写在此处便于校准。
+const CONTEXT_BOOST_CAP: i64 = 150_000;
+/// 上下文召回条目上限：最近 64 条片段，内存占用极小（约数 KB）。
+/// 热路径在 `lm_boost` 内对条目做线性扫描（≤64 次 `&str` 比较，零分配），
+/// 对每键排序的 O(n log n) 比较来说属于常数级开销。
+const CONTEXT_RECALL_CAP: usize = 64;
+
 
 /// 「今天」= UNIX 纪元以来的天数。衰减窗口按天推进即可（半衰期本身 30 天粒度）。
 pub(crate) fn today_days() -> u64 {
@@ -96,6 +106,85 @@ pub struct Candidate {
     /// true = 来自 AI 预测（UI 标注用）
     pub ai: bool,
 }
+/// 轻量上下文召回条目：一条最近 kime 提交过的片段/句子及其读音。
+/// `hits` 记录被提交/召中的次数，用于给加成加权；被 CONTEXT_BOOST_CAP 封顶。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextEntry {
+    text: String,
+    /// 音节 `'` 连接（如 "gao'pin"），或 shell surrounding_text 本身（指纹语义）
+    reading: String,
+    hits: u64,
+}
+
+/// 轻量上下文召回结构：记录最近 kime 提交过的片段/句子及其读音。
+/// surrounding_text 只做召回线索，不写入 bigram。
+#[derive(Clone, Debug, Default)]
+struct ContextRecall {
+    entries: Vec<ContextEntry>,
+}
+
+impl ContextRecall {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// 记录一条已提交的片段/句子。同一文本+读音命中则刷新 hits 并前移；
+    /// 未命中则追加到头部，超过上限时丢弃尾部条目（LRU 风格）。
+    fn record(&mut self, text: &str, reading: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.text == text && e.reading == reading)
+        {
+            self.entries[pos].hits += 1;
+            let entry = self.entries.remove(pos);
+            self.entries.insert(0, entry);
+            return;
+        }
+        if self.entries.len() >= CONTEXT_RECALL_CAP {
+            self.entries.pop();
+        }
+        self.entries.insert(0, ContextEntry {
+            text: text.to_string(),
+            reading: reading.to_string(),
+            hits: 1,
+        });
+    }
+
+    /// 为候选计算上下文召回加成。
+    /// 当前输入读音是历史条目读音的前缀/后缀（或精确相等）时给予加成。
+    /// 加成随 hits 增大，但被 CONTEXT_BOOST_CAP 封顶，保持 tie-breaker 性质。
+    fn boost_for(&self, candidate: &Candidate, current_reading: Option<&str>) -> i64 {
+        let Some(current) = current_reading else { return 0 };
+        let mut best_hits: u64 = 0;
+        for entry in &self.entries {
+            if entry.text != candidate.text {
+                continue;
+            }
+            // 当前读音是条目读音的前缀或后缀（精确相等由两边均覆盖）
+            if entry.reading == current
+                || entry.reading.starts_with(current)
+                || entry.reading.ends_with(current)
+            {
+                best_hits = best_hits.max(entry.hits);
+            }
+        }
+        if best_hits > 0 {
+            (best_hits as i64 * 50_000).clamp(0, CONTEXT_BOOST_CAP)
+        } else {
+            0
+        }
+    }
+}
+
+/// 判断 `short` 是否为 `long` 的前缀或后缀（精确相等也算）。
+fn is_prefix_or_suffix(short: &str, long: &str) -> bool {
+    short == long || long.starts_with(short) || long.ends_with(short)
+}
+
 
 /// 内存排序索引条目，按 (pinyin ASC, freq DESC, text ASC) 排序；
 /// `eff` = 排序用有效频率（开库/learn 烘焙，比较器纯字段比较，热路径零哈希零 powf）
@@ -182,7 +271,18 @@ pub struct Dict {
     db_path: PathBuf,
     /// 后台词库写线程句柄（懒 spawn；队满丢 job，键路径零 SQLite 写）。
     writer: LearnWriter,
-}
+    /// 轻量上下文召回结构：最近 kime 提交的片段/句子 + shell surrounding_text 线索。
+    /// surrounding_text 只做召回，不写入 bigram（见 `record_context_tail`）。
+    context_recall: ContextRecall,
+    /// 当前输入读音（transient）。lookup 前由引擎设置，供 `lm_boost` 的上下文召回匹配用。
+    /// 单线程所有，无并发顾虑。未设置时召回加成为 0。
+    current_input_reading: Option<String>,
+    /// 离线片段缓存：由 `refresh_fragment_cache` 填充，供 `lm_boost` 的片段召回加成用。
+    /// 引擎在 lookup 前按当前读音刷新；未刷新时片段加成为 0。
+    fragment_cache: Vec<crate::lm::FragmentCandidate>,
+ }
+
+
 
 /// Helper to compute exclusive upper bound for prefix range query（与 `store::increment_prefix`
 /// 同语义：末字符 +1，`'z'` 进 `'{'`——只对小写字母串求上界，`'` 结尾进 `'a'`。
@@ -471,13 +571,44 @@ impl Dict {
                last_seen INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY(prev_id, next_id)
              );
-             CREATE INDEX IF NOT EXISTS idx_bigram_prev ON bigram(prev_id);
-             CREATE INDEX IF NOT EXISTS idx_bigram_last ON bigram(count, last_seen);
+             CREATE TABLE IF NOT EXISTS lm_fragment (
+               id        INTEGER PRIMARY KEY,
+               text      TEXT    NOT NULL,   -- 片段文本（整句或短语）
+               reading   TEXT    NOT NULL,   -- 整段读音，`'` 连接
+               count     INTEGER NOT NULL DEFAULT 1,
+               last_seen INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(text, reading)
+             );
+             -- lm_fragment 索引：按读音前缀查询片段召回；按 count/last_seen 老化淘汰。
+             CREATE INDEX IF NOT EXISTS idx_lm_fragment_reading ON lm_fragment(reading);
+             CREATE INDEX IF NOT EXISTS idx_lm_fragment_count ON lm_fragment(count, last_seen);
              ",
         )?;
         // 既有库缺列迁移（世代兼容）：旧 dict.sqlite3 的 commit_log 没有 tail_ctx，
         // CREATE TABLE IF NOT EXISTS 对既有表不补列，这里显式查列缺失则 ALTER；
         // 新建库已带列，整段 no-op。开库一次，无热路径开销。
+        // 既有库缺表迁移（世代兼容）：旧库没有 lm_fragment 表，
+        // CREATE TABLE IF NOT EXISTS 对新库 no-op，对旧库需显式建表。
+        let has_lm_fragment: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='lm_fragment'")?
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .map(|rows| rows.flatten().next().is_some())
+            .unwrap_or(false);
+        if !has_lm_fragment {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS lm_fragment (
+                  id        INTEGER PRIMARY KEY,
+                  text      TEXT    NOT NULL,
+                  reading   TEXT    NOT NULL,
+                  count     INTEGER NOT NULL DEFAULT 1,
+                  last_seen INTEGER NOT NULL DEFAULT 0,
+                  UNIQUE(text, reading)
+                );
+                 CREATE INDEX IF NOT EXISTS idx_lm_fragment_reading ON lm_fragment(reading);
+                 CREATE INDEX IF NOT EXISTS idx_lm_fragment_count ON lm_fragment(count, last_seen);
+                 ",
+            )?;
+        }
         {
             let has_tail_ctx: bool = conn
                 .prepare("PRAGMA table_info(commit_log)")?
@@ -589,6 +720,9 @@ impl Dict {
             lm_warned: false,
             db_path: path.to_path_buf(),
             writer: LearnWriter::default(),
+            context_recall: ContextRecall::new(),
+            current_input_reading: None,
+            fragment_cache: Vec::new(),
         })
     }
 
@@ -649,7 +783,7 @@ impl Dict {
             .iter()
             .map(Self::english_to_candidate)
             .collect();
-        out.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
+        out.sort_by(|a, b| self.cand_cmp(a, b));
         out.truncate(limit);
         let mut comps: Vec<Candidate> = self.english[start + exact_len..]
             .iter()
@@ -657,7 +791,7 @@ impl Dict {
             .map(Self::english_to_candidate)
             .collect();
         // ponytail: 整段重排（最坏 `a` 命中 ~4k 条，release 下几 µs）；哪天真嫌慢再换 top-k 堆。
-        comps.sort_by(|a, b| b.eff.cmp(&a.eff).then_with(|| a.text.cmp(&b.text)));
+        comps.sort_by(|a, b| self.cand_cmp(a, b));
         comps.truncate(limit - out.len());
         out.extend(comps);
         out
@@ -1537,6 +1671,10 @@ impl Dict {
         text: &str,
         tail: Option<&str>,
     ) {
+        // 实时 bigram + 上下文召回（当帧生效，零 SQLite 写）。
+        // 持久化（commit_log）由下方 persist_commit_log 独立完成。
+        self.commit_context_sync(ctx, reading, text);
+
         // 失败不阻塞上屏（输入法优先级），但不能静默：日志是离线挖掘唯一
         // 原材料，连失败会掏空排序质量。一次性告警（lm_warned 哨兵防刷屏
         // ——每键都打印会淹掉终端），且绝不 panic（见 warn_once）。
@@ -1555,7 +1693,6 @@ impl Dict {
             );
         }
     }
-
     /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
     ///
     /// 每次 learn 后由引擎调用。挖掘完成使世代号变化时自动重载缓存。
@@ -1603,19 +1740,106 @@ impl Dict {
                 .or_default()
                 .insert(row.1, row.2);
         }
+    /// 某 (text, reading) 的 LM 加成：词级 bigram 计数 + 上下文召回加成 + 离线片段加成。
+    /// 加成直接落排序比较，不碰 eff/导出频率。总和被 CONTEXT_BOOST_CAP 封顶，
+    /// 保持「频率为主、上下文为辅」的 tie-breaker 性质。
+    /// 热路径：两次 &str HashMap 查找 + ≤64 条上下文条目线性扫描 + 离线片段线性扫描，零分配。
+    pub fn lm_boost(&self, c: &Candidate) -> i64 {
+        let mut boost = 0i64;
+        // 1. 词级 bigram（lm_counts）：上次提交词的后继计数 × LM_BOOST_UNIT
+        if !self.lm_counts.is_empty() && !c.pinyin.is_empty() {
+            boost += self.lm_counts
+                .get(c.text.as_str())
+                .and_then(|m| m.get(c.pinyin.as_str()))
+                .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
+                .unwrap_or(0);
+        }
+        // 2. 上下文召回加成：历史片段/句子与当前输入读音匹配（前缀/后缀/相等）
+        boost += self.context_recall.boost_for(c, self.current_input_reading.as_deref());
+        // 3. 离线片段加成：历史片段读音与当前输入读音匹配（前缀/后缀/相等）
+        boost += crate::lm::fragment_boost_for_reading(
+            &self.fragment_cache,
+            self.current_input_reading.as_deref().unwrap_or(""),
+            c,
+        );
+        boost.clamp(0, CONTEXT_BOOST_CAP)
+    }
+    /// Commit 同步路径：把本次上屏词写入实时 bigram（lm_counts）与上下文召回结构，
+    /// 供 lm_boost 当帧生效。持久化（commit_log）由 `enqueue_log_commit` / `log_commit`
+    /// 独立完成，此处只改内存，零 SQLite 写，不阻塞上屏。
+    ///
+    /// 仅中文→中文写入 bigram（英文上下文不污染中文 bigram）；所有 kime 提交
+    /// 都记入上下文召回（中文参与 bigram 加成，英文只做历史片段召回）。
+    pub(crate) fn commit_context_sync(
+        &mut self,
+        prev: Option<(&str, &str)>,
+        reading: &[String],
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let current_reading = reading.join("'");
+
+        // 实时 bigram：prev_word → current_word，仅中文→中文
+        if !current_reading.is_empty() {
+            if let Some((prev_text, _prev_reading)) = prev {
+                let prev_is_cjk = prev_text.chars().next().map_or(false, is_cjk_char);
+                let cur_is_cjk = text.chars().next().map_or(false, is_cjk_char);
+                if prev_is_cjk && cur_is_cjk {
+                    self.lm_counts
+                        .entry(prev_text.to_string())
+                        .or_default()
+                        .entry(current_reading.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                }
+            }
+        }
+
+        // 上下文召回：所有 kime 提交都记录
+        self.context_recall.record(text, &current_reading);
     }
 
-    /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
-    /// 加成直接落排序比较，不碰 eff/导出频率。
-    /// 热路径：两次 &str HashMap 查找，零分配。
-    pub fn lm_boost(&self, c: &Candidate) -> i64 {
-        if self.lm_counts.is_empty() || c.pinyin.is_empty() {
-            return 0;
-        }
-        self.lm_counts
-            .get(c.text.as_str())
-            .and_then(|m| m.get(c.pinyin.as_str()))
-            .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
-            .unwrap_or(0)
+    /// 设置当前输入读音（transient），供 lm_boost 的上下文召回匹配用。
+    /// 引擎在 lookup_prefix / lookup_english 前调用；未设置时召回加成为 0。
+    pub(crate) fn set_current_input_reading(&mut self, reading: Option<&str>) {
+        self.current_input_reading = reading.map(str::to_string);
     }
+
+    /// 记录 shell surrounding_text 到上下文召回结构（仅做召回线索，不写入 bigram）。
+    pub(crate) fn record_context_tail(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // surrounding_text 没有读音，用文本本身作为读音（指纹语义）；
+        // 读音匹配时不会与拼音输入冲突（拼音 ≠ 汉字文本），仅用于 context_seed。
+        self.context_recall.record(text, text);
+    }
+
+    /// 在上下文召回结构中按文本查找条目，供 context_seed 使用。
+    pub(crate) fn context_recall_lookup(&self, text: &str) -> Option<(String, u64)> {
+        // (reading, hits)
+        self.context_recall
+            .entries
+            .iter()
+            .find(|e| e.text == text)
+            .map(|e| (e.reading.clone(), e.hits))
+        .map(|e| (e.reading.clone(), e.hits))
+    }
+
+    /// 刷新离线片段缓存：按当前输入读音查询 lm_fragment 表，供 `lm_boost` 的片段召回加成用。
+    /// 引擎在 lookup_prefix / lookup_english 前按当前 joined 读音调用；未刷新时片段加成为 0。
+    pub(crate) fn refresh_fragment_cache(&mut self, reading: &str) {
+        self.fragment_cache = crate::lm::query_fragments_by_reading(&self.conn, reading, 16)
+            .unwrap_or_default();
+    }
+
+}
+
+
+
+/// 单个字符是否为 CJK（用于判断中文上下文，避免英文污染中文 bigram）。
+fn is_cjk_char(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }

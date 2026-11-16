@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "description": "kime-typing-probe mock 按键脚本，供 runner 回放。",
+  "scripts": [
+    {
+      "sentence_id": "s1",
+      "lang": "zh",
+      "key_events": [
+        { "kind": "char", "ch": "w" },
+        { "kind": "char", "ch": "o" },
+        { "kind": "char", "ch": "m" },
+        { "kind": "char", "ch": "e" },
+        { "kind": "char", "ch": "n" },
+        { "kind": "space" }
+      ]
+    },
+    {
+      "sentence_id": "s2",
+      "lang": "en",
+      "key_events": [
+        { "kind": "char", "ch": "h" },
+        { "kind": "char", "ch": "e" },
+        { "kind": "char", "ch": "l" },
+        { "kind": "char", "ch": "l" },
+        { "kind": "char", "ch": "o" },
+        { "kind": "space" }
+      ]
+    },
+    {
+      "sentence_id": "s3",
+      "lang": "zh",
+      "key_events": [
+        { "kind": "char", "ch": "n" },
+        { "kind": "char", "ch": "i" },
+        { "kind": "char", "ch": "h" },
+        { "kind": "char", "ch": "a" },
+        { "kind": "char", "ch": "o" },
+        { "kind": "space" }
+      ]
+    },
+    {
+      "sentence_id": "s4",
+      "lang": "en",
+      "key_events": [
+        { "kind": "char", "ch": "w" },
+        { "kind": "char", "ch": "o" },
+        { "kind": "char", "ch": "r" },
+        { "kind": "char", "ch": "l" },
+        { "kind": "char", "ch": "d" },
+        { "kind": "space" }
+      ]
+    },
+    {
+      "sentence_id": "s5",
+      "lang": "zh",
+      "key_events": [
+        { "kind": "char", "ch": "b" },
+        { "kind": "char", "ch": "e" },
+        { "kind": "char", "ch": "i" },
+        { "kind": "char", "ch": "j" },
+        { "kind": "char", "ch": "i" },
+        { "kind": "char", "ch": "n" },
+        { "kind": "g" },
+        { "kind": "space" }
+      ]
+    }
+  ]
+}

@@ -330,6 +330,11 @@ impl Engine {
         self.context = tail;
         self.last_commit = None;
         self.dict.set_lm_context(None);
+        // surrounding_text 只做上下文召回线索，不写入 bigram（#2）；
+        // kime 自己的 Commit 才由 commit_context_sync 写 bigram。
+        if let Some(t) = &tail {
+            self.dict.record_context_tail(t);
+        }
     }
 
     /// 当前上下文尾巴（分词 / 排序的上下文输入），无上下文时 `None`。
@@ -1046,6 +1051,9 @@ impl Engine {
     fn learn_commit_word(&mut self, word: &str, reading: &[String], tail_ctx: Option<&str>) {
         let prev = self.last_commit.take();
         let tail = if prev.is_none() { tail_ctx } else { None };
+        // 实时 bigram + 上下文召回（当帧生效）。仅中文→中文写 bigram，
+        // 英文上下文不污染中文 bigram（#4）。
+        self.dict.commit_context_sync(prev, reading, word);
         self.dict.enqueue_log_commit(
             prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
             reading,
@@ -1053,11 +1061,14 @@ impl Engine {
             tail,
         );
         self.last_commit = Some((word.to_string(), reading.join("'")));
-        self.dict.set_lm_context(
-            self.last_commit
-                .as_ref()
-                .map(|(t, r)| (t.as_str(), r.as_str())),
-        );
+        // 仅中文提交设置 LM bigram 上下文，英文只做历史片段召回（#4）。
+        if word.chars().next().map_or(false, is_cjk) {
+            self.dict.set_lm_context(
+                self.last_commit
+                    .as_ref()
+                    .map(|(t, r)| (t.as_str(), r.as_str())),
+            );
+        }
         match self.dict.learn_mem(reading, word) {
             Ok(()) => self.dict.enqueue_learn(reading, word),
             Err(e) => {
@@ -1165,6 +1176,9 @@ impl Engine {
                     );
                     self.rebuild_preedit_display();
                     self.last_joined = sp_joined.clone();
+                    // 设置当前输入读音并刷新离线片段缓存，供 lm_boost 的上下文召回加成用。
+                    self.dict.set_current_input_reading(Some(&self.last_joined));
+                    self.dict.refresh_fragment_cache(&self.last_joined);
                     let mut cands = self
                         .dict
                         .lookup_prefix(&syllables, pending, self.config.candidate_limit)
@@ -1341,6 +1355,9 @@ impl Engine {
         if self.letters.len() < 2 {
             return;
         }
+        // 设置当前输入读音并刷新离线片段缓存，供 lm_boost 的上下文召回加成用。
+        self.dict.set_current_input_reading(Some(&self.letters));
+        self.dict.refresh_fragment_cache(&self.letters);
         let en = self
             .dict
             .lookup_english(&self.letters, self.config.candidate_limit);
@@ -1393,7 +1410,9 @@ impl Engine {
         self.preedit_display = format!("{}{}", self.pending_words.concat(), self.letters);
         self.rebuild_preedit_display();
         self.last_joined = joined_key(&reading, &tail);
-
+        // 设置当前输入读音并刷新离线片段缓存，供 lm_boost 的上下文召回加成用。
+        self.dict.set_current_input_reading(Some(&self.last_joined));
+        self.dict.refresh_fragment_cache(&self.last_joined);
         // 主路径查询（首切分，显示与层一契约以它为准）
         let mut cands: Vec<Candidate> = self
             .dict
