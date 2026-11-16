@@ -34,14 +34,11 @@ fn bigram_count(d: &Dict, prev: &str, next: &str) -> i64 {
 }
 
 /// 构造 boost 查询用的 Candidate（text + `'` 连接读音）。
+///
+/// 用模型层构造函数而非结构体字面量：候选的语言/层/来源是必填语义，缺省会让
+/// 测试构造出排序键不完整的候选。
 fn cand(text: &str, pinyin: &str) -> kime_core::dict::Candidate {
-    kime_core::dict::Candidate {
-        text: text.to_string(),
-        pinyin: pinyin.to_string(),
-        freq: 0,
-        eff: 0,
-        ai: false,
-    }
+    kime_core::dict::Candidate::zh(text, pinyin, 0, 0)
 }
 
 #[test]

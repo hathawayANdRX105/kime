@@ -16,7 +16,7 @@
 //! [`legacy_main`] 的手写解析。
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -297,23 +297,41 @@ fn dbg_builtin_scenario(name: &str) -> Vec<String> {
 ///   kime debug --scenario <commit-backspace|shift-mode|punct-idle-backspace>
 ///   kime debug tok1 tok2 ...            （自定义键序列）
 ///   cat keys.txt | kime debug           （每 token 一个，空白分隔）
+///   kime debug --dict <库> --full r u   （打印全部候选，不截断到 6 条）
+///   kime debug --dict <库> --json r u   （每键一行 JSON，供 agent/脚本消费）
+///
+/// `--full` 与 `--json` 是排查排序问题的主力：默认只打印前 6 条，看不出
+/// 「中文候选是否整体在英文之前」这类跨块结论；JSON 让自动化脚本按字段断言，
+/// 不必解析给人看的排版。
 fn handle_debug_cmd(args: &[String]) -> ExitCode {
     let mut dict_path: Option<PathBuf> = None;
     let mut scenario: Option<String> = None;
+    let mut corpus: Option<PathBuf> = None;
     let mut tokens: Vec<String> = Vec::new();
+    let mut full = false;
+    let mut json = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dict" => dict_path = it.next().map(PathBuf::from),
             "--scenario" => scenario = it.next().cloned(),
+            "--corpus" => corpus = it.next().map(PathBuf::from),
+            "--full" => full = true,
+            "--json" => json = true,
             other => tokens.push(other.to_string()),
         }
+    }
+    // 语料模式：按文件里的 (mode, keys, expect) 逐条回放，独立于 token 序列。
+    // 存在的理由：排查排序问题时「改前跑一次、改后跑一次」必须是一条命令，
+    // 而不是让 agent 手写按键序列再自己比对输出。
+    if let Some(path) = corpus {
+        return run_corpus(&path, dict_path.as_deref());
     }
     if let Some(name) = &scenario {
         tokens = dbg_builtin_scenario(name);
     }
     if tokens.is_empty() {
-        eprintln!("no tokens: pass key tokens or --scenario; 见 --help");
+        eprintln!("no tokens: pass key tokens or --scenario/--corpus; 见 --help");
         return ExitCode::from(2);
     }
 
@@ -373,7 +391,48 @@ fn handle_debug_cmd(args: &[String]) -> ExitCode {
     for (i, tok) in tokens.iter().enumerate() {
         let outcome = engine.key(dbg_token_to_key(tok));
         let cands: Vec<String> = engine.candidates().iter().map(|c| c.text.clone()).collect();
-        let preview = cands.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
+        if json {
+            // 机器可读：一行一键，字段固定。agent/脚本按 cands 数组断言相对顺序，
+            // 不依赖人读排版。lang/layer 一起输出——排序问题的结论往往是
+            // 「某个英文词排到了中文候选中间」，只有文本看不出来，带层与语言才看得见。
+            // lang/layer 走 {:?}（枚举 Debug 输出是合法 JSON 字符串字面量：Zh/Exact），
+            // outcome 是结构体变体，必须显式 json_str 包一层——否则输出
+            // "outcome":Consumed 不是合法 JSON，脚本解析直接失败。
+            let items: Vec<String> = engine
+                .candidates()
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"text\":{},\"lang\":{},\"layer\":{},\"eff\":{}}}",
+                        json_str(&c.text),
+                        json_str(&format!("{:?}", c.lang)),
+                        json_str(&format!("{:?}", c.layer)),
+                        c.eff
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"i\":{},\"tok\":{},\"outcome\":{},\"mode\":{},\"preedit\":{},\"cands\":[{}]}}",
+                i + 1,
+                json_str(tok),
+                json_str(&format!("{outcome:?}")),
+                json_str(if engine.chinese() { "zh" } else { "en" }),
+                json_str(engine.preedit()),
+                items.join(",")
+            );
+            continue;
+        }
+        let shown = if full {
+            cands.len()
+        } else {
+            cands.len().min(6)
+        };
+        let preview = cands
+            .iter()
+            .take(shown)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         println!(
             "[{:>2}] {:<10} => {:?} | mode={} preedit={:?} cands[{}]= {} undo={}",
             i + 1,
@@ -387,6 +446,184 @@ fn handle_debug_cmd(args: &[String]) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// 最小 JSON 字符串转义（候选文本可能含引号/反斜杠/控制字符）。
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 语料回放：按文件里的 (mode, keys, expect) 逐条喂键、校验断言。
+///
+/// 引擎按 mode 缓存（同一 mode 复用，每条用例前用 ESC 清空组合），因为开一次
+/// 真实词库要几百毫秒——每条用例都重开会让语料跑不起来。用例之间不共享学习状态：
+/// 语料里没有上屏键，ESC 只清组合不写任何表。
+///
+/// 失败时打印实际候选表——排查时最需要的信息就是「实际顺序是什么」。任一用例
+/// 失败 → 退出码 1，因此可以直接当 agent/CI 的验收命令。
+fn run_corpus(path: &Path, dict_path: Option<&Path>) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("failed to read corpus {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    // 每种 mode 一个引擎（懒建）；dict_path 为 None 时用内存库，只适合解析自检。
+    let mut engines: Vec<(Option<Scheme>, Engine)> = Vec::new();
+    let mut failures = 0usize;
+    let mut total = 0usize;
+
+    for (i, raw) in text.lines().enumerate() {
+        let row = raw.trim();
+        if row.is_empty() || row.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = row.split('\t').collect();
+        if cols.len() != 3 {
+            eprintln!("corpus 第 {} 行必须正好 3 列：{row:?}", i + 1);
+            failures += 1;
+            continue;
+        }
+        let Some(shuangpin) = dbg_parse_mode(cols[0]) else {
+            eprintln!("corpus 第 {} 行：未知模式 {:?}", i + 1, cols[0]);
+            failures += 1;
+            continue;
+        };
+        total += 1;
+
+        let slot = match engines.iter().position(|(m, _)| *m == shuangpin) {
+            Some(idx) => idx,
+            None => {
+                let dict = match dbg_open_dict(dict_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let mut config = Config::load();
+                config.shuangpin = shuangpin;
+                engines.push((shuangpin, Engine::new(dict, config)));
+                engines.len() - 1
+            }
+        };
+        let engine = &mut engines[slot].1;
+        // 用例之间清空组合：ESC 只清当前输入，不落任何学习记录。
+        // 循环条件看 preedit 而不是 undo_depth——undo_depth 统计的是撤销栈，
+        // 组合非空时它仍可能是 0，用它当次数会一次都不清（实测串味）。
+        for _ in 0..8 {
+            if engine.preedit().is_empty() && engine.candidates().is_empty() {
+                break;
+            }
+            engine.key(dbg_token_to_key("ESC"));
+        }
+        let cands = dbg_feed(engine, cols[1]);
+        match dbg_check(cols[2], &cands) {
+            Ok(()) => println!(
+                "PASS  {:<22} keys={:<10} cands={}",
+                cols[0],
+                cols[1],
+                cands.len()
+            ),
+            Err(e) => {
+                failures += 1;
+                let shown: Vec<&str> = cands.iter().take(24).map(String::as_str).collect();
+                println!(
+                    "FAIL  {:<22} keys={:<10} {e}\n      实际候选[{}] = {:?}",
+                    cols[0],
+                    cols[1],
+                    cands.len(),
+                    shown
+                );
+            }
+        }
+    }
+    if total == 0 {
+        eprintln!("corpus 里没有可执行用例：{}", path.display());
+        return ExitCode::from(2);
+    }
+    println!("corpus: {total} 条，失败 {failures} 条");
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// 打开词库：给定路径则开它，否则开一个内存库（语料只做解析自检时用）。
+fn dbg_open_dict(dict_path: Option<&Path>) -> Result<Dict, String> {
+    match dict_path {
+        Some(p) => Dict::open(p).map_err(|e| format!("failed to open dict {}: {e}", p.display())),
+        None => Dict::open(":memory:").map_err(|e| format!("failed to open temp dict: {e}")),
+    }
+}
+
+/// 语料模式列 → 双拼方案（`None` = 全拼）。
+fn dbg_parse_mode(raw: &str) -> Option<Option<Scheme>> {
+    match raw {
+        "full" => Some(None),
+        other => other
+            .strip_prefix("shuangpin:")
+            .and_then(|name| match name {
+                "ziranma" => Some(Scheme::Ziranma),
+                "xiaohe" => Some(Scheme::Xiaohe),
+                _ => None,
+            })
+            .map(Some),
+    }
+}
+
+/// 喂一串字符键，返回最后一次按键后的候选文本。
+fn dbg_feed(engine: &mut Engine, keys: &str) -> Vec<String> {
+    let mut last = Vec::new();
+    for c in keys.chars() {
+        engine.key(dbg_token_to_key(&c.to_string()));
+        last = engine.candidates().iter().map(|c| c.text.clone()).collect();
+    }
+    last
+}
+
+/// 校验一条断言（语法与 `debug_corpus_test.rs` 一致）。
+fn dbg_check(expect: &str, cands: &[String]) -> Result<(), String> {
+    let pos = |t: &str| cands.iter().position(|c| c == t);
+    for raw in expect.split(';').filter(|s| !s.trim().is_empty()) {
+        if let Some(v) = raw.strip_prefix("first=") {
+            if cands.first().map(String::as_str) != Some(v) {
+                return Err(format!("首候选应为 {v:?}，实际 {:?}", cands.first()));
+            }
+        } else if let Some(v) = raw.strip_prefix("has=") {
+            if pos(v).is_none() {
+                return Err(format!("候选里缺少 {v:?}"));
+            }
+        } else if let Some(v) = raw.strip_prefix("absent=") {
+            if pos(v).is_some() {
+                return Err(format!("候选里不该出现 {v:?}"));
+            }
+        } else if let Some((l, r)) = raw.split_once('<') {
+            match (pos(l), pos(r)) {
+                (Some(a), Some(b)) if a < b => {}
+                (a, b) => return Err(format!("{l:?} 必须在 {r:?} 之前，实际 左={a:?} 右={b:?}")),
+            }
+        } else {
+            return Err(format!("无法解析断言 {raw:?}"));
+        }
+    }
+    Ok(())
 }
 
 /// 配置文件路径：`$KIME_CONFIG_PATH` 优先，否则 `~/.config/kime/config.toml`。
@@ -511,6 +748,10 @@ fn legacy_main(argv: &[String]) -> ExitCode {
         Some("debug") => {
             let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
             return handle_debug_cmd(&sub_args);
+        }
+        Some("typing") => {
+            let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
+            return handle_typing_cmd(&sub_args);
         }
         Some("mine-lm") => {
             let mut dict_path: Option<PathBuf> = None;
@@ -767,4 +1008,114 @@ fn legacy_main(argv: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `kime typing <文本文件>` —— 打字语料回放：逐词统计候选名次并落一份 markdown 报告。
+///
+///   kime typing <file> [--dict <库>] [--out <报告.md>] [--limit N] [--json]
+///                   [--mode full|ziranma|xiaohe]
+///
+/// 为什么单独做一个命令：候选顺序的回归测试用的是短串 fixture，而用户抱怨的是
+/// 「打一整段话时顺序不对」。这个命令把整段文本当成一次连续输入跑，产出可持久化
+/// 的数字，让改前/改后能对照。
+fn handle_typing_cmd(args: &[String]) -> ExitCode {
+    let mut dict_path: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut limit: usize = 40;
+    let mut json = false;
+    // `None` = 全拼（语料里的键是拼音字母）；`Some(scheme)` = 双拼。
+    // 用单层 Option，避免「解析失败」与「合法的全拼」挤在同一个类型里。
+    let mut mode: Option<kime_core::Scheme> = None;
+    let mut inputs: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dict" => dict_path = it.next().map(PathBuf::from),
+            "--out" => out = it.next().map(PathBuf::from),
+            "--limit" => limit = it.next().and_then(|s| s.parse().ok()).unwrap_or(40),
+            "--json" => json = true,
+            "--mode" => match it.next().map(|m| m.to_ascii_lowercase()).as_deref() {
+                Some("full") | None => mode = None,
+                Some("ziranma") => mode = Some(kime_core::Scheme::Ziranma),
+                Some("xiaohe") => mode = Some(kime_core::Scheme::Xiaohe),
+                Some(other) => {
+                    eprintln!("--mode 只支持 full | ziranma | xiaohe（收到 {other:?}）");
+                    return ExitCode::from(2);
+                }
+            },
+            other => inputs.push(other.to_string()),
+        }
+    }
+    if inputs.is_empty() {
+        eprintln!("no input file: kime typing <file> [--dict <库>] [--out <报告.md>]");
+        return ExitCode::from(2);
+    }
+    let path = dict_path.unwrap_or_else(default_dict_path);
+    let mut failures = 0usize;
+    for file in &inputs {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to read {file}: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        // 每个文件重开一次词库：Dict 不是 Clone（持有 SQLite 连接），
+        // 而 typing::run 会消费它来建引擎。少量文件 = 少量开库，可接受。
+        let dict = match Dict::open(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("failed to open dict {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
+        };
+        // 语料里的键是**拼音字母**，因此默认按全拼回放；用户配置里的双拼
+        // 不继承——否则同一份语料在双拼用户机器上会被解码成别的音节
+        // （实测 "jin" 被解成 ji+n，候选全是 技能/继续 之类）。
+        let mut config = Config::load();
+        config.shuangpin = mode;
+        let report = kime_core::typing::run(dict, config, &text);
+        if json {
+            let rows: Vec<String> = report
+                .cases
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"text\":{},\"lang\":{:?},\"keys\":{},\"rank\":{},\"cands\":{}}}",
+                        json_str(&c.text),
+                        c.lang,
+                        json_str(&c.keys),
+                        c.rank
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "null".into()),
+                        c.cands
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"file\":{},\"summary\":{},\"cases\":[{}]}}",
+                json_str(file),
+                json_str(&report.summary()),
+                rows.join(",")
+            );
+        } else {
+            let md = kime_core::typing::render_markdown(file, &report, limit);
+            print!("{md}");
+            if let Some(p) = &out {
+                match std::fs::write(p, &md) {
+                    Ok(()) => println!("报告已写入 {}", p.display()),
+                    Err(e) => {
+                        eprintln!("failed to write {}: {e}", p.display());
+                        failures += 1;
+                    }
+                }
+            }
+        }
+    }
+    if failures > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

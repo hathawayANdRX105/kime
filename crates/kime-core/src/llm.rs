@@ -3,7 +3,7 @@
 //! 拼音切分后异步请求 LLM（OpenAI 兼容），debounce 200ms，
 //! 结果经 `Engine::merge_ai` 回流主线程。
 
-use crate::dict::Candidate;
+use crate::model::{Candidate, SourceKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -170,12 +170,11 @@ fn build_prompt(syllables: &[String], context: Option<&str>) -> String {
 pub fn parse_candidates(text: &str, syllables: &[String]) -> Vec<Candidate> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| Candidate {
-            text: l.trim().to_string(),
-            pinyin: syllables.join("'"),
-            freq: 1,
-            eff: 1,
-            ai: true,
+        .map(|l| {
+            // AI 候选：来源标记为 Ai，层与语言由 engine 的合入口决定（AI 只追加到列表
+            // 末尾，不参与主排序），这里给读音键与最小可用分数。
+            Candidate::zh(l.trim().to_string(), syllables.join("'"), 1, 1)
+                .with_source(SourceKind::Ai)
         })
         .take(3)
         .collect()

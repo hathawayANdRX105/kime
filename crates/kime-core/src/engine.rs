@@ -13,7 +13,9 @@ use crate::context::append_tail;
 use crate::dict::{Candidate, Dict};
 use crate::lattice::Seed;
 use crate::lm::segment_output_text;
+use crate::model::{Lang, Layer, SourceKind};
 use crate::punct;
+use crate::rank;
 use kime_pinyin::segment;
 use std::io::Write;
 
@@ -451,7 +453,16 @@ impl Engine {
         // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；
         // 双拼按键位消耗（见 doc）。
         let old_len = self.letters.len();
-        let remaining = if self.sp_active {
+        // 英文候选的读音键就是词本身，与「音节序列」不是同一种东西：
+        // lookup_english 按**原始按键串**匹配（精确或前缀），所以被选中的英文词
+        // 覆盖了全部已敲字母 —— 整段消耗，面板随之关闭。
+        //
+        // 不这么处理的后果（实测）：双拼下 `skill` 的 consumed 被当成 1 个音节，
+        // 只吃掉 2 键，剩下 `chail` 继续留在组合里，空格选完面板不退出，
+        // 下一次上屏变成「skill拆历来」这种拼接串。
+        let remaining = if cand.lang == Lang::En {
+            String::new()
+        } else if self.sp_active {
             let k = consumed.len();
             let cut = 2 * k;
             if cut >= self.letters.len() {
@@ -1177,42 +1188,7 @@ impl Engine {
                     // 与 pending 的声母前缀是**两种不同意图**（末键在码表里身兼声母位
                     // 与韵母位）：两类都查、都给候选，查完**按频率统一重排**——
                     // 各批内部有序、批间无序，不重排就变成「先查的意图恒在前」。
-                    if !half_key_syls.is_empty() {
-                        let mut seen: std::collections::HashSet<String> =
-                            cands.iter().map(|c| c.text.clone()).collect();
-                        let mut completions: Vec<Candidate> = Vec::new();
-                        // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p
-                        // 有 18 个），取太多会让第一个音节独占整页。
-                        //
-                        // **不按累计条数早退**：早退会让排在后面的音节永远查不到
-                        // （自然码 p 的 un 系里 lun 排第 8，累计到上限时正好错过，
-                        // 用户按 p 就看不到「论」）。音节数有界（≤26），全部查完
-                        // 的成本是几十次内存查询，可接受。
-                        let per_syllable = (self.config.candidate_limit / 8).max(2);
-                        for s in &half_key_syls {
-                            let mut r = syllables.clone();
-                            r.push((*s).to_string());
-                            if let Ok(mut vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
-                                vc.retain(|c| seen.insert(c.text.clone()));
-                                completions.extend(vc);
-                            }
-                        }
-                        // 补全候选 + 原前缀结果，**按频率统一重排**：两类意图的
-                        // 候选分属多次查询，批间无序，不重排就变成「先枚举的意图
-                        // 恒在前」（自然码 p 的声母位 pa/pai… 会把韵母位
-                        // lun/jun… 整批压到后面，而用户按 p 想要的恰恰可能是
-                        // lun/jun）。排序口径与 Dict::cand_cmp 一致：eff +
-                        // lm_boost 降序，同频按文本升序。
-                        let mut merged = completions;
-                        merged.extend(cands);
-                        merged.sort_by(|a, b| {
-                            let ka = a.eff as i64 + self.dict.lm_boost(a);
-                            let kb = b.eff as i64 + self.dict.lm_boost(b);
-                            kb.cmp(&ka).then_with(|| a.text.cmp(&b.text))
-                        });
-                        merged.truncate(self.config.candidate_limit);
-                        cands = merged;
-                    }
+                    self.merge_half_key_intents(&mut cands, &syllables, &half_key_syls);
                     self.candidates = cands;
                     if self.candidates.is_empty() {
                         if let Ok(ab) = self
@@ -1333,36 +1309,84 @@ impl Engine {
     /// 所以双拼/全拼下行为一致。两个字母起才查，免得单字母把 `a/AA/an` 之类的英文噪声
     /// 灌进每一次按键。
     ///
-    /// 落位（用户裁定）：英文精确命中（key 等于原始输入，大小写不敏感）插到中文层一
-    /// 精确块之后、中文补全块之前；英文前缀补全仍整体挂列表末尾。块内“精确在前、
-    /// 补全在后”不变，单字母噪声闸不变；中文层一「精确命中优先于补全」的内部规则
-    /// 完全不受影响。
+    /// 落位由**分数**决定，不再由「中文块在前」这条约定决定：候选自携 [`Lang`] 与
+    /// [`Layer`]，跨语言时排序键只比校准后的分数（[`crate::rank::ScoreScale`]）。
+    /// 于是「中文『如果』压过英文 `rug`」是因为它分数更高，而不是因为中文被强制排前；
+    /// 高频英文词同样能压过低频中文词。
+    ///
+    /// 这里合并后统一重排：中英文各自内部本来有序，但跨语言交错必须重新比较。
+    /// 首音节单字（[`Layer::Append`]）不参与重排——见 [`Engine::sort_candidates`]。
     fn merge_english(&mut self) {
-        if self.letters.len() < 2 {
+        if self.letters.len() >= 2 {
+            let en = self
+                .dict
+                .lookup_english(&self.letters, self.config.candidate_limit);
+            self.candidates.extend(en);
+        }
+        self.sort_candidates();
+    }
+
+    /// 跨语言合并：中英文候选按同一排序键重排，中英文混合顺序由分数决定。
+    ///
+    /// 为什么必须**整表按 RankKey 排序**，而不是「两段有序 run 的归并」：
+    /// 候选列表不是单一有序 run——它是按查询批次拼起来的（精确块 → 补全块 →
+    /// 句子 → 模糊音/纠错/多切分追加）。若假设「中文段已按分数有序」再与英文段做
+    /// 双指针归并，只要英文段首元素的分数落在中文第一、第二条之间，整段英文
+    /// （含补全词）就会插到中文精确命中之前——正是本次要修的 bug 形态。
+    ///
+    /// 所以直接对「非 Append 候选」整体按 [`rank::Ranker::compare`] 排序
+    /// （层 → 分数 → 文本 → 来源），再写回它们原来的槽位：
+    ///
+    /// - 层在分数之前 ⇒ 精确块恒在补全块之前，跨语言竞争只发生在同层之内；
+    /// - `Layer::Append`（首音节单字 / AI 候选）**不参与**排序、原槽位不动——
+    ///   它们的落点本身携带 #87 的交错结果，重排会把它们按层号推到末尾。
+    ///
+    /// 实现上只搬移不克隆：先把非 Append 候选 `take` 出来排序，再按槽位回填，
+    /// 热路径每键一次，不产生逐候选的 String 拷贝。
+    fn sort_candidates(&mut self) {
+        let ranker = self.dict.ranker();
+        // 只有「中英文同时在场」才需要重排：单一语言的列表由查询管道拼装，
+        // 其顺序（精确块 → 句子 → 补全 → 模糊音/纠错追加）本身就是契约，
+        // 无条件重排会把它打散（实测：撤销/退格/部分选词等 6 个用例因此回归）。
+        let mut has_zh = false;
+        let mut has_en = false;
+        let mut slots: Vec<usize> = Vec::new();
+        for (i, c) in self.candidates.iter().enumerate() {
+            if rank::is_append(c) {
+                continue;
+            }
+            slots.push(i);
+            match c.lang {
+                Lang::Zh => has_zh = true,
+                Lang::En => has_en = true,
+            }
+        }
+        if !has_zh || !has_en {
             return;
         }
-        let en = self
-            .dict
-            .lookup_english(&self.letters, self.config.candidate_limit);
-        if en.is_empty() {
-            return;
+        if slots.len() < 2 {
+            return; // 0 或 1 个待排候选：顺序已经是对的
         }
-        // lookup_english 已按「精确块 → 补全块」返回；pinyin 存的是词本身，用
-        // 大小写不敏感比对拆成精确与补全两段。
-        let (exact, comps): (Vec<Candidate>, Vec<Candidate>) = en
-            .into_iter()
-            .partition(|c| c.pinyin.eq_ignore_ascii_case(&self.letters));
-        // 插入点 = 中文层一精确块末尾（精确词条 pinyin 恒等于查词键 last_joined），
-        // 即「中文精确之后、中文补全之前」；逐条 insert 保持精确段内部先后。
-        let l1_end = self
-            .candidates
-            .iter()
-            .take_while(|c| c.pinyin == self.last_joined)
-            .count();
-        for (i, c) in exact.into_iter().enumerate() {
-            self.candidates.insert(l1_end + i, c);
+        let mut pool: Vec<Option<Candidate>> = self.candidates.drain(..).map(Some).collect();
+        let mut picked: Vec<Candidate> = Vec::with_capacity(slots.len());
+        for &i in &slots {
+            if let Some(c) = pool[i].take() {
+                picked.push(c);
+            }
         }
-        self.candidates.extend(comps);
+        ranker.sort(&mut picked);
+        let mut picked = picked.into_iter();
+        let mut out: Vec<Candidate> = Vec::with_capacity(pool.len());
+        for slot in pool.iter_mut() {
+            match slot.take() {
+                Some(c) => out.push(c), // Append 槽位：原样保留
+                None => match picked.next() {
+                    Some(c) => out.push(c),
+                    None => break,
+                },
+            }
+        }
+        self.candidates = out;
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。
@@ -1403,18 +1427,18 @@ impl Engine {
         // 模糊音变体：对完整音节与尾部半截串做「首（声母）/尾（韵母）替换」，
         // 每处替换独立成一路查询，结果按文本去重合并。fuzzy_map 为空时整块跳过。
         if !self.fuzzy_map.is_empty() {
-            let mut seen: std::collections::HashSet<String> =
-                cands.iter().map(|c| c.text.clone()).collect();
+            // 跨批去重集合由排序内核提供（`rank::Seen`）：各模糊音变体共享同一份
+            // 记录，首切分的结果先占位，变体只能补新文本。
+            let mut seen = rank::Seen::of(&cands);
             let push_variant = |reading: &[String],
                                 tail: &str,
-                                seen: &mut std::collections::HashSet<String>,
+                                seen: &mut rank::Seen,
                                 cands: &mut Vec<Candidate>| {
-                if let Ok(mut vc) =
-                    self.dict
-                        .lookup_prefix(reading, tail, self.config.candidate_limit)
+                if let Ok(vc) = self
+                    .dict
+                    .lookup_prefix(reading, tail, self.config.candidate_limit)
                 {
-                    vc.retain(|c| seen.insert(c.text.clone()));
-                    cands.extend(vc);
+                    rank::append_unique(cands, vc, seen);
                 }
             };
             // 完整音节变体
@@ -1443,24 +1467,13 @@ impl Engine {
         // （≤12 字母实测 2–4 条，Fibonacci 级），每条同样带 candidate_limit 查询；
         // 结果按文本去重后**续在首切分之后**——首切分总序零变化（preedit/层一/英文
         // 层一的落位契约都不受影响），重复文本保留频率更高的出现。
-        let mut seen_at: std::collections::HashMap<String, usize> = cands
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.text.clone(), i))
-            .collect();
+        // 多切分合并走 `rank::merge_unique(HighestEff)`：位置以首切分为准，同文本
+        // 保留频率更高的出现（与旧实现等价，但去重口径只剩一处定义）。
         for extra in segs.iter().skip(1) {
             let mut r = extra.clone();
             let t = r.pop().unwrap_or_default();
             if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
-                for c in vc {
-                    match seen_at.get(&c.text).copied() {
-                        Some(i) => cands[i].freq = cands[i].freq.max(c.freq),
-                        None => {
-                            seen_at.insert(c.text.clone(), cands.len());
-                            cands.push(c);
-                        }
-                    }
-                }
+                cands = rank::merge_unique(&self.dict.ranker(), cands, vc, rank::Dedup::HighestEff);
             }
         }
         // 邻键纠错：直查（主路径/模糊/多切分）候选不足时，对按键串生成编辑距离 1
@@ -1475,8 +1488,9 @@ impl Engine {
             && self.letters.len() <= crate::correction::MAX_CORRECTION_INPUT
             && cands.len() < crate::correction::CORRECTION_TRIGGER_MIN
         {
-            let mut corrected_seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            // 纠错批次内先到先得 + 不与已有候选重复：同一个 `rank::Seen` 承担两件事
+            // （旧实现用 `corrected_seen` + `seen_at` 两个容器表达同一意图）。
+            let mut corrected_seen = rank::Seen::of(&cands);
             let baseline = segs.first().cloned().unwrap_or_default();
             let mut variants = crate::correction::corrected_keys(&self.letters);
             // 替换/转位在前、缺字母插入在后：插入是更大偏离，纠错候选
@@ -1498,12 +1512,7 @@ impl Engine {
                 let mut r = full;
                 let t = r.pop().unwrap_or_default();
                 if let Ok(vc) = self.dict.lookup_prefix(&r, &t, self.config.candidate_limit) {
-                    for c in vc {
-                        if corrected_seen.insert(c.text.clone()) && !seen_at.contains_key(&c.text) {
-                            seen_at.insert(c.text.clone(), cands.len());
-                            cands.push(c);
-                        }
-                    }
+                    rank::append_unique(&mut cands, vc, &mut corrected_seen);
                 }
                 if cands.len() >= self.config.candidate_limit {
                     break;
@@ -1565,17 +1574,25 @@ impl Engine {
             // 前提：切分数有界（实测 ≤12 字母 2–4 条，Fibonacci 级），组句调用
             // 次数 = 合格切分数，同一 SpanCache 复用跨切分共有的跨度查词；故不为
             // 无限切分做额外防御。
-            let mut seen: std::collections::HashSet<String> =
-                cands.iter().map(|c| c.text.clone()).collect();
+            let mut seen = rank::Seen::of(&cands);
             for extra in rest {
-                let mut extra_sents = crate::lattice::viterbi_sentences_seeded(
+                let extra_sents = crate::lattice::viterbi_sentences_seeded(
                     &self.dict,
                     extra,
                     seed.clone(),
                     &mut self.span_cache,
                 );
-                extra_sents.retain(|s| seen.insert(s.text.clone()));
-                cands.extend(extra_sents);
+                // 次切分的句标记为 `Layer::Tail`：它们只能落在列表尾，
+                // 不得越过首切分的句（层 `SentenceCovers`）与层一精确命中。
+                // 不设层的后果是它们以默认精确层参与排序，高频次切分句会反超首切分句。
+                let extra_sents: Vec<Candidate> = extra_sents
+                    .into_iter()
+                    .map(|mut c| {
+                        c.layer = Layer::Tail;
+                        c
+                    })
+                    .collect();
+                rank::append_unique(&mut cands, extra_sents, &mut seen);
             }
         }
         // 缺陷 A 回退：主路径/模糊/多切分/纠错/缩写/整句全空时砍末音节逐档重查。
@@ -1619,6 +1636,51 @@ impl Engine {
         self.candidates = cands;
     }
 
+    /// 双拼末键的**韵母位补全**：末键作韵母位能拼出的完整音节，逐个作为已完成的
+    /// 末音节补查，与「声母位 + 半截键」的查询结果合并。
+    ///
+    /// 两种意图统一标成 [`Layer::Completion`]：它们来自两次不同查询，层号之间没有
+    /// 可比性；若各自保留原层，「韵母位查询的精确命中」会凭层号压过「声母位查询的
+    /// 补全命中」，而用户按 u（sh 声母键）要的恰恰是 sh 系。半截键本身就是「还没
+    /// 打完」的状态，两种解释都属于补全，因此同层才是正确语义。
+    fn merge_half_key_intents(
+        &self,
+        cands: &mut Vec<Candidate>,
+        syllables: &[String],
+        half_key_syls: &[&str],
+    ) {
+        if half_key_syls.is_empty() {
+            return;
+        }
+        // 跨批去重集合由排序内核提供（`rank::Seen`）：韵母位各音节共享同一份记录，
+        // 先到先得。
+        let mut seen = rank::Seen::of(cands.iter());
+        let mut completions: Vec<Candidate> = Vec::new();
+        // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p 有 18 个），
+        // 取太多会让第一个音节独占整页。
+        //
+        // **不按累计条数早退**：早退会让排在后面的音节永远查不到（自然码 p 的 un 系里
+        // lun 排第 8，累计到上限时正好错过，用户按 p 就看不到「论」）。音节数有界
+        // （≤26），全部查完的成本是几十次内存查询，可接受。
+        let per_syllable = (self.config.candidate_limit / 8).max(2);
+        for s in half_key_syls {
+            let mut r = syllables.to_vec();
+            r.push((*s).to_string());
+            if let Ok(vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
+                rank::append_unique(&mut completions, vc, &mut seen);
+            }
+        }
+        let ranker = self.dict.ranker();
+        let mut merged = completions;
+        merged.append(cands);
+        for c in &mut merged {
+            c.layer = Layer::Completion;
+        }
+        ranker.sort_within_batch(&mut merged);
+        merged.truncate(self.config.candidate_limit);
+        *cands = merged;
+    }
+
     /// 缺陷 A：整串无词条、补全/缩写/Viterbi 全都拼不出候选时的最后一道回退——
     /// 砍掉末音节逐档重查（`[..n-1]` → `[..1]`），取第一个非空结果返回。
     /// 用户至少能看到首音节的字/词可选；`preedit` / `last_reading` / `last_joined`
@@ -1637,7 +1699,14 @@ impl Engine {
                 .lookup_prefix(&syllables[..k], "", self.config.candidate_limit)
                 .unwrap_or_default();
             if !cands.is_empty() {
-                return Some(cands);
+                // 回退候选标记为兜底层：整串无词条时才出现，层号保证它们不会插到
+                // 正常候选之前（回退是「列表非空」的最后手段，不是排名选手）。
+                return Some(
+                    cands
+                        .into_iter()
+                        .map(|c| c.with_layer(Layer::Fallback))
+                        .collect(),
+                );
             }
         }
         None
@@ -1672,15 +1741,17 @@ impl Engine {
         let Ok(mut extra) = dict.lookup_prefix(&syllables[..1], "", limit) else {
             return;
         };
-        extra.retain(|c| !cands.iter().any(|o| o.text == c.text));
+        // 追加池不得与主列表重复：去重口径由排序内核统一提供。
+        rank::retain_unseen(&mut extra, &mut rank::Seen::of(cands.iter()));
         if extra.is_empty() {
             return;
         }
         // 保护首段：整串全覆盖的候选（整句 / 精确词）置顶，单字不得越过。
-        // has_pending 时保护键需覆盖组合词区间——半截键场景 syllables 是
-        // 完整音节、组合词 pinyin "bian'hua" 与精确键 "bian" 不匹配；
-        // 用 `full_joined + "'"` 前缀保护这些消耗了 pending 音节的组合词，
-        // 否则单字（边 244 万）会把组合词（变化 50 万）压到首屏之外。
+        //
+        // 「覆盖完整输入」是关于**读音**的性质（读音键等于整串，半截键时等于
+        // 整串 + "'" 前缀），不是关于层的性质——模糊音/纠错变体同样带精确层，但
+        // 读音不同，不能算首段。所以这里读候选的读音键，而不是只看层。
+        // 层由查询阶段定型，与首段判据正交：层决定跨层顺序，读音决定覆盖范围。
         let full_joined = syllables.join("'");
         let head = if has_pending {
             let prefix = format!("{full_joined}'");
@@ -1691,23 +1762,19 @@ impl Engine {
         } else {
             cands.iter().take_while(|c| c.pinyin == full_joined).count()
         };
-        // 预算独立于主查询的 candidate_limit：候选总量可远超一页，首音节单字
-        // 全量进同一列表，翻页在平台层做。extra 已被 lookup 的 limit 约束为
-        // eff 降序的前 limit 条；双列稳定合并（池内序原样保留，#87 交错）。
+        // 首音节单字标记为 Append 层：唯一允许跨层按分数归并的来源，其余层不得
+        // 被它插队（见 `rank::merge_append` 的契约注释）。
+        let ranker = dict.ranker();
+        let append: Vec<Candidate> = extra
+            .into_iter()
+            .map(|c| {
+                c.with_layer(Layer::Append)
+                    .with_source(SourceKind::FirstSyllable)
+            })
+            .collect();
         let mut merged: Vec<Candidate> = cands[..head].to_vec();
-        let mut main = cands.iter().skip(head).peekable();
-        for e in extra.iter() {
-            while let Some(n) = main.peek() {
-                if n.eff >= e.eff {
-                    merged.push((*n).clone());
-                    main.next();
-                } else {
-                    break;
-                }
-            }
-            merged.push(e.clone());
-        }
-        merged.extend(main.cloned());
+        let rest: Vec<Candidate> = cands[head..].to_vec();
+        merged.extend(rank::merge_append(&ranker, rest, append));
         merged.truncate(limit);
         *cands = merged;
     }
@@ -1765,15 +1832,29 @@ impl Engine {
         l1_key: &str,
         coverage_key: &str,
     ) {
-        let l1_end = cands.iter().take_while(|c| c.pinyin == l1_key).count();
+        let l1_end = cands
+            .iter()
+            .take_while(|c| rank::in_exact_block(c) && c.pinyin == l1_key)
+            .count();
         // k-best 列表本身按路径代价升序；后续句子只许插在前一条之后，
         // 否则频率折算会把更优的切分反-sort 到后面。
+        // 句子去重与「已有候选不重复」用同一个 `rank::Seen`：句子是逐条插入的，
+        // 每条都要对当前列表去重。
+        let mut seen = rank::Seen::of(cands.iter());
         let mut cursor = l1_end;
-        for sentence in sentences {
-            if cands.iter().any(|c| c.text == sentence.text) {
+        for mut sentence in sentences {
+            if !seen.insert(&sentence.text) {
                 continue;
             }
-            let pos = if sentence.pinyin == coverage_key {
+            // 层归属在这里定型，而不是靠插入位置隐式表达：覆盖完整输入 →
+            // SentenceCovers（精确块之后），未覆盖 → Tail（列表尾）。
+            let covers = sentence.pinyin == coverage_key;
+            sentence.layer = if covers {
+                Layer::SentenceCovers
+            } else {
+                Layer::Tail
+            };
+            let pos = if covers {
                 // fcitx5 组句语义：句恒落层一精确块之后、其余候选之前，
                 // 词条分数不把句压到中间（用户实测长句被高频单字挤下第一）。
                 cursor
@@ -1785,19 +1866,19 @@ impl Engine {
         }
     }
 
-    /// M5: AI 候选合入当前列表。后台线程完成后由壳回调（仍在主线程执行）
+    /// M5: AI 候选合入当前列表。后台线程完成后由壳回调（仍在主线程执行）。
+    ///
+    /// AI 候选标记为 [`Layer::Append`]：它**不参与**整表排序，永远追加在列表末尾
+    /// （既有契约：`llm_merge_adds_candidates` / `llm_dedupe_existing`）。层号让
+    /// 「不参与排序」这件事显式化——若沿用精确层，任何一次重排都会把 AI 候选
+    /// 提到前面。
     pub fn merge_ai(&mut self, ai: Vec<Candidate>) {
-        let mut seen = std::collections::HashSet::new();
-        // 先加入现有候选文本集合
-        for c in &self.candidates {
-            seen.insert(c.text.clone());
-        }
-        // 去重合并 AI 候选
-        for c in ai {
-            if seen.insert(c.text.clone()) {
-                self.candidates.push(c);
-            }
-        }
+        let mut seen = rank::Seen::of(&self.candidates);
+        let batch: Vec<Candidate> = ai
+            .into_iter()
+            .map(|c| c.with_layer(Layer::Append).with_source(SourceKind::Ai))
+            .collect();
+        rank::append_unique(&mut self.candidates, batch, &mut seen);
     }
 }
 /// 连续 CJK 汉字：与 `crate::lm::is_cjk_word_char` 同口径（基本区 + 扩展 A）。

@@ -1,0 +1,48 @@
+# kime 候选排序调试语料（debug corpus）
+#
+# 目的：把「候选顺序」这条最容易回归的契约变成可复用数据，让 agent / 人排查时
+# 直接跑同一个文件，而不是每次手写 fixture 复现。
+#
+# 格式（TSV，三列，# 开头为注释）：
+#   mode <TAB> keys <TAB> expect
+#
+#   mode   full                  纯全拼
+#          shuangpin:<scheme>    双拼，scheme ∈ ziranma | natural | 小鹤方案名
+#   keys   键序列，逐字符喂引擎（与 `kime debug` 的 token 序列同义）
+#   expect 断言，分号分隔：
+#            first=文本      该键敲击后第一个候选必须是它
+#            has=文本        候选中必须出现
+#            absent=文本     候选中不得出现
+#            文本A<文本B     A 必须在 B 之前（跨语言/跨层的相对顺序）
+#
+# 运行：
+#   cargo test -p kime-core --test debug_corpus_test        # 用 fixtures 词库回放
+#   kime debug --dict <库> --corpus <本文件>                 # 用真实词库回放
+#
+# 加用例：追加一行即可。断言必须来自既有契约（测试/文档），不要写「当前行为」，
+# 否则语料会把 bug 钉成规范。
+
+# 语料必须**同时**能在 fixtures 词库与真实用户词库上跑通（两条命令见文件头）。
+# 因此断言只用两套词库都有的词，且只锁与具体词频无关的结论：具体哪个同音词
+# 排第一由词频决定，钉死它会让语料在换词库时误报。
+
+# 基础输入：中文精确命中 + 上屏
+full	nihao	first=你好
+full	shenme	first=什么
+full	zongguo	has=中国
+
+# 跨语言顺序由**校准分数**决定（每个语言在自己的频率分布里归一化后比较），
+# 不是「中文整块在前」也不是「英文整块在前」。因此这里不钉固定顺序——
+# 那会把某一份词库的频率分布固化成契约。要断言两语言之间的先后，用
+# `kime debug --json` 看 lang/layer/eff 三个字段，按实际分数判断。
+#
+# 这里只断言与频率无关的部分：中文候选必须可达（不被英文挤出候选窗）。
+full	ru	has=如果
+full	rug	has=如果
+
+# 双拼：同一输入在双拼下的中文结论与全拼一致
+shuangpin:ziranma	nihao	first=你好
+shuangpin:ziranma	rug	has=如果
+
+# 单字母不查英文（噪声闸在引擎层）
+full	a	absent=a

@@ -87,13 +87,11 @@ pub fn build(dict_sqlite: &Path, out_bin: &Path) -> Result<u64> {
     let mut groups: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     for row in rows {
         let (pinyin, text, freq) = row?;
-        groups.entry(pinyin).or_default().push(Candidate {
-            text,
-            pinyin: String::new(),
-            freq,
-            eff: freq,
-            ai: false,
-        });
+        // 构建期只做打包：读音键留空（块内按 key 归属回填），层/语言由读取侧定型。
+        groups
+            .entry(pinyin)
+            .or_default()
+            .push(Candidate::zh(text, String::new(), freq, freq));
     }
 
     let pinyins: Vec<String> = groups.keys().cloned().collect(); // BTreeMap 已排序

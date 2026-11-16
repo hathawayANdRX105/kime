@@ -1,0 +1,65 @@
+# crates/kime-core/tests/fixtures/typing/mixed.txt
+
+总计 59 词：top1 32 / top10 56 / miss 3
+
+| # | 词 | 语言 | 键 | 名次 | 候选数 |
+|---|---|---|---|---|---|
+| 1 | 使用 | zh | shiyong | 1 | 52 |
+| 2 | kime | en | kime | - | 61 |
+| 3 | 打 | zh | da | 2 | 100 |
+| 4 | 字 | zh | zi | 3 | 100 |
+| 5 | 的 | zh | de | 1 | 100 |
+| 6 | 时 | zh | shi | 2 | 100 |
+| 7 | 候 | zh | hou | 2 | 100 |
+| 8 | 中 | zh | zhong | 1 | 50 |
+| 9 | 文 | zh | wen | 2 | 63 |
+| 10 | 候 | zh | hou | 2 | 100 |
+| 11 | 选 | zh | xuan | 1 | 63 |
+| 12 | 必 | zh | bi | 3 | 100 |
+| 13 | 须 | zh | xu | 4 | 52 |
+| 14 | 排 | zh | pai | 3 | 98 |
+| 15 | 在 | zh | zai | 1 | 52 |
+| 16 | english | en | english | - | 14 |
+| 17 | 候 | zh | hou | 2 | 100 |
+| 18 | 选 | zh | xuan | 1 | 63 |
+| 19 | 之 | zh | zhi | 4 | 51 |
+| 20 | 前 | zh | qian | 1 | 63 |
+| 21 | 否 | zh | fou | 1 | 99 |
+| 22 | 则 | zh | ze | 1 | 100 |
+| 23 | 输 | zh | shu | 7 | 100 |
+| 24 | 入 | zh | ru | 2 | 100 |
+| 25 | ru | en | ru | - | 100 |
+| 26 | 会 | zh | hui | 1 | 52 |
+| 27 | 先 | zh | xian | 1 | 106 |
+| 28 | 看 | zh | kan | 1 | 72 |
+| 29 | 到 | zh | dao | 1 | 60 |
+| 30 | rug | en | rug | 1 | 61 |
+| 31 | 而不是 | zh | erbushi | 1 | 50 |
+| 32 | 如果 | zh | ruguo | 1 | 63 |
+| 33 | 我 | zh | wo | 1 | 100 |
+| 34 | 们 | zh | men | 1 | 100 |
+| 35 | 跑 | zh | pao | 1 | 59 |
+| 36 | typing | en | typing | 1 | 3 |
+| 37 | 语 | zh | yu | 6 | 91 |
+| 38 | 料 | zh | liao | 2 | 96 |
+| 39 | 来 | zh | lai | 1 | 58 |
+| 40 | 回 | zh | hui | 2 | 52 |
+| 41 | 归 | zh | gui | 4 | 100 |
+| 42 | 这 | zh | zhe | 1 | 52 |
+| 43 | 个 | zh | ge | 1 | 100 |
+| 44 | 顺 | zh | shun | 1 | 58 |
+| 45 | 序 | zh | xu | 8 | 52 |
+| 46 | 同 | zh | tong | 1 | 62 |
+| 47 | 时 | zh | shi | 2 | 100 |
+| 48 | 检查 | zh | jiancha | 1 | 61 |
+| 49 | commit | en | commit | 1 | 19 |
+| 50 | 之 | zh | zhi | 4 | 51 |
+| 51 | 后 | zh | hou | 1 | 100 |
+| 52 | 候 | zh | hou | 2 | 100 |
+| 53 | 选 | zh | xuan | 1 | 63 |
+| 54 | 窗 | zh | chuang | 2 | 58 |
+| 55 | 口 | zh | kou | 2 | 51 |
+| 56 | 是 | zh | shi | 1 | 100 |
+| 57 | 否 | zh | fou | 1 | 99 |
+| 58 | 清 | zh | qing | 2 | 52 |
+| 59 | 空 | zh | kong | 1 | 52 |

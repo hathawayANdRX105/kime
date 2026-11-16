@@ -8,7 +8,8 @@
 //! [`viterbi_sentences_seeded`] 额外把光标前已上屏的末词（[`Seed`]）当作虚拟起点词，
 //! 其先验概率计入联合概率，但不进产出候选的文本（只上屏新组合）。
 
-use crate::dict::{Candidate, Dict};
+use crate::dict::Dict;
+use crate::model::{Candidate, Layer, SourceKind};
 
 /// 每条边的基础代价。每个词都收一份，构成「段数少优先」的固定偏置；
 /// 概率项本身（每个多出来的词平均再加 ~10000）已经保证了不会乱切。
@@ -216,13 +217,12 @@ pub fn viterbi_sentences_seeded(
         .filter(|p| !p.placeholder)
         .map(|p| {
             let score = sentence_score(p.ln_freq_sum, p.words, total);
-            Candidate {
-                text: p.text,
-                pinyin: p.pinyin,
-                freq: score,
-                eff: score,
-                ai: false,
-            }
+            // 组句候选的层由 engine 按「是否覆盖完整输入」定型（覆盖 → SentenceCovers，
+            // 未覆盖 → Tail）；这里只给来源标记与默认层。默认给 SentenceCovers 而不是
+            // Exact：组句是拼出来的，不是词典精确命中，默认精确层会让它越过真正的层一。
+            Candidate::zh(p.text, p.pinyin, score, score)
+                .with_source(SourceKind::Sentence)
+                .with_layer(Layer::SentenceCovers)
         })
         .collect()
 }

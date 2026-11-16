@@ -1,0 +1,10 @@
+--
+name: debug-english
+sort: by_weight
+version: "1"
+...
+ru	ru	800
+rug	rug	3720
+ruby	ruby	900
+rules	rules	1200
+run	run	2000
