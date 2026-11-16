@@ -282,11 +282,15 @@ pub fn mine_gated(conn: &Connection, gate: Option<&Jeving>) -> rusqlite::Result<
         .unwrap_or(0);
     Ok(st)
 }
-/// commit_log 单行：逐词提交的文本与读音，按 ts 顺序排列，用于恢复片段序列。
+/// commit_log 单行：逐词提交的文本、读音与上文链标识。
+///
+/// `ctx_id` = 上一词的 vocab id（`NULL` = 该词没有 kime 前词，是句子/片段起点）。
+/// 片段挖掘按它切段：跨 `ctx_id = NULL` 不拼接，避免把不同句子连成一个假片段。
 #[derive(Clone, Debug)]
 struct FragmentRow {
     text: String,
     reading: String,
+    ctx_id: Option<i64>,
 }
 
 /// 挖掘出的片段候选：片段文本、整段读音、出现次数、可解释加成。
@@ -305,8 +309,9 @@ pub struct FragmentCandidate {
 /// 纯函数：从逐条提交记录中提取片段计数（无 DB，可单测）。
 ///
 /// 规则：
-/// - 仅在连续提交序列内提取（text 为空或 reading 为空视为序列边界，不跨序列拼接）。
-/// - 对每个位置 i，向后取长度 2..=FRAGMENT_MAX_WORDS 的子序列作为候选片段。
+/// - **按 `ctx_id` 切段**：`ctx_id = None` 表示该词没有 kime 前词（一次提交的
+///   起点），新段从它开始。跨段不拼接——否则不同句子会被连成一个假片段。
+/// - 段内对每个起始位置向后取长度 2..=`FRAGMENT_MAX_WORDS` 的子序列。
 /// - 片段文本 = 逐词拼接，片段读音 = 逐音节 `'` 连接。
 ///
 /// 返回：(文本, 读音) → 出现次数。
@@ -315,52 +320,53 @@ fn fragment_counts_from_rows(
 ) -> std::collections::HashMap<(String, String), i64> {
     let mut counts: std::collections::HashMap<(String, String), i64> =
         std::collections::HashMap::new();
-    let n = rows.len();
-    let mut i = 0;
-    while i < n {
-        // 找到一个连续序列的起点：text/reading 都非空
-        if rows[i].text.is_empty() || rows[i].reading.is_empty() {
-            i += 1;
-            continue;
+    let mut segment: Vec<&FragmentRow> = Vec::new();
+    for row in rows {
+        // ctx_id = None 是句子起点：先结算上一段，再从本行开新段。
+        if row.ctx_id.is_none() {
+            count_segment(&segment, &mut counts);
+            segment.clear();
         }
-        // 向前扩展，收集连续非空行构成的序列
-        let seq_start = i;
-        while i < n && !rows[i].text.is_empty() && !rows[i].reading.is_empty() {
-            i += 1;
-        }
-        let seq_end = i; // [seq_start, seq_end) 是连续序列
-        let seq_len = seq_end - seq_start;
-        if seq_len < 2 {
-            continue;
-        }
-        // 对序列内每个起始位置，取长度 2..=FRAGMENT_MAX_WORDS 的子序列
-        for s in seq_start..seq_end {
-            let mut text = String::new();
-            let mut reading = String::new();
-            for len in 1..=FRAGMENT_MAX_WORDS {
-                let e = s + len;
-                if e > seq_end {
-                    break;
-                }
-                let row = &rows[e - 1];
-                if !text.is_empty() {
-                    text.push_str(row.text.as_str());
-                } else {
-                    text = row.text.clone();
-                }
-                if !reading.is_empty() {
-                    reading.push('\'');
-                    reading.push_str(row.reading.as_str());
-                } else {
-                    reading = row.reading.clone();
-                }
-                if len >= 2 {
-                    *counts.entry((text.clone(), reading.clone())).or_default() += 1;
-                }
+        segment.push(row);
+    }
+    count_segment(&segment, &mut counts);
+    counts
+}
+
+/// 统计单段内的片段计数（段 = 连续提交序列）。
+fn count_segment(
+    segment: &[&FragmentRow],
+    counts: &mut std::collections::HashMap<(String, String), i64>,
+) {
+    let n = segment.len();
+    if n < 2 {
+        return;
+    }
+    for s in 0..n {
+        let mut text = String::new();
+        let mut reading = String::new();
+        for len in 1..=FRAGMENT_MAX_WORDS {
+            let e = s + len;
+            if e > n {
+                break;
+            }
+            let row = segment[e - 1];
+            if row.text.is_empty() || row.reading.is_empty() {
+                break;
+            }
+            if text.is_empty() {
+                text.push_str(row.text.as_str());
+                reading.push_str(row.reading.as_str());
+            } else {
+                text.push_str(row.text.as_str());
+                reading.push('\'');
+                reading.push_str(row.reading.as_str());
+            }
+            if len >= 2 {
+                *counts.entry((text.clone(), reading.clone())).or_default() += 1;
             }
         }
     }
-    counts
 }
 
 /// 离线片段挖掘（事务内）：
@@ -373,13 +379,20 @@ fn fragment_counts_from_rows(
 /// 在清日志（purge commit_log）之前调用，确保读到本轮日志。
 /// 返回新并入的片段数（供 MineStats.fragments_mined）。
 fn mine_fragments(conn: &Connection, today: i64) -> rusqlite::Result<i64> {
-    // 只读预扫：commit_log 全部 (text, reading)，按 ts 升序
+    // 只读预扫：commit_log 按 ts 升序取 (文本, 读音, 上文链)。
+    // text 在 vocab 表里（commit_log 只存 text_id），必须 JOIN 才能拿到文本；
+    // ctx_id 用于切段（NULL = 句子起点，见 FragmentRow）。
     let rows: Vec<FragmentRow> = {
-        let mut stmt = conn.prepare("SELECT text, reading FROM commit_log ORDER BY ts ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT v.text, c.reading, c.ctx_id
+             FROM commit_log c JOIN vocab v ON v.id = c.text_id
+             ORDER BY c.ts ASC, c.rowid ASC",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(FragmentRow {
                 text: r.get::<_, String>(0)?,
                 reading: r.get::<_, String>(1)?,
+                ctx_id: r.get::<_, Option<i64>>(2)?,
             })
         })?;
         rows.flatten().collect()
