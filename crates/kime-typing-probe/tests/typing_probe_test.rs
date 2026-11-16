@@ -5,7 +5,7 @@
 
 use kime_core::dict::Dict;
 use kime_typing_probe::{
-    corpus::{corpus_from_tsv, CorpusEntry},
+    corpus::CorpusEntry,
     metrics::{LatencyStats, PerLang, SentenceMetric, Summary},
     report::{render_markdown, to_json, ProbeReport, SCHEMA_VERSION},
     runner::{KeyEvent, Lang, Runner},
@@ -449,7 +449,7 @@ fn llm_client_offline_by_default() {
 /// 整体：ProbeReport::from_result 附加 rules-only 建议。
 #[test]
 fn report_from_result_adds_suggestions() {
-    let mut result = kime_typing_probe::ProbeResult {
+    let result = kime_typing_probe::ProbeResult {
         schema_version: SCHEMA_VERSION.to_string(),
         generated_at: 0,
         corpus_id: "test".to_string(),

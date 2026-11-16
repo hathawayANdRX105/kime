@@ -2,9 +2,9 @@
 //! feature 则可选用轻量 HTTP 请求，但不得让 CI 联网。失败/未配置时静默降级
 //! 为 rules-only 建议。
 
-// 这些类型只在 `llm` feature 或测试里出现；默认构建（lib 非 test）下若不加门，
-// 导入就是未使用的——CI 的 `clippy --all-targets -D warnings` 会红。
-#[cfg(any(feature = "llm", test))]
+// 这些类型只在 `llm` feature 下构造；默认构建（含 lib 测试目标）不编译，
+// 否则会报 dead_code —— CI 的 `clippy --all-targets -D warnings` 会红。
+#[cfg(feature = "llm")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "llm")]
 use std::time::Duration;
@@ -80,7 +80,7 @@ impl LlmClient {
 }
 
 /// OpenAI 兼容聊天请求载荷（最小字段，避免引入 reqwest 类型泄漏）。
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 #[derive(Serialize)]
 struct LlmRequest {
     model: String,
@@ -88,7 +88,7 @@ struct LlmRequest {
     temperature: f64,
 }
 
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 #[derive(Serialize)]
 struct LlmMessage {
     role: String,
@@ -96,19 +96,19 @@ struct LlmMessage {
 }
 
 /// LLM 响应：最小解析，只取 `choices[0].message.content`。
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 #[derive(Deserialize)]
 struct LlmResponse {
     choices: Option<Vec<LlmChoice>>,
 }
 
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 #[derive(Deserialize)]
 struct LlmChoice {
     message: LlmResponseMessage,
 }
 
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 #[derive(Deserialize)]
 struct LlmResponseMessage {
     content: String,
@@ -134,7 +134,7 @@ fn post_json(endpoint: &str, body: &str, timeout_secs: u64) -> anyhow::Result<St
     Ok(text)
 }
 
-#[cfg(any(feature = "llm", test))]
+#[cfg(feature = "llm")]
 fn parse_suggestions(text: &str) -> Option<Vec<String>> {
     let resp: LlmResponse = serde_json::from_str(text).ok()?;
     let mut suggestions: Vec<String> = Vec::new();
@@ -161,7 +161,7 @@ fn parse_suggestions(text: &str) -> Option<Vec<String>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llm"))]
 mod tests {
     use super::*;
 

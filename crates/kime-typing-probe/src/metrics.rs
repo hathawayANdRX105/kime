@@ -85,7 +85,7 @@ impl SentenceMetric {
             let end = start + page_size;
             s.candidates
                 .get(start..end)
-                .map_or(false, |window| window.iter().any(|c| c == &trace.text))
+                .is_some_and(|window| window.iter().any(|c| c == &trace.text))
         });
 
         // 退格次数：KeyEvent::Backspace 的样本数
@@ -168,7 +168,7 @@ impl Summary {
 
         let all_latencies: Vec<f64> = sentences
             .iter()
-            .flat_map(|s| std::iter::repeat(s.latency_ms.mean_ms).take(s.keys.max(1)))
+            .flat_map(|s| std::iter::repeat_n(s.latency_ms.mean_ms, s.keys.max(1)))
             .collect();
         let latency_ms = latency_stats(&all_latencies);
 

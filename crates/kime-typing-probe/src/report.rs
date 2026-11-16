@@ -193,7 +193,7 @@ fn render_markdown_result(report: &ProbeReport) -> String {
             s.overall_score,
         ));
     }
-    md.push_str("\n");
+    md.push('\n');
 
     md.push_str("## Per Sentence\n\n");
     md.push_str("| ID | Lang | Target | Top-1 | First-Screen | Keys | Latency mean (ms) | Page | BS | Resel |\n");
@@ -213,13 +213,13 @@ fn render_markdown_result(report: &ProbeReport) -> String {
             s.reselections,
         ));
     }
-    md.push_str("\n");
+    md.push('\n');
 
     md.push_str("## Suggestions\n\n");
     for s in &report.suggestions {
         md.push_str(&format!("- {s}\n"));
     }
-    md.push_str("\n");
+    md.push('\n');
 
     md
 }
