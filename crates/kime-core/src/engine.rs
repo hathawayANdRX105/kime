@@ -1326,50 +1326,67 @@ impl Engine {
         self.sort_candidates();
     }
 
-    /// 跨语言合并：中文块与英文块按**分数**交错，各自内部顺序原样保留。
+    /// 跨语言合并：中英文候选按同一排序键重排，中英文混合顺序由分数决定。
     ///
-    /// 为什么不是一次 `sort_by(rank_key)`：候选列表不是单一有序run——中文块的顺序
-    /// 由「层 + 分数」决定（精确 → 补全，跨意图合批时只看分数），英文块同理。用
-    /// 一个全局比较器重排会把「同语言内已定好的顺序」打散（例如双拼半截键下
-    /// 声母位补全必须排在韵母位精确词之前），那是有测试钉死的语义。
+    /// 为什么必须**整表按 RankKey 排序**，而不是「两段有序 run 的归并」：
+    /// 候选列表不是单一有序 run——它是按查询批次拼起来的（精确块 → 补全块 →
+    /// 句子 → 模糊音/纠错/多切分追加）。若假设「中文段已按分数有序」再与英文段做
+    /// 双指针归并，只要英文段首元素的分数落在中文第一、第二条之间，整段英文
+    /// （含补全词）就会插到中文精确命中之前——正是本次要修的 bug 形态。
     ///
-    /// 所以这里做**两段有序run 的归并**：同语言的两条从不互相比较（保持原序），
-    /// 只有跨语言才比分。`Layer::Append`（首音节单字）原槽位不动——它的落点本身
-    /// 携带 #87 的交错结果。
+    /// 所以直接对「非 Append 候选」整体按 [`rank::Ranker::compare`] 排序
+    /// （层 → 分数 → 文本 → 来源），再写回它们原来的槽位：
+    ///
+    /// - 层在分数之前 ⇒ 精确块恒在补全块之前，跨语言竞争只发生在同层之内；
+    /// - `Layer::Append`（首音节单字 / AI 候选）**不参与**排序、原槽位不动——
+    ///   它们的落点本身携带 #87 的交错结果，重排会把它们按层号推到末尾。
+    ///
+    /// 实现上只搬移不克隆：先把非 Append 候选 `take` 出来排序，再按槽位回填，
+    /// 热路径每键一次，不产生逐候选的 String 拷贝。
     fn sort_candidates(&mut self) {
         let ranker = self.dict.ranker();
+        // 只有「中英文同时在场」才需要重排：单一语言的列表由查询管道拼装，
+        // 其顺序（精确块 → 句子 → 补全 → 模糊音/纠错追加）本身就是契约，
+        // 无条件重排会把它打散（实测：撤销/退格/部分选词等 6 个用例因此回归）。
+        let mut has_zh = false;
+        let mut has_en = false;
         let mut slots: Vec<usize> = Vec::new();
-        let mut zh: Vec<Candidate> = Vec::new();
-        let mut en: Vec<Candidate> = Vec::new();
         for (i, c) in self.candidates.iter().enumerate() {
             if rank::is_append(c) {
                 continue;
             }
             slots.push(i);
             match c.lang {
-                Lang::Zh => zh.push(c.clone()),
-                Lang::En => en.push(c.clone()),
+                Lang::Zh => has_zh = true,
+                Lang::En => has_en = true,
             }
         }
-        if en.is_empty() || zh.is_empty() {
-            return; // 单语言：内部顺序已经是对的，无需归并
+        if !has_zh || !has_en {
+            return;
         }
-        let mut merged: Vec<Candidate> = Vec::with_capacity(zh.len() + en.len());
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < zh.len() && j < en.len() {
-            if ranker.score(&zh[i]) >= ranker.score(&en[j]) {
-                merged.push(zh[i].clone());
-                i += 1;
-            } else {
-                merged.push(en[j].clone());
-                j += 1;
+        if slots.len() < 2 {
+            return; // 0 或 1 个待排候选：顺序已经是对的
+        }
+        let mut pool: Vec<Option<Candidate>> = self.candidates.drain(..).map(Some).collect();
+        let mut picked: Vec<Candidate> = Vec::with_capacity(slots.len());
+        for &i in &slots {
+            if let Some(c) = pool[i].take() {
+                picked.push(c);
             }
         }
-        merged.extend(zh[i..].iter().cloned());
-        merged.extend(en[j..].iter().cloned());
-        for (slot, c) in slots.into_iter().zip(merged) {
-            self.candidates[slot] = c;
+        ranker.sort(&mut picked);
+        let mut picked = picked.into_iter();
+        let mut out: Vec<Candidate> = Vec::with_capacity(pool.len());
+        for slot in pool.iter_mut() {
+            match slot.take() {
+                Some(c) => out.push(c), // Append 槽位：原样保留
+                None => match picked.next() {
+                    Some(c) => out.push(c),
+                    None => break,
+                },
+            }
         }
+        self.candidates = out;
     }
 
     /// 全拼路径：segment 全部切分逐条前缀查询 + 模糊音 + abbrev 兜底 + Viterbi 句级联想。

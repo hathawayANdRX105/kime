@@ -281,16 +281,19 @@ pub fn render_markdown(title: &str, report: &TypingReport, limit: usize) -> Stri
         report.miss()
     ));
     s.push_str("| # | 词 | 语言 | 键 | 名次 | 候选数 |\n|---|---|---|---|---|---|\n");
+    // 单元格文本必须转义：候选里可能含 `|`（短语导入不做字符过滤）或换行，
+    // 原样写进 Markdown 表格会把列数撑乱、报告失去可读性。
+    let cell = |v: &str| v.replace('|', "\\|").replace(['\n', '\r'], " ");
     for (i, c) in report.cases.iter().take(limit).enumerate() {
         s.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
             i + 1,
-            c.text,
+            cell(&c.text),
             match c.lang {
                 Lang::Zh => "zh",
                 Lang::En => "en",
             },
-            c.keys,
+            cell(&c.keys),
             c.rank.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
             c.cands
         ));

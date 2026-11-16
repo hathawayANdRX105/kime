@@ -1212,10 +1212,12 @@ impl Dict {
         if joined.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let user_exact = self.overlay_exact(&joined);
-        let mut user_comps = self.overlay_comps(&joined, tail);
-
         if let Some(store) = &self.store {
+            let user_exact = self.overlay_exact(&joined);
+            let mut user_comps = self.overlay_comps(&joined, tail);
+            // 用户词 overlay 只在 FST 路径需要：纯 SQLite 路径的 `index` 本身
+            // 就含用户词（且已烘好 eff），再查 overlay 是纯浪费（审查发现：
+            // overlay_comps 还会为前缀上界分配一个 Vec<char>）。
             let (base_exact, base_comps) = store.lookup_prefix_layers(syllables, tail, limit);
             // 存储层只负责取词，层归属在这里定型：两条存储路径因此不可能给出
             // 不同的层语义（历史 bug 正出在「谁定层」分散在两处）。
@@ -1469,6 +1471,12 @@ impl Dict {
                         },
                     );
                 }
+            }
+            // FST 模式下基准同样要跟着抬：用户词 overlay 的 eff 在这里被改，
+            // 若只更新内存不更新基准，跨语言校准的分母会偏小，中文分数系统性偏高
+            //（审查发现：这条分支以前直接 return，基准停在开库时的值）。
+            if let Some(max) = self.user_overlay.iter().map(|e| e.eff).max() {
+                self.bump_zh_max(max);
             }
             return Ok(());
         }

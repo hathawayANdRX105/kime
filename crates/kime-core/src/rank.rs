@@ -123,17 +123,16 @@ impl ScoreScale {
 
     /// 某语言某有效频率 → 可比分数。
     ///
-    /// 单调性是硬要求：`eff_a > eff_b` 必须推出 `score_a >= score_b`。
-    /// 所以这里**不截断到上界**——早期实现把 `eff` 截到 `max` 再归一化，
-    /// 用户提频超过词表最大频时（ BOOST 叠加后常见）所有超额词并列满分，
-    /// 排序退化成文本序，提频直接失效（`freq_boost_test` 钉死）。
+    /// 单调性优先于饱和：分数**不截断到上界**——用户提频超过词表最大频时（BOOST 叠加后
+    /// 常见），截断会让超额词并列满分，排序退化成文本序，提频静默失效。
+    ///
+    /// 退化按**语言各自**判断（不是两语言取或）：某一语言词表为空/全 0 频时，
+    /// 它自己退回线性比较；另一语言仍走对数路径。若按「任一方退化就两边线性」，
+    /// 有数据的一端的分数会挤在 eff 量级、另一端全坍在 0~1，同层跨语言交错失效。
     pub fn score(&self, lang: Lang, eff: u64) -> u64 {
-        // 退化：任一语言没有频率数据（空词表 / 全 0 频）时校准无意义，
-        // 直接比原始频率——对数会把 600010 与 500000 压成同一个整数 13，精度全丢。
-        if self.zh_max <= 1 || self.en_max <= 1 {
+        let Some(k) = self.factor(lang) else {
             return eff.min(SCORE_CAP);
-        }
-        let k = self.factor(lang);
+        };
         let raw = (1.0 + eff as f64).ln() * k;
         if raw <= 0.0 {
             return 0;
@@ -144,13 +143,16 @@ impl ScoreScale {
         raw as u64
     }
 
-    /// 该语言的缩放系数。
-    fn factor(&self, lang: Lang) -> f64 {
+    /// 该语言的缩放系数；`None` = 该语言没有频率数据，退回线性比较。
+    fn factor(&self, lang: Lang) -> Option<f64> {
         let max = match lang {
             Lang::Zh => self.zh_max,
             Lang::En => self.en_max,
         };
-        SCORE_MAX as f64 / (1.0 + max as f64).ln()
+        if max <= 1 {
+            return None;
+        }
+        Some(SCORE_MAX as f64 / (1.0 + max as f64).ln())
     }
 }
 
@@ -407,25 +409,42 @@ pub fn merge_append(
     mut head: Vec<Candidate>,
     mut append: Vec<Candidate>,
 ) -> Vec<Candidate> {
-    // 归并前提是两段都按分数降序。调用方给的 head 是主列表去掉保护首段后的尾部
-    // （层优先拼接，非分数序），append 是查询结果直接打标（同样非分数序）——
-    // 不预排序的话，同一多重集换个输入顺序就换个交错结果。
-    ranker.sort_within_batch(&mut head);
-    ranker.sort_within_batch(&mut append);
+    // 归并键分两种，取决于候选是不是 Append：
+    //
+    // - 非 Append（主列表尾段：补全、未覆盖句）→ (层, 分数, 文本)：层在分数前，
+    //   保证「未覆盖句不得越过补全词」。
+    // - Append（首音节单字）→ (分数, 文本)：它必须能按分数插到补全之间（#87）。
+    //
+    // 调用方保证每一侧内部同质（head 全是主列表尾段，append 全是首音节单字），
+    // 因此「一侧 Append、另一侧非 Append」时按分数比较是正确语义，不会产生
+    // 不传递的比较。
+    let sort_key = |c: &Candidate| -> (Option<Layer>, u64) {
+        let tier = if is_append(c) { None } else { Some(c.layer) };
+        (tier, ranker.score(c))
+    };
+    let cmp = |a: &Candidate, b: &Candidate| -> Ordering {
+        let (ak, as_) = (sort_key(a), ranker.score(a));
+        let (bk, bs) = (sort_key(b), ranker.score(b));
+        match (ak.0, bk.0) {
+            (Some(x), Some(y)) => x
+                .cmp(&y)
+                .then_with(|| bs.cmp(&as_))
+                .then_with(|| a.text.cmp(&b.text)),
+            _ => bs.cmp(&as_).then_with(|| a.text.cmp(&b.text)),
+        }
+    };
+    head.sort_by(|a, b| cmp(a, b));
+    append.sort_by(|a, b| cmp(a, b));
     let mut head = head.into_iter().peekable();
     let mut append = append.into_iter().peekable();
     let mut out: Vec<Candidate> = Vec::with_capacity(head.len() + append.len());
     loop {
-        // peek 的借用必须在 next() 之前结束，否则迭代器会被移动；
-        // 因此先在 match 里只算「该取哪一边」，再统一 next()。
         let take_head = match (head.peek(), append.peek()) {
-            (Some(h), Some(a)) => ranker.score(h) >= ranker.score(a),
+            (Some(h), Some(a)) => cmp(h, a) != Ordering::Greater,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => break,
         };
-        // 用 if let 而不是 expect：本函数不返回 Result/Option，expect 无法用 `?`
-        // 传播，只会 panic（仓库 dylint 的 expect-in-non-result 就是拦这个）。
         if take_head {
             match head.next() {
                 Some(c) => out.push(c),

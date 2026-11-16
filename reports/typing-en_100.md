@@ -1,6 +1,6 @@
 # crates/kime-core/tests/fixtures/typing/en_100.txt
 
-总计 106 词：top1 47 / top10 95 / miss 5
+总计 106 词：top1 47 / top10 96 / miss 5
 
 | # | 词 | 语言 | 键 | 名次 | 候选数 |
 |---|---|---|---|---|---|
@@ -33,7 +33,7 @@
 | 27 | word | en | word | 5 | 54 |
 | 28 | in | en | in | 1 | 101 |
 | 29 | the | en | the | 3 | 119 |
-| 30 | list | en | list | 17 | 73 |
+| 30 | list | en | list | 2 | 73 |
 | 31 | because | en | because | 1 | 1 |
 | 32 | users | en | users | 1 | 1 |
 | 33 | only | en | only | 4 | 36 |
@@ -46,7 +46,7 @@
 | 40 | scroll | en | scroll | 1 | 9 |
 | 41 | to | en | to | 51 | 100 |
 | 42 | the | en | the | 3 | 119 |
-| 43 | bottom | en | bottom | 7 | 57 |
+| 43 | bottom | en | bottom | 9 | 57 |
 | 44 | of | en | of | 2 | 100 |
 | 45 | a | en | a | - | 50 |
 | 46 | long | en | long | 3 | 92 |
