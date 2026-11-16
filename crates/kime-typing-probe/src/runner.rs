@@ -35,12 +35,14 @@ pub enum KeyEvent {
 }
 
 /// 单键采样记录：每次 `Engine::key` 返回后记录的瞬时状态。
+///
+/// 不存 `Outcome`：`kime_core::Outcome` 未派生 `Serialize`，而这里只需要
+/// 「是否上屏、上屏了什么」——`committed` 已承载，`Outcome` 的其余变体
+/// （Consumed/Ignored）对报告无信息量。
 #[derive(Clone, Debug, Serialize)]
 pub struct KeySample {
     /// 输入的按键事件
     pub event: KeyEvent,
-    /// `Engine::key` 返回的 `Outcome`
-    pub outcome: Outcome,
     /// 耗时（毫秒）
     pub latency_ms: f64,
     /// 回放后的 preedit 显示串
@@ -260,7 +262,6 @@ impl Runner {
 
         let sample = KeySample {
             event: event.clone(),
-            outcome,
             latency_ms,
             preedit,
             candidates,

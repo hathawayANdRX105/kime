@@ -199,8 +199,18 @@ impl Summary {
 impl PerLang {
     /// 按 lang 分桶聚合（zh / en）。
     pub fn from_sentences(sentences: &[SentenceMetric]) -> Self {
-        let zh: Vec<&SentenceMetric> = sentences.iter().filter(|s| s.lang == Lang::Zh).collect();
-        let en: Vec<&SentenceMetric> = sentences.iter().filter(|s| s.lang == Lang::En).collect();
+        // 保持 owned 切片：`Summary::from_sentences` 收 `&[SentenceMetric]`，
+        // 传 `Vec<&SentenceMetric>` 会类型不匹配（CI 实测）。
+        let zh: Vec<SentenceMetric> = sentences
+            .iter()
+            .filter(|s| s.lang == Lang::Zh)
+            .cloned()
+            .collect();
+        let en: Vec<SentenceMetric> = sentences
+            .iter()
+            .filter(|s| s.lang == Lang::En)
+            .cloned()
+            .collect();
         Self {
             zh: Summary::from_sentences(&zh),
             en: Summary::from_sentences(&en),

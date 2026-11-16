@@ -37,7 +37,7 @@ pub fn run(
         let events = key_events_for(entry, lang);
         let mut session = runner::Runner::new(dict_path, entry)?;
         session.run(&events)?;
-        let metric = metrics::SentenceMetric::from_session(&entry.id, &session.trace);
+        let metric = metrics::SentenceMetric::from_session(&entry.id, session.trace());
         sentences.push(metric);
     }
     let summary = metrics::Summary::from_sentences(&sentences);
