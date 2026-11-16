@@ -194,7 +194,6 @@ pub fn mine_gated(conn: &Connection, gate: Option<&Jeving>) -> rusqlite::Result<
     // 离线片段挖掘：在清日志之前调用，确保读到本轮日志。
     st.fragments_mined = mine_fragments(conn, today)?;
 
-
     // 清日志：**只删已合并进主表的行**（对计数 ≥ MIN_ADMISSION）。
     // 未达门槛的行保留——它们下轮可能凑够准入线；已合并的必须删，
     // 否则下轮 UPSERT 累加会双重计数。
@@ -309,9 +308,13 @@ pub struct FragmentCandidate {
 /// - 仅在连续提交序列内提取（text 为空或 reading 为空视为序列边界，不跨序列拼接）。
 /// - 对每个位置 i，向后取长度 2..=FRAGMENT_MAX_WORDS 的子序列作为候选片段。
 /// - 片段文本 = 逐词拼接，片段读音 = 逐音节 `'` 连接。
+///
 /// 返回：(文本, 读音) → 出现次数。
-fn fragment_counts_from_rows(rows: &[FragmentRow]) -> std::collections::HashMap<(String, String), i64> {
-    let mut counts: std::collections::HashMap<(String, String), i64> = std::collections::HashMap::new();
+fn fragment_counts_from_rows(
+    rows: &[FragmentRow],
+) -> std::collections::HashMap<(String, String), i64> {
+    let mut counts: std::collections::HashMap<(String, String), i64> =
+        std::collections::HashMap::new();
     let n = rows.len();
     let mut i = 0;
     while i < n {
@@ -510,7 +513,6 @@ pub fn fragment_boost_for_reading(
     }
     best
 }
-
 
 /// 前缀切分候选词最大长度（按字符）。词库词常规 2–4 字，上限只挡病态长
 /// 词条，实践中不可达（同 mine_phrases 的长度防线思路）。

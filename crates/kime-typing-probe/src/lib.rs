@@ -26,7 +26,10 @@ pub mod runner;
 ///
 /// # Errors
 /// 语料读取失败、`Dict::open` 失败或按键回放期望不满足时返回 `anyhow::Error`。
-pub fn run(corpus_path: &std::path::Path, dict_path: &std::path::Path) -> anyhow::Result<ProbeResult> {
+pub fn run(
+    corpus_path: &std::path::Path,
+    dict_path: &std::path::Path,
+) -> anyhow::Result<ProbeResult> {
     let corpus = corpus::Corpus::load_tsv(corpus_path)?;
     let mut sentences = Vec::with_capacity(corpus.entries.len());
     for entry in &corpus.entries {
@@ -70,7 +73,9 @@ fn key_events_for(entry: &corpus::CorpusEntry, lang: runner::Lang) -> Vec<runner
     let mut events: Vec<runner::KeyEvent> = source
         .chars()
         .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| runner::KeyEvent::Char { ch: c.to_ascii_lowercase() })
+        .map(|c| runner::KeyEvent::Char {
+            ch: c.to_ascii_lowercase(),
+        })
         .collect();
     events.push(runner::KeyEvent::Space);
     events

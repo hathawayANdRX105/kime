@@ -70,7 +70,13 @@ fn build_test_dict(tmp: &TempDir) -> PathBuf {
 }
 
 /// 为单条语料构造 Runner 并回放给定按键脚本。
-fn run_one(dict_path: &PathBuf, text: &str, pinyin: &str, lang: Lang, events: &[KeyEvent]) -> Runner {
+fn run_one(
+    dict_path: &PathBuf,
+    text: &str,
+    pinyin: &str,
+    lang: Lang,
+    events: &[KeyEvent],
+) -> Runner {
     let entry = CorpusEntry {
         id: format!("test:{lang:?}:{text}"),
         freq: 1,
@@ -218,7 +224,11 @@ fn per_lang_buckets() {
         top1_hit: true,
         first_screen_hit: true,
         keys: 5,
-        latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+        latency_ms: LatencyStats {
+            mean_ms: 1.0,
+            p50_ms: 1.0,
+            p99_ms: 1.0,
+        },
         page_turns: 0,
         backspaces: 0,
         reselections: 0,
@@ -233,7 +243,11 @@ fn per_lang_buckets() {
         top1_hit: true,
         first_screen_hit: true,
         keys: 5,
-        latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+        latency_ms: LatencyStats {
+            mean_ms: 1.0,
+            p50_ms: 1.0,
+            p99_ms: 1.0,
+        },
         page_turns: 0,
         backspaces: 0,
         reselections: 0,
@@ -256,7 +270,11 @@ fn report_json_roundtrip() {
             target_hit_rate: 1.0,
             top1_hit_rate: 1.0,
             first_screen_hit_rate: 1.0,
-            latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+            latency_ms: LatencyStats {
+                mean_ms: 1.0,
+                p50_ms: 1.0,
+                p99_ms: 1.0,
+            },
             page_turns: 0,
             backspace_count: 0,
             reselect_count: 0,
@@ -267,7 +285,11 @@ fn report_json_roundtrip() {
                 target_hit_rate: 1.0,
                 top1_hit_rate: 1.0,
                 first_screen_hit_rate: 1.0,
-                latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -277,7 +299,11 @@ fn report_json_roundtrip() {
                 target_hit_rate: 1.0,
                 top1_hit_rate: 1.0,
                 first_screen_hit_rate: 1.0,
-                latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -293,7 +319,11 @@ fn report_json_roundtrip() {
             top1_hit: true,
             first_screen_hit: true,
             keys: 5,
-            latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+            latency_ms: LatencyStats {
+                mean_ms: 1.0,
+                p50_ms: 1.0,
+                p99_ms: 1.0,
+            },
             page_turns: 0,
             backspaces: 0,
             reselections: 0,
@@ -324,7 +354,11 @@ fn report_markdown_sections() {
             target_hit_rate: 1.0,
             top1_hit_rate: 1.0,
             first_screen_hit_rate: 1.0,
-            latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+            latency_ms: LatencyStats {
+                mean_ms: 1.0,
+                p50_ms: 1.0,
+                p99_ms: 1.0,
+            },
             page_turns: 0,
             backspace_count: 0,
             reselect_count: 0,
@@ -335,7 +369,11 @@ fn report_markdown_sections() {
                 target_hit_rate: 1.0,
                 top1_hit_rate: 1.0,
                 first_screen_hit_rate: 1.0,
-                latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -345,7 +383,11 @@ fn report_markdown_sections() {
                 target_hit_rate: 1.0,
                 top1_hit_rate: 1.0,
                 first_screen_hit_rate: 1.0,
-                latency_ms: LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -380,10 +422,7 @@ fn sorting_layer_contract_not_broken() {
         pinyin: "ni'hao".to_string(),
     };
     let mut runner = Runner::new(&db_path, &entry).expect("build runner");
-    let events = [
-        KeyEvent::Char { ch: 'n' },
-        KeyEvent::Char { ch: 'i' },
-    ];
+    let events = [KeyEvent::Char { ch: 'n' }, KeyEvent::Char { ch: 'i' }];
     runner.run(&events).expect("run keys");
 
     let cands = runner.engine().candidates();
@@ -391,7 +430,11 @@ fn sorting_layer_contract_not_broken() {
     assert!(!cands.is_empty());
     // 中文精确应在英文精确之前（本库内若无英文，则首为中文）。
     let first_zh = cands.iter().any(|c| c.text == "你好");
-    assert!(first_zh, "中文精确 '你好' 应出现在候选列表，实际: {:?}", cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>());
+    assert!(
+        first_zh,
+        "中文精确 '你好' 应出现在候选列表，实际: {:?}",
+        cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+    );
 }
 
 /// LLM client：缺省未设端点时 disabled，suggestions 返回 None（静默降级）。
@@ -415,7 +458,11 @@ fn report_from_result_adds_suggestions() {
             target_hit_rate: 0.5, // 低于阈值，触发规则建议
             top1_hit_rate: 0.5,
             first_screen_hit_rate: 0.5,
-            latency_ms: LatencyStats { mean_ms: 10.0, p50_ms: 10.0, p99_ms: 10.0 },
+            latency_ms: LatencyStats {
+                mean_ms: 10.0,
+                p50_ms: 10.0,
+                p99_ms: 10.0,
+            },
             page_turns: 0,
             backspace_count: 0,
             reselect_count: 0,
@@ -426,7 +473,11 @@ fn report_from_result_adds_suggestions() {
                 target_hit_rate: 0.5,
                 top1_hit_rate: 0.5,
                 first_screen_hit_rate: 0.5,
-                latency_ms: LatencyStats { mean_ms: 10.0, p50_ms: 10.0, p99_ms: 10.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 10.0,
+                    p50_ms: 10.0,
+                    p99_ms: 10.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -436,7 +487,11 @@ fn report_from_result_adds_suggestions() {
                 target_hit_rate: 0.5,
                 top1_hit_rate: 0.5,
                 first_screen_hit_rate: 0.5,
-                latency_ms: LatencyStats { mean_ms: 10.0, p50_ms: 10.0, p99_ms: 10.0 },
+                latency_ms: LatencyStats {
+                    mean_ms: 10.0,
+                    p50_ms: 10.0,
+                    p99_ms: 10.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -472,7 +527,11 @@ fn run_replays_corpus_end_to_end() {
     // 按键序列来自读音（w o m e n + 空格），不是空
     assert_eq!(sentence.keys, 6);
     // 目标命中：上屏文本等于语料文本
-    assert!(sentence.target_hit, "committed={:?}", sentence.candidates_sample);
+    assert!(
+        sentence.target_hit,
+        "committed={:?}",
+        sentence.candidates_sample
+    );
     // 语言桶：读音非空 → zh
     assert_eq!(sentence.lang, Lang::Zh);
     assert_eq!(result.per_lang.zh.target_hit_rate, 1.0);

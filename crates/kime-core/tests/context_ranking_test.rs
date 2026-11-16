@@ -59,8 +59,14 @@ fn realtime_bigram_uses_previous_word_as_key() {
     let b_guo = d.lm_boost(&zh("果", "guo"));
 
     assert!(b_pre > 0, "高→频 应给频非零加成，实际 {b_pre}");
-    assert!(b_pre > b_guo, "频（5 次）应高于果（1 次）：{b_pre} vs {b_guo}");
-    assert!(b_pre <= CONTEXT_BOOST_CAP, "加成不得超过封顶 {CONTEXT_BOOST_CAP}");
+    assert!(
+        b_pre > b_guo,
+        "频（5 次）应高于果（1 次）：{b_pre} vs {b_guo}"
+    );
+    assert!(
+        b_pre <= CONTEXT_BOOST_CAP,
+        "加成不得超过封顶 {CONTEXT_BOOST_CAP}"
+    );
 }
 
 #[test]
@@ -86,7 +92,11 @@ fn english_commit_does_not_pollute_zh_bigram() {
     d.log_commit(Some(("if", "if")), &["gao".into()], "高", None);
 
     context_is_gao(&mut d);
-    assert_eq!(d.lm_boost(&zh("频", "pin")), 0, "英文上下文不应污染中文 bigram");
+    assert_eq!(
+        d.lm_boost(&zh("频", "pin")),
+        0,
+        "英文上下文不应污染中文 bigram"
+    );
 }
 
 #[test]
@@ -103,7 +113,10 @@ fn lm_boost_clamped_to_cap() {
     context_is_gao(&mut d);
     let b = d.lm_boost(&zh("频", "pin"));
     assert!(b > 0, "应有非零加成");
-    assert!(b <= CONTEXT_BOOST_CAP, "加成 {b} 超过封顶 {CONTEXT_BOOST_CAP}");
+    assert!(
+        b <= CONTEXT_BOOST_CAP,
+        "加成 {b} 超过封顶 {CONTEXT_BOOST_CAP}"
+    );
 }
 
 #[test]
@@ -118,7 +131,10 @@ fn context_recall_boosts_same_text_candidate() {
 
     // lookup_prefix 内部刷新片段缓存并写入「当前输入读音」，与引擎调用路径一致。
     let _ = d.lookup_prefix(&["pin".into()], "", 50);
-    assert!(d.lm_boost(&zh("频", "pin")) > 0, "读音匹配时上下文召回应加成");
+    assert!(
+        d.lm_boost(&zh("频", "pin")) > 0,
+        "读音匹配时上下文召回应加成"
+    );
 
     // 读音不匹配 → 召回不命中。
     let _ = d.lookup_prefix(&["hao".into()], "", 50);

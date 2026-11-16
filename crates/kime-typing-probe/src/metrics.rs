@@ -83,24 +83,21 @@ impl SentenceMetric {
             let (page_idx, page_size) = s.page;
             let start = page_idx * page_size;
             let end = start + page_size;
-            s.candidates.get(start..end).map_or(false, |window| {
-                window.iter().any(|c| c == &trace.text)
-            })
+            s.candidates
+                .get(start..end)
+                .map_or(false, |window| window.iter().any(|c| c == &trace.text))
         });
 
         // 退格次数：KeyEvent::Backspace 的样本数
-        let backspaces = samples.iter().filter(|s| matches!(s.event, crate::runner::KeyEvent::Backspace)).count();
+        let backspaces = samples
+            .iter()
+            .filter(|s| matches!(s.event, crate::runner::KeyEvent::Backspace))
+            .count();
 
         // 候选样本：取首键首屏前 5 个候选（精简报告体积）
         let candidates_sample = samples
             .first()
-            .map(|s| {
-                s.candidates
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .map(|s| s.candidates.iter().take(5).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
         let latencies: Vec<f64> = samples.iter().map(|s| s.latency_ms).collect();
@@ -166,7 +163,8 @@ impl Summary {
         let n = sentences.len().max(1);
         let target_hit = sentences.iter().filter(|s| s.target_hit).count() as f64 / n as f64;
         let top1_hit = sentences.iter().filter(|s| s.top1_hit).count() as f64 / n as f64;
-        let first_screen = sentences.iter().filter(|s| s.first_screen_hit).count() as f64 / n as f64;
+        let first_screen =
+            sentences.iter().filter(|s| s.first_screen_hit).count() as f64 / n as f64;
 
         let all_latencies: Vec<f64> = sentences
             .iter()
@@ -180,7 +178,8 @@ impl Summary {
 
         // 综合得分 0-100：命中率 60%、延迟 20%、操作成本 20%
         let latency_penalty = (latency_ms.p99_ms / 100.0).clamp(0.0, 1.0) * 20.0;
-        let op_penalty = ((backspace_count + reselect_count) as f64 / n as f64).clamp(0.0, 1.0) * 20.0;
+        let op_penalty =
+            ((backspace_count + reselect_count) as f64 / n as f64).clamp(0.0, 1.0) * 20.0;
         let hit_score = (target_hit + top1_hit + first_screen) / 3.0 * 60.0;
         let overall_score = (hit_score - latency_penalty - op_penalty).clamp(0.0, 100.0);
 

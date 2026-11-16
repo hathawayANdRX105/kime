@@ -1,7 +1,7 @@
 //! 报告渲染：输出 JSON/Markdown；包含 summary/per_lang/per_sentence/suggestions；
 //! rules-only 建议缺省提供，LLM 可选通过 `KIME_LLM_ENDPOINT`，缺失/失败静默降级。
 
-use crate::metrics::{PerLang, Summary};
+use crate::metrics::{PerLang, SentenceMetric, Summary};
 use crate::ProbeResult;
 use serde::Serialize;
 
@@ -26,13 +26,14 @@ impl ProbeReport {
     pub fn from_result(result: &ProbeResult) -> Self {
         let mut suggestions = rules_only_suggestions(&result.summary, &result.per_lang);
         // LLM 可选：端点已配置且编译了 `llm` feature 时追加；未配置/失败静默降级。
-        let summary_json = serde_json::to_string(&(
-            &result.summary,
-            &result.per_lang,
-            result.total_sentences,
-        ))
-        .unwrap_or_default();
-        suggestions.extend(crate::llm::LlmClient::from_env().suggestions(&summary_json).unwrap_or_default());
+        let summary_json =
+            serde_json::to_string(&(&result.summary, &result.per_lang, result.total_sentences))
+                .unwrap_or_default();
+        suggestions.extend(
+            crate::llm::LlmClient::from_env()
+                .suggestions(&summary_json)
+                .unwrap_or_default(),
+        );
         Self {
             schema_version: result.schema_version.clone(),
             generated_at: result.generated_at,
@@ -113,7 +114,10 @@ fn rules_only_suggestions(summary: &Summary, per_lang: &PerLang) -> Vec<String> 
     // per-lang 兜底
     for (lang, s) in [("zh", &per_lang.zh), ("en", &per_lang.en)] {
         if s.target_hit_rate < 0.8 {
-            suggestions.push(format!("{lang}: target_hit_rate {:.2} 低于 0.80，建议专项补强该语种语料。", s.target_hit_rate));
+            suggestions.push(format!(
+                "{lang}: target_hit_rate {:.2} 低于 0.80，建议专项补强该语种语料。",
+                s.target_hit_rate
+            ));
         }
     }
 
@@ -129,14 +133,29 @@ fn render_markdown_result(report: &ProbeReport) -> String {
     let mut md = String::new();
     md.push_str("# Typing Probe Report\n\n");
     md.push_str(&format!("- Schema version: {}\n", report.schema_version));
-    md.push_str(&format!("- Generated at (unix seconds): {}\n", report.generated_at));
+    md.push_str(&format!(
+        "- Generated at (unix seconds): {}\n",
+        report.generated_at
+    ));
     md.push_str(&format!("- Corpus: {}\n", report.corpus_id));
-    md.push_str(&format!("- Total sentences: {}\n\n", report.total_sentences));
+    md.push_str(&format!(
+        "- Total sentences: {}\n\n",
+        report.total_sentences
+    ));
 
     md.push_str("## Summary\n\n");
-    md.push_str(&format!("- Target hit rate: {:.4}\n", report.summary.target_hit_rate));
-    md.push_str(&format!("- Top-1 hit rate: {:.4}\n", report.summary.top1_hit_rate));
-    md.push_str(&format!("- First-screen hit rate: {:.4}\n", report.summary.first_screen_hit_rate));
+    md.push_str(&format!(
+        "- Target hit rate: {:.4}\n",
+        report.summary.target_hit_rate
+    ));
+    md.push_str(&format!(
+        "- Top-1 hit rate: {:.4}\n",
+        report.summary.top1_hit_rate
+    ));
+    md.push_str(&format!(
+        "- First-screen hit rate: {:.4}\n",
+        report.summary.first_screen_hit_rate
+    ));
     md.push_str(&format!(
         "- Latency (ms): mean={:.2}, p50={:.2}, p99={:.2}\n",
         report.summary.latency_ms.mean_ms,
@@ -144,13 +163,26 @@ fn render_markdown_result(report: &ProbeReport) -> String {
         report.summary.latency_ms.p99_ms
     ));
     md.push_str(&format!("- Page turns: {}\n", report.summary.page_turns));
-    md.push_str(&format!("- Backspace count: {}\n", report.summary.backspace_count));
-    md.push_str(&format!("- Reselect count: {}\n", report.summary.reselect_count));
-    md.push_str(&format!("- Overall score: {:.2}/100\n\n", report.summary.overall_score));
+    md.push_str(&format!(
+        "- Backspace count: {}\n",
+        report.summary.backspace_count
+    ));
+    md.push_str(&format!(
+        "- Reselect count: {}\n",
+        report.summary.reselect_count
+    ));
+    md.push_str(&format!(
+        "- Overall score: {:.2}/100\n\n",
+        report.summary.overall_score
+    ));
 
     md.push_str("## Per Lang\n\n");
-    md.push_str("| Lang | Target Hit | Top-1 Hit | First-Screen Hit | Latency p99 (ms) | Score |\n");
-    md.push_str("|------|------------|-----------|------------------|------------------|-------|\n");
+    md.push_str(
+        "| Lang | Target Hit | Top-1 Hit | First-Screen Hit | Latency p99 (ms) | Score |\n",
+    );
+    md.push_str(
+        "|------|------------|-----------|------------------|------------------|-------|\n",
+    );
     for (lang, s) in [("zh", &report.per_lang.zh), ("en", &report.per_lang.en)] {
         md.push_str(&format!(
             "| {lang} | {:.4} | {:.4} | {:.4} | {:.2} | {:.2} |\n",
@@ -207,7 +239,11 @@ mod tests {
                 target_hit_rate: 1.0,
                 top1_hit_rate: 1.0,
                 first_screen_hit_rate: 1.0,
-                latency_ms: crate::metrics::LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: crate::metrics::LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspace_count: 0,
                 reselect_count: 0,
@@ -218,7 +254,11 @@ mod tests {
                     target_hit_rate: 1.0,
                     top1_hit_rate: 1.0,
                     first_screen_hit_rate: 1.0,
-                    latency_ms: crate::metrics::LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                    latency_ms: crate::metrics::LatencyStats {
+                        mean_ms: 1.0,
+                        p50_ms: 1.0,
+                        p99_ms: 1.0,
+                    },
                     page_turns: 0,
                     backspace_count: 0,
                     reselect_count: 0,
@@ -228,7 +268,11 @@ mod tests {
                     target_hit_rate: 1.0,
                     top1_hit_rate: 1.0,
                     first_screen_hit_rate: 1.0,
-                    latency_ms: crate::metrics::LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                    latency_ms: crate::metrics::LatencyStats {
+                        mean_ms: 1.0,
+                        p50_ms: 1.0,
+                        p99_ms: 1.0,
+                    },
                     page_turns: 0,
                     backspace_count: 0,
                     reselect_count: 0,
@@ -244,7 +288,11 @@ mod tests {
                 top1_hit: true,
                 first_screen_hit: true,
                 keys: 5,
-                latency_ms: crate::metrics::LatencyStats { mean_ms: 1.0, p50_ms: 1.0, p99_ms: 1.0 },
+                latency_ms: crate::metrics::LatencyStats {
+                    mean_ms: 1.0,
+                    p50_ms: 1.0,
+                    p99_ms: 1.0,
+                },
                 page_turns: 0,
                 backspaces: 0,
                 reselections: 0,
@@ -277,6 +325,9 @@ mod tests {
         let mut result = sample_result();
         result.summary.target_hit_rate = 0.5;
         let report = ProbeReport::from_result(&result);
-        assert!(report.suggestions.iter().any(|s| s.contains("target_hit_rate")));
+        assert!(report
+            .suggestions
+            .iter()
+            .any(|s| s.contains("target_hit_rate")));
     }
 }

@@ -181,6 +181,10 @@ pub struct Dict {
     /// 没有它，实时 bigram 只能按「候选自己的文本」查——而 bigram 的语义是
     /// 「上一词的后继里出现过这个读音」，按候选文本查等于永远查不到（历史 bug）。
     lm_prev_text: Option<String>,
+    /// shell surrounding_text（光标前上文，汉字文本）。仅作召回线索：
+    /// 候选文本出现在这段上文里时给加成，用来恢复「刚打过的词」。
+    /// 与 `context_recall` 分开，因为后者按**读音**匹配，汉字永不命中。
+    context_tail: Option<String>,
 }
 
 /// 打开 rime `.dict.yaml`，交回 `...` 分隔线**之后**的正文行。中文/英文两条导入路径共用。
@@ -416,7 +420,9 @@ pub struct ContextRecall {
 
 impl ContextRecall {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// 记录一条已提交的片段/句子。同一文本+读音命中则刷新 hits 并前移；
@@ -438,18 +444,27 @@ impl ContextRecall {
         if self.entries.len() >= CONTEXT_RECALL_CAP {
             self.entries.pop();
         }
-        self.entries.insert(0, ContextEntry {
-            text: text.to_string(),
-            reading: reading.to_string(),
-            hits: 1,
-        });
+        self.entries.insert(
+            0,
+            ContextEntry {
+                text: text.to_string(),
+                reading: reading.to_string(),
+                hits: 1,
+            },
+        );
     }
 
     /// 为候选计算上下文召回加成。
     /// 当前输入读音与条目读音匹配（精确相等或前缀/后缀关系）且条目文本等于
     /// 候选文本时，给予与 hits 相关的加成，被 CONTEXT_BOOST_CAP 封顶。
-    pub fn boost_for(&self, candidate: &crate::model::Candidate, current_reading: Option<&str>) -> i64 {
-        let Some(current) = current_reading else { return 0 };
+    pub fn boost_for(
+        &self,
+        candidate: &crate::model::Candidate,
+        current_reading: Option<&str>,
+    ) -> i64 {
+        let Some(current) = current_reading else {
+            return 0;
+        };
         let mut best_hits: u64 = 0;
         for entry in &self.entries {
             if entry.text != candidate.text {
@@ -702,6 +717,7 @@ impl Dict {
             fragment_cache: RefCell::new(Vec::new()),
             realtime_bigram: HashMap::new(),
             lm_prev_text: None,
+            context_tail: None,
         })
     }
 
@@ -1801,7 +1817,11 @@ impl Dict {
         }
         // 本次词成为下一次查询的「上一词」。非中文提交不建立中文 bigram 关系，
         // 但要把外键清掉，否则英文词之后仍会按上上个中文词加成。
-        self.lm_prev_text = if cur_is_cjk { Some(text.to_string()) } else { None };
+        self.lm_prev_text = if cur_is_cjk {
+            Some(text.to_string())
+        } else {
+            None
+        };
 
         // 上下文召回：所有 kime 提交都记录（文本 + 读音）。
         self.context_recall.record(text, &current_reading);
@@ -1813,15 +1833,19 @@ impl Dict {
         *self.current_input_reading.borrow_mut() = reading.map(str::to_string);
     }
 
-    /// 记录 shell surrounding_text 到上下文召回结构（仅做召回线索，不写入 bigram）。
-    /// surrounding_text 与文本本身相等作为读音指纹；boost_for 仅在读音与当前输入
-    /// 读音有前缀/后缀/相等关系时才计分，汉字文本永远不会匹配拼音输入，故不会
-    /// 产生误加成。条目按 LRU 管理，与 commit_context_sync 的真实读音条目共享上限。
+    /// 记录 shell surrounding_text（光标前上文）作为召回线索。
+    ///
+    /// 与 `context_recall` **分开存**：那套条目的读音是拼音，按读音前缀匹配；
+    /// 而 surrounding_text 是汉字文本，与拼音永不匹配。混在一起只会白占 64 条
+    /// LRU 名额、淘汰真正能命中的拼音条目（历史 bug）。
     pub(crate) fn record_context_tail(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.context_recall.record(text, text);
+        if self.context_tail.as_deref() == Some(text) {
+            return;
+        }
+        self.context_tail = Some(text.to_string());
     }
 
     /// 刷新离线片段缓存：按当前输入读音查询 lm_fragment 表，供 `lm_boost` 的片段召回加成用。
@@ -1839,7 +1863,6 @@ impl Dict {
     fn is_cjk(c: char) -> bool {
         matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
     }
-
 
     /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
     ///
@@ -1938,16 +1961,23 @@ impl Dict {
             );
         }
         // 上下文召回：历史提交文本与当前输入读音匹配。
-        extra = extra.saturating_add(self.context_recall.boost_for(
-            c,
-            self.current_input_reading.borrow().as_deref(),
-        ));
+        extra = extra.saturating_add(
+            self.context_recall
+                .boost_for(c, self.current_input_reading.borrow().as_deref()),
+        );
         // 离线片段：历史片段读音与当前输入读音匹配。
         extra = extra.saturating_add(crate::lm::fragment_boost_for_reading(
             &self.fragment_cache.borrow(),
             self.current_input_reading.borrow().as_deref().unwrap_or(""),
             c,
         ));
+        // surrounding_text 召回：候选文本出现在光标前上文里 —— 恢复「刚打过的词」。
+        // 与读音类证据不同，这条按**文本**匹配，与 CJK 关键词同现即加分。
+        if let Some(tail) = self.context_tail.as_deref() {
+            if !tail.is_empty() && tail.contains(c.text.as_str()) {
+                extra = extra.saturating_add(CONTEXT_BIGRAM_UNIT);
+            }
+        }
 
         boost.saturating_add(extra.min(CONTEXT_BOOST_CAP))
     }

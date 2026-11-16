@@ -25,14 +25,23 @@ impl LlmClient {
     /// 从环境变量构造：`KIME_LLM_ENDPOINT`、`KIME_LLM_MODEL`、`KIME_LLM_API_KEY`。
     /// 未设端点时返回禁用客户端（endpoint=None）。
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("KIME_LLM_ENDPOINT").ok().filter(|s| !s.is_empty());
+        let endpoint = std::env::var("KIME_LLM_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty());
         let model = std::env::var("KIME_LLM_MODEL").unwrap_or_else(|_| "gpt-oss-120b".to_string());
-        let api_key = std::env::var("KIME_LLM_API_KEY").ok().filter(|s| !s.is_empty());
+        let api_key = std::env::var("KIME_LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
         let timeout_secs = std::env::var("KIME_LLM_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
-        Self { endpoint, model, api_key, timeout_secs }
+        Self {
+            endpoint,
+            model,
+            api_key,
+            timeout_secs,
+        }
     }
 
     /// 是否启用：端点已设且编译了 `llm` feature（否则静默降级 rules-only）。
@@ -88,19 +97,19 @@ struct LlmMessage {
 
 /// LLM 响应：最小解析，只取 `choices[0].message.content`。
 #[cfg(any(feature = "llm", test))]
- #[derive(Deserialize)]
+#[derive(Deserialize)]
 struct LlmResponse {
     choices: Option<Vec<LlmChoice>>,
 }
 
 #[cfg(any(feature = "llm", test))]
- #[derive(Deserialize)]
+#[derive(Deserialize)]
 struct LlmChoice {
     message: LlmResponseMessage,
 }
 
 #[cfg(any(feature = "llm", test))]
- #[derive(Deserialize)]
+#[derive(Deserialize)]
 struct LlmResponseMessage {
     content: String,
 }
@@ -119,7 +128,9 @@ fn post_json(endpoint: &str, body: &str, timeout_secs: u64) -> anyhow::Result<St
         .body(body.to_string())
         .send()
         .map_err(|e| anyhow::anyhow!("llm request: {e}"))?;
-    let text = resp.text().map_err(|e| anyhow::anyhow!("llm response: {e}"))?;
+    let text = resp
+        .text()
+        .map_err(|e| anyhow::anyhow!("llm response: {e}"))?;
     Ok(text)
 }
 
@@ -176,7 +187,12 @@ mod tests {
 
     #[test]
     fn suggestions_disabled_returns_none() {
-        let client = LlmClient { endpoint: None, model: "m".into(), api_key: None, timeout_secs: 5 };
+        let client = LlmClient {
+            endpoint: None,
+            model: "m".into(),
+            api_key: None,
+            timeout_secs: 5,
+        };
         assert!(client.suggestions("{}").is_none());
     }
 

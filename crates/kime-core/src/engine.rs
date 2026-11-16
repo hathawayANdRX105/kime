@@ -1077,7 +1077,7 @@ impl Engine {
         );
         self.last_commit = Some((word.to_string(), reading.join("'")));
         // 仅中文提交设置 LM bigram 上下文，英文只做历史片段召回（#4）。
-        if word.chars().next().map_or(false, is_cjk) {
+        if word.chars().next().is_some_and(is_cjk) {
             self.dict.set_lm_context(
                 self.last_commit
                     .as_ref()

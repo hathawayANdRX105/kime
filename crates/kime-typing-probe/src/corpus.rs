@@ -55,9 +55,9 @@ impl Corpus {
             if cols.len() < 2 {
                 continue;
             }
-            let freq: u64 = cols[0].parse().map_err(|e| {
-                anyhow::anyhow!("parse freq at line {line_no}: {e}")
-            })?;
+            let freq: u64 = cols[0]
+                .parse()
+                .map_err(|e| anyhow::anyhow!("parse freq at line {line_no}: {e}"))?;
             entries.push(CorpusEntry {
                 id: format!("{}:{}", path.display(), line_no + 1),
                 freq,

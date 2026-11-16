@@ -5,7 +5,12 @@
 //!（仅 dev-dep，随 crate 销毁即清）。不引入 platform/render，不依赖网络。
 //! kime-core 的按键常量（`KEY_*`）已 pub，此处直接复用，避免常量 drift 与 orphan-rule 违规。
 
-use kime_core::{engine::{KEY_BACKSPACE, KEY_EQUAL, KEY_ESC, KEY_MINUS, KEY_SPACE}, Engine, Key, Outcome};
+use crate::corpus::CorpusEntry;
+use kime_core::{
+    dict::Dict,
+    engine::{KEY_BACKSPACE, KEY_EQUAL, KEY_ESC, KEY_MINUS, KEY_SPACE},
+    Engine, Key, Outcome,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Instant;
@@ -83,7 +88,7 @@ impl Lang {
     /// 曾经按 id/文件名里的 `zh` 子串判断，而真实 id 形如
     /// `path/zh_articles.tsv:12`——只认 `starts_with("zh")` 时全部落进 `En`，
     /// per-lang 统计随之失真。判据统一到 [`crate::corpus::CorpusEntry::is_zh`]。
-    pub fn of_entry(entry: &corpus::CorpusEntry) -> Self {
+    pub fn of_entry(entry: &CorpusEntry) -> Self {
         if entry.is_zh() {
             Lang::Zh
         } else {
@@ -176,8 +181,8 @@ impl Runner {
     /// 默认配置（关闭纠错/双拼）：`Config { shuangpin: None, correction: false,
     /// ..Default::default() }`，`dict_path` 指向 tempfile 或已有 sqlite 库，不依赖
     /// 用户 ~/.config/kime。
-    pub fn new(dict_path: &Path, entry: &corpus::CorpusEntry) -> anyhow::Result<Self> {
-        let dict = kime_core::Dict::open(dict_path).map_err(|e| anyhow::anyhow!("dict open: {e}"))?;
+    pub fn new(dict_path: &Path, entry: &CorpusEntry) -> anyhow::Result<Self> {
+        let dict = Dict::open(dict_path).map_err(|e| anyhow::anyhow!("dict open: {e}"))?;
         let config = kime_core::config::Config {
             shuangpin: None,
             correction: false,
@@ -300,13 +305,13 @@ mod tests {
 
     #[test]
     fn lang_follows_entry_reading() {
-        let zh = corpus::CorpusEntry {
+        let zh = CorpusEntry {
             id: "path/zh_articles.tsv:12".to_string(),
             freq: 1,
             text: "我们".to_string(),
             pinyin: "wo'men".to_string(),
         };
-        let en = corpus::CorpusEntry {
+        let en = CorpusEntry {
             id: "path/en_articles.tsv:3".to_string(),
             freq: 1,
             text: "hello".to_string(),
