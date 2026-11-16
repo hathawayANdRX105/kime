@@ -453,7 +453,16 @@ impl Engine {
         // 剩余键串 = 原串去掉被选候选覆盖的音节。全拼按字母长度消耗；
         // 双拼按键位消耗（见 doc）。
         let old_len = self.letters.len();
-        let remaining = if self.sp_active {
+        // 英文候选的读音键就是词本身，与「音节序列」不是同一种东西：
+        // lookup_english 按**原始按键串**匹配（精确或前缀），所以被选中的英文词
+        // 覆盖了全部已敲字母 —— 整段消耗，面板随之关闭。
+        //
+        // 不这么处理的后果（实测）：双拼下 `skill` 的 consumed 被当成 1 个音节，
+        // 只吃掉 2 键，剩下 `chail` 继续留在组合里，空格选完面板不退出，
+        // 下一次上屏变成「skill拆历来」这种拼接串。
+        let remaining = if cand.lang == Lang::En {
+            String::new()
+        } else if self.sp_active {
             let k = consumed.len();
             let cut = 2 * k;
             if cut >= self.letters.len() {

@@ -1,13 +1,17 @@
-//! 中文候选统一置于英文候选之前（例如 `ok`：哦可、哦可哦可 在 OK、okay 之前），
+//! 英文候选的层序、按键消耗与噪声闸。
 //!
-//! 中文内部保持精确→补全，英文内部保持精确→补全；两字母门槛不变。
-//! `ok` 与 `an` 回归覆盖中文整块在前、英文块内层序。
+//! 排序口径见 `crate::model::RankKey`：层（精确→补全）在分数之前，跨语言竞争发生在
+//! 同层之内；两字母门槛不变。
+//! `ok` / `an` 覆盖中英候选的层序；`skill` 覆盖英文候选在双拼下的按键消耗
+//!（空格选中必须整词上屏并关闭面板）。
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kime_core::config::Config;
 use kime_core::dict::{Candidate, Dict};
+use kime_core::engine::KEY_SPACE;
+use kime_core::Scheme;
 use kime_core::{Engine, Key, Outcome};
 
 /// `ok` 时中文只有层二补全（哦可 o'ke、哦可哦可 o'ke'o'ke）：中文整块在英文块之前。
@@ -28,6 +32,7 @@ const EN: &str = "\
 OK	OK	10
 okay	okay	500000
 an	an	20
+skill	skill	900
 ";
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -61,6 +66,55 @@ fn engine(tag: &str) -> (Engine, std::path::PathBuf) {
         },
     );
     (e, dir)
+}
+
+/// 双拼（自然码）引擎：验证英文候选在双拼下的按键消耗。
+fn sp_engine(tag: &str) -> (Engine, std::path::PathBuf) {
+    let dir = tmp_dir(tag);
+    let cn = dir.join("cn.yaml");
+    let en = dir.join("en.yaml");
+    fs::write(&cn, CN).unwrap();
+    fs::write(&en, EN).unwrap();
+    let mut dict = Dict::open(dir.join("dict.sqlite3")).unwrap();
+    dict.import(&cn).unwrap();
+    dict.import_english(&en).unwrap();
+    let e = Engine::new(
+        dict,
+        Config {
+            shuangpin: Some(Scheme::Ziranma),
+            ..Config::default()
+        },
+    );
+    (e, dir)
+}
+
+/// 空格选中英文候选必须**一次上屏并关闭面板**。
+///
+/// 回归的 bug：英文候选的读音键是词本身（不是音节序列），旧实现按「音节个数 × 2 键」
+/// 计算消耗，双拼下只吃掉 2 键，剩下的键留在组合里——面板不退出，下一次上屏变成
+/// 「skill + 残余音节」的拼接串（用户实测：选 skill 后接着敲 ill，上屏 skill拆历来）。
+#[test]
+fn space_on_english_candidate_commits_and_closes_panel() {
+    let (mut e, dir) = sp_engine("en_commit");
+    type_letters(&mut e, "skill");
+    assert!(
+        e.candidates().iter().any(|c| c.text == "skill"),
+        "候选里必须有英文 skill"
+    );
+    assert_eq!(
+        e.key(Key {
+            ch: None,
+            code: KEY_SPACE,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        }),
+        Outcome::Commit("skill".into()),
+        "空格选英文候选必须整词上屏"
+    );
+    assert!(e.preedit().is_empty(), "上屏后面板必须关闭");
+    assert!(e.candidates().is_empty(), "上屏后候选必须清空");
+    let _ = fs::remove_dir_all(dir);
 }
 
 fn type_letters(e: &mut Engine, s: &str) {
