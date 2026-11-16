@@ -99,6 +99,8 @@ fn zh_wo_men_hit() {
     let runner = run_one(&db_path, "我们", "wo'men", Lang::Zh, &events);
     let trace = runner.trace();
 
+    // 上屏文本必须等于目标（真正证明「打出来了」，而非只证明按键被消费）
+    assert_eq!(trace.committed, "我们", "逐字 wo'men + 空格应上屏「我们」");
     // 每键都有采样
     assert_eq!(trace.samples.len(), events.len());
     // 耗时非负
@@ -399,36 +401,50 @@ fn report_markdown_sections() {
     assert!(md.contains("## Suggestions"));
 }
 
-/// 排序层契约：中文精确 → 英文精确 → 中文补全 → 英文补全。
-/// 本 crate 不修改 core 排序，只断言消费侧不破坏该层序：
-/// 对同一拼音前缀，中文精确匹配条目排在英文精确之前，
-/// 中文补全再之前英文补全；Candidate.ai 仅标记 AI 来源，不参与层内顺序。
+/// 排序层契约：中文精确 → 中文补全；且候选层序单调不降。
+///
+/// 词库里有 `ni`（你/尼，精确）与 `ni hao`（你好，补全），断言：
+/// 1. 候选非空；
+/// 2. 层序单调不降（`Layer` 序：Exact &lt; Completion）——跨层回归直接被捕获；
+/// 3. 中文精确「你」在中文补全「你好」之前。
+///
+/// 只断言「某候选出现过」捕捉不到跨层回归（词库缺条目时永远成立）。
 #[test]
 fn sorting_layer_contract_not_broken() {
     let tmp = TempDir::new().expect("tmpdir");
     let db_path = build_test_dict(&tmp);
 
-    // 在同一拼音块下插入中英文精确与补全条目，核对 Engine 输出候选的层序。
     let entry = CorpusEntry {
-        id: "test:zh:nihao".to_string(),
+        id: "test:zh:ni".to_string(),
         freq: 100,
-        text: "你好".to_string(),
-        pinyin: "ni'hao".to_string(),
+        text: "你".to_string(),
+        pinyin: "ni".to_string(),
     };
     let mut runner = Runner::new(&db_path, &entry).expect("build runner");
     let events = [KeyEvent::Char { ch: 'n' }, KeyEvent::Char { ch: 'i' }];
     runner.run(&events).expect("run keys");
 
     let cands = runner.engine().candidates();
-    // 首候选应为中文精确匹配（若库内有）；否则不为空且首项非 ai 标记伪造。
-    assert!(!cands.is_empty());
-    // 中文精确应在英文精确之前（本库内若无英文，则首为中文）。
-    let first_zh = cands.iter().any(|c| c.text == "你好");
-    assert!(
-        first_zh,
-        "中文精确 '你好' 应出现在候选列表，实际: {:?}",
-        cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
-    );
+    assert!(!cands.is_empty(), "候选不应为空");
+
+    // 层序单调不降：RankKey 的 tier 在分数之前比较。
+    for w in cands.windows(2) {
+        assert!(
+            w[0].layer <= w[1].layer,
+            "层序必须单调不降：{:?} 在 {:?} 之前",
+            (w[0].text.as_str(), w[0].layer),
+            (w[1].text.as_str(), w[1].layer)
+        );
+    }
+
+    let pos = |t: &str| cands.iter().position(|c| c.text == t);
+    if let (Some(zh_exact), Some(zh_comp)) = (pos("你"), pos("你好")) {
+        assert!(
+            zh_exact < zh_comp,
+            "中文精确「你」应在中文补全「你好」之前：{:?}",
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// LLM client：缺省未设端点时 disabled，suggestions 返回 None（静默降级）。

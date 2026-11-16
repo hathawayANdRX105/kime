@@ -1840,6 +1840,10 @@ impl Dict {
     /// LRU 名额、淘汰真正能命中的拼音条目（历史 bug）。
     pub(crate) fn record_context_tail(&mut self, text: &str) {
         if text.is_empty() {
+            // 空文本 = 上下文断裂（句首 / 光标位置非法）：必须清掉旧段文本，
+            // 否则 has_context 恒为真，上一段的 surrounding_text 会继续给新句子
+            // 的候选加分（跨段污染，违反「无上下文 = 裸频序」）。
+            self.context_tail = None;
             return;
         }
         if self.context_tail.as_deref() == Some(text) {
@@ -1848,15 +1852,38 @@ impl Dict {
         self.context_tail = Some(text.to_string());
     }
 
+    /// 清空 surrounding_text 召回线索（上下文断裂时由引擎调用）。
+    pub(crate) fn clear_context_tail(&mut self) {
+        self.context_tail = None;
+    }
+
     /// 刷新离线片段缓存：按当前输入读音查询 lm_fragment 表，供 `lm_boost` 的片段召回加成用。
-    /// 读音未变则直接返回（零查询），避免每次按键都查库。
+    ///
+    /// 两处省查询：
+    /// - 读音未变 → 直接返回（同一读音内重复按键不查库）；
+    /// - **无上下文** → 清空缓存直接返回。片段加成只在有上下文时才计分
+    ///   （见 `lm_boost` 的 `has_context` 门控），此时查库纯属白跑。
     pub(crate) fn refresh_fragment_cache(&self, reading: &str) {
+        if !self.has_context() {
+            self.set_current_input_reading(Some(reading));
+            *self.fragment_cache.borrow_mut() = Vec::new();
+            return;
+        }
         if self.current_input_reading.borrow().as_deref() == Some(reading) {
             return;
         }
         self.set_current_input_reading(Some(reading));
         *self.fragment_cache.borrow_mut() =
             crate::lm::query_fragments_by_reading(&self.conn, reading, 16).unwrap_or_default();
+    }
+
+    /// 当前是否存在上下文（上一提交词或 surrounding_text）。
+    ///
+    /// 加成路径的统一门控：`lm_boost` 用它决定要不要计新增三路，
+    /// `refresh_fragment_cache` 用它决定要不要查库。
+    #[inline]
+    fn has_context(&self) -> bool {
+        self.lm_prev_text.is_some() || self.context_tail.is_some()
     }
 
     /// 单个字符是否为 CJK（用于判断中文上下文，避免英文污染中文 bigram）。
@@ -1950,7 +1977,7 @@ impl Dict {
         // 没有上下文 = 用户刚开始一句新输入，此时必须退回裸频序——
         // 否则「历史提交过的高频片段」会无条件压过语料频率，清上下文也不恢复
         // （`lm_mine_test::lm_context_reorders_candidates` 钉的就是这条）。
-        let has_context = self.lm_prev_text.is_some() || self.context_tail.is_some();
+        let has_context = self.has_context();
         let mut extra: i64 = 0;
         if has_context {
             self.push_context_boost(&mut extra, c);

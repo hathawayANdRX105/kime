@@ -5,9 +5,12 @@
 //! 2. 上下文不匹配时不加成（外键错配 = 恒零，这里钉死正确方向）；
 //! 3. 英文提交不污染中文 bigram；
 //! 4. 加成被 CONTEXT_BOOST_CAP 封顶，永不压过裸频；
-//! 5. 离线片段挖掘计入 MineStats.fragments_mined。
+//! 5. **无上下文 = 加成归零**（门控，跨段污染回归）；
+//! 6. 离线片段挖掘计入 MineStats.fragments_mined。
 //!
-//! 不引入新依赖，沿用 main 风格（临时 sqlite + Dict::open）。
+//! 只用公共 API：integration test 拿不到 `pub(crate)` 的
+//! `record_context_tail` / `set_current_input_reading`，上下文入口一律走
+//! `log_commit` + `set_lm_context`，与引擎真实调用路径一致。
 
 use kime_core::dict::{Dict, CONTEXT_BOOST_CAP};
 use kime_core::lm;
@@ -139,6 +142,38 @@ fn context_recall_boosts_same_text_candidate() {
     // 读音不匹配 → 召回不命中。
     let _ = d.lookup_prefix(&["hao".into()], "", 50);
     assert_eq!(d.lm_boost(&zh("频", "pin")), 0, "读音不匹配时不应加成");
+}
+
+/// 无上下文 = 加成归零。
+///
+/// 钉住门控：上下文断裂后（`set_lm_context(None)`），实时 bigram / 上下文召回 /
+/// 离线片段都不得继续加分——否则上一段的文本会跨段污染新句子的候选顺序。
+#[test]
+fn no_context_means_zero_boost() {
+    let db = tmp_db("noctx");
+    let mut d = Dict::open(&db).unwrap();
+
+    // 全新库：既无提交历史也无上下文。
+    assert_eq!(d.lm_boost(&zh("频", "pin")), 0, "空库不应有加成");
+
+    // 建立历史：高→频 反复提交。
+    for _ in 0..5 {
+        d.log_commit(None, &["gao".into()], "高", None);
+        d.log_commit(Some(("高", "gao")), &["pin".into()], "频", None);
+    }
+
+    // 有上下文：加成非零。
+    context_is_gao(&mut d);
+    let with_ctx = d.lm_boost(&zh("频", "pin"));
+    assert!(with_ctx > 0, "有上下文时 高→频 应加成，实际 {with_ctx}");
+
+    // 上下文断裂：加成归零。
+    d.set_lm_context(None);
+    assert_eq!(
+        d.lm_boost(&zh("频", "pin")),
+        0,
+        "清上下文后应退回裸频序（加成归零）"
+    );
 }
 
 #[test]

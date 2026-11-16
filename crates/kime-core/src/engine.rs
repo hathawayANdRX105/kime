@@ -331,8 +331,11 @@ impl Engine {
     pub fn set_context(&mut self, tail: Option<String>) {
         // surrounding_text 只做上下文召回线索，不写入 bigram（#2）；
         // kime 自己的 Commit 才由 commit_context_sync 写 realtime bigram。
-        if let Some(t) = tail.as_deref() {
-            self.dict.record_context_tail(t);
+        // `None` = 上下文断裂：必须同时清掉召回线索，否则上一段文本会继续
+        // 给新句子的候选加分（跨段污染）。
+        match tail.as_deref() {
+            Some(t) => self.dict.record_context_tail(t),
+            None => self.dict.clear_context_tail(),
         }
         self.context = tail;
         self.last_commit = None;
