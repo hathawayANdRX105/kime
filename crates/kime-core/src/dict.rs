@@ -1274,7 +1274,7 @@ impl Dict {
             let user_candidates = self.overlay_exact(&joined);
             return Ok(self.merge_overlay(base, user_candidates, limit));
         }
-        let start = self.index.partition_point(|e| e.pinyin < &joined);
+        let start = self.index.partition_point(|e| e.pinyin < joined);
         let mut candidates = Vec::new();
         for entry in &self.index[start..] {
             if entry.pinyin != joined {
@@ -1786,10 +1786,10 @@ impl Dict {
 
         // 实时 bigram：prev_word → current_word，仅中文→中文。
         // realtime_bigram 不被 set_lm_context 清空，与离线 lm_counts 互补。
-        let cur_is_cjk = text.chars().next().is_some_and(is_cjk);
+        let cur_is_cjk = text.chars().next().is_some_and(Self::is_cjk);
         if !current_reading.is_empty() && cur_is_cjk {
             if let Some((prev_text, _)) = prev {
-                if prev_text.chars().next().is_some_and(is_cjk) {
+                if prev_text.chars().next().is_some_and(Self::is_cjk) {
                     self.realtime_bigram
                         .entry(prev_text.to_string())
                         .or_default()

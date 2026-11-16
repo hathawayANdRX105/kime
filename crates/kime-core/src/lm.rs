@@ -321,7 +321,7 @@ fn fragment_counts_from_rows(rows: &[FragmentRow]) -> std::collections::HashMap<
             continue;
         }
         // 向前扩展，收集连续非空行构成的序列
-        let mut seq_start = i;
+        let seq_start = i;
         while i < n && !rows[i].text.is_empty() && !rows[i].reading.is_empty() {
             i += 1;
         }
@@ -475,7 +475,7 @@ pub fn query_fragments_by_reading(
             })
         },
     )?;
-    rows.flatten().collect()
+    Ok(rows.flatten().collect())
 }
 
 /// 纯加成助手：给定候选与当前读音，若候选与某历史片段匹配则返回加成。
@@ -859,8 +859,6 @@ fn vocab_id_for_text(conn: &Connection, text: &str, today: i64) -> rusqlite::Res
         |r| r.get(0),
     )
 }
-
-use rusqlite::params;
 
 /// 「今天」= UNIX 纪元以来的天数（与 dict.rs 的 today_days 同语义）。
 fn today_days() -> i64 {

@@ -329,14 +329,14 @@ impl Engine {
     /// `None` = 光标前无可用上下文。外部文本/光标编辑会终止 kime 提交词链，避免把
     /// 不相邻的输出学成 bigram；kime 自己的 Commit echo 由平台壳过滤，不影响连续输入。
     pub fn set_context(&mut self, tail: Option<String>) {
+        // surrounding_text 只做上下文召回线索，不写入 bigram（#2）；
+        // kime 自己的 Commit 才由 commit_context_sync 写 realtime bigram。
+        if let Some(t) = tail.as_deref() {
+            self.dict.record_context_tail(t);
+        }
         self.context = tail;
         self.last_commit = None;
         self.dict.set_lm_context(None);
-        // surrounding_text 只做上下文召回线索，不写入 bigram（#2）；
-        // kime 自己的 Commit 才由 commit_context_sync 写 realtime bigram。
-        if let Some(t) = &tail {
-            self.dict.record_context_tail(t);
-        }
     }
 
     /// 当前上下文尾巴（分词 / 排序的上下文输入），无上下文时 `None`。
