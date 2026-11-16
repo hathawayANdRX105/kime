@@ -26,13 +26,16 @@ const CN: &str = "\
 安排	an pai	7000000
 ";
 
-/// 英文块只含 exact（OK/an）与补全（okay），内部精确优先于补全，整块接在中文候选之后。
+/// 英文词表刻意放一条高频词（zebra 900000）当基准：跨语言分数是「在本语言分布里的
+/// 相对位置」，若被测词恰好是词表最大频，它会并列满分并按文本序胜出，断言就不再
+/// 表达任何契约（小词表上的历史误判来源）。
 const EN: &str = "\
 ...
 OK	OK	10
 okay	okay	500000
 an	an	20
 skill	skill	900
+zebra	zebra	900000
 ";
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -137,38 +140,48 @@ fn texts(cands: &[Candidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
 
-/// 中文层一为空（`ok` 无读音恰为 o'k 的词）：中文补全块（哦可、哦可哦可）在英文块之前；
-/// 英文块内精确 OK 仍先于补全 okay。
+/// 排序键是 `(层, 校准分数, 文本, 来源)`：**层在分数之前，跨语言竞争只发生在同层内**。
+///
+/// 输入 `ok`：中文只有补全（哦可 9M / 哦可哦可 8M，层二）；英文有精确词 OK（层一）
+/// 与补全词 okay（层二）。因此：
+///
+/// - 英文精确 OK（层一）排在中文补全之前——层一整体在层二之前，与语言无关；
+/// - 英文补全 okay（500k）与中文补全 哦可（9M）同层比分，哦可更高，故在前。
 #[test]
-fn chinese_leads_english_when_layer_one_empty() {
+fn layer_one_beats_layer_two_across_languages() {
     let (mut e, dir) = engine("ok");
     type_letters(&mut e, "ok");
     let got = texts(e.candidates());
-    let ok_pos = got.iter().position(|t| *t == "OK").unwrap();
-    let oke_pos = got.iter().position(|t| *t == "哦可").unwrap();
-    let okeoke_pos = got.iter().position(|t| *t == "哦可哦可").unwrap();
-    let okay_pos = got.iter().position(|t| *t == "okay").unwrap();
-    // 中文候选统一在英文候选之前；英文块内精确仍先于补全。
-    assert!(oke_pos < ok_pos, "中文补全 哦可 不得落后于英文 OK：{got:?}");
+    let pos = |t: &str| got.iter().position(|x| *x == t).unwrap();
+    let (ok, oke, okeoke, okay) = (pos("OK"), pos("哦可"), pos("哦可哦可"), pos("okay"));
     assert!(
-        okeoke_pos < ok_pos,
-        "中文补全 哦可哦可 不得落后于英文 OK：{got:?}"
+        ok < oke,
+        "层一（英文精确）整体在层二（中文补全）之前：{got:?}"
     );
-    assert!(ok_pos < okay_pos, "英文块内精确仍先于补全：{got:?}");
+    assert!(ok < okay, "英文精确仍先于英文补全：{got:?}");
+    assert!(oke < okay, "同层比分：900k 应压过 500k：{got:?}");
+    assert!(
+        oke < okeoke,
+        "同层同分文本升序前的频率序：9M 在 8M 之前：{got:?}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 中文层一非空（安/按）：中文精确 → 中文补全（安排）→ 英文精确（an），
-/// 即中文整块在英文候选之前，英文块内只有一条 exact。
+/// 输入 `an`：中文层一 安(9M)/按(8M)，英文层一 an(20，英文表基准 900k)，
+/// 中文层二 安排。
+///
+/// 期望 `安 按 an 安排`：
+/// - 层一内部按分数：安 > 按 > an（an 在本语言分布里位置很低）；
+/// - 层二整体在层一之后：安排 排在 an 之后——**层序压制分数**，不是「谁分高谁在前」。
 #[test]
-fn chinese_exact_then_completion_then_english() {
+fn layer_order_beats_score_across_languages() {
     let (mut e, dir) = engine("an");
     type_letters(&mut e, "an");
     let got = texts(e.candidates());
     assert_eq!(
         got,
-        ["安", "按", "安排", "an"],
-        "中文整块在英文候选之前：{got:?}"
+        ["安", "按", "an", "安排"],
+        "层一（安/按/an）整体在层二（安排）之前：{got:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }
