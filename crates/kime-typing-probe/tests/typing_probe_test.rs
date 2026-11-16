@@ -10,7 +10,7 @@ use kime_typing_probe::{
     report::{render_markdown, to_json, ProbeReport, SCHEMA_VERSION},
     runner::{KeyEvent, Lang, Runner},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 const CN_DICT: &str = "\
@@ -70,13 +70,7 @@ fn build_test_dict(tmp: &TempDir) -> PathBuf {
 }
 
 /// 为单条语料构造 Runner 并回放给定按键脚本。
-fn run_one(
-    dict_path: &PathBuf,
-    text: &str,
-    pinyin: &str,
-    lang: Lang,
-    events: &[KeyEvent],
-) -> Runner {
+fn run_one(dict_path: &Path, text: &str, pinyin: &str, lang: Lang, events: &[KeyEvent]) -> Runner {
     let entry = CorpusEntry {
         id: format!("test:{lang:?}:{text}"),
         freq: 1,
