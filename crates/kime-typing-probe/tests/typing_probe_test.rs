@@ -698,3 +698,34 @@ fn continuous_replay_keeps_entries_aligned() {
             .collect::<Vec<_>>()
     );
 }
+
+/// 零样本语种不得产生「命中率过低」建议：没测过 ≠ 测得差。
+///
+/// 回归：纯中文语料下 en 桶全零，旧实现据此输出
+/// 「en: target_hit_rate 0.00 低于 0.80，建议专项补强该语种语料。」
+#[test]
+fn zero_sample_language_gets_no_suggestion() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let corpus_path = tmp.path().join("zh_only.tsv");
+    std::fs::write(&corpus_path, "1\t我们\two'men\n").expect("write corpus");
+
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
+    let report = kime_typing_probe::report::ProbeReport::from_result(&result);
+
+    assert!(
+        !report.suggestions.iter().any(|s| s.starts_with("en:")),
+        "en 桶零样本时不应给 en 建议：{:?}",
+        report.suggestions
+    );
+    // 同时确认 zh 桶的建议路径仍然活着（避免把整条 per-lang 建议都关掉）。
+    assert!(
+        report
+            .suggestions
+            .iter()
+            .any(|s| s.contains("暂无规则建议")),
+        "全命中时应落到「暂无规则建议」：{:?}",
+        report.suggestions
+    );
+}
