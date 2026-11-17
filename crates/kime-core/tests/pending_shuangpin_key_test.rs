@@ -109,10 +109,12 @@ fn pending_key_completes_into_the_full_syllable() {
 /// 带指定词条的引擎：`rows` 是 `(拼音, 词, 频率)`。
 ///
 /// 默认 `engine()` 的 fixture 只有 shi/wu/u，测不了 a 系与 un 系。
-fn engine_with(db: &std::path::Path, rows: &[(&str, &str, i64)]) -> Engine {
+fn engine_with<S: AsRef<str>>(db: &std::path::Path, rows: &[(S, S, i64)]) -> Engine {
     let _ = Dict::open(db).expect("create schema");
     let conn = rusqlite::Connection::open(db).unwrap();
     for (pinyin, text, freq) in rows {
+        let pinyin = pinyin.as_ref();
+        let text = text.as_ref();
         conn.execute(
             "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, ?3, ?4, 0)",
             rusqlite::params![
@@ -189,5 +191,78 @@ fn lone_consonant_key_keeps_final_intent() {
     assert!(
         got.contains(&"论") && got.contains(&"军"),
         "单敲 p（Ziranma 韵母位 un/ün）应出 lun/jun 系列，实际 {got:?}"
+    );
+}
+
+/// 两个意图的**相对次序**：声母位意图整体在韵母位意图之前。
+///
+/// 回归的契约矛盾：`merge_half_key_intents` 旧实现把两批压平后按分数统一排，
+/// 从未保证过「声母位优先」——`pending_shuangpin_key_queries_its_initial` 里
+/// `是 < 乌` 只是因为 fixture 中 是(9000) 恰比 乌(7000) 频高。
+///
+/// 这里把两个意图的频率**反过来**（韵母位的 `乌` 更高），顺序仍须由意图决定：
+/// 声母位意图的词全部排在韵母位意图之前。
+#[test]
+fn initial_intent_sorts_before_final_intent_regardless_of_score() {
+    let db = tmp_db("intent_order");
+    let mut e = engine_with(
+        &db,
+        &[
+            ("shi", "事", 1_000),    // 声母位：sh 系（低频率）
+            ("wu", "乌", 9_000_000), // 韵母位：*u 系（高频率）
+            ("bu", "不", 8_000_000),
+        ],
+    );
+    type_str(&mut e, "u");
+    let got: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+    let shi = got
+        .iter()
+        .position(|t| *t == "事")
+        .expect("声母位词「事」应在列");
+    let wu = got
+        .iter()
+        .position(|t| *t == "乌")
+        .expect("韵母位词「乌」应在列");
+    assert!(
+        shi < wu,
+        "声母位意图必须整体在韵母位之前，即使韵母位词频高得多：{got:?}"
+    );
+}
+
+/// 韵母位意图的**保底份额**：声母位词很多时，韵母位也不能被挤出候选窗。
+///
+/// 回归：旧实现里声母位查询自己就按 `candidate_limit` 截断，合批后整体再截断，
+/// 于是声母位读音一多韵母位就 0 条可见——真实词库实测敲 `p` 首 50 条里一条
+/// un/ün 系列都没有，韵母位意图等于不存在。
+#[test]
+fn final_intent_keeps_a_reserved_quota() {
+    // 声母位：30 个 p 系音节（pa/pai/pan/pang/pao/pei/pen/peng/pi/pian/…）
+    let finals = [
+        "pa", "pai", "pan", "pang", "pao", "pei", "pen", "peng", "pi", "pian", "piao", "pie",
+        "pin", "ping", "po", "pou", "pu", "pa", "pai", "pan", "pang", "pao", "pei", "pen", "peng",
+        "pi", "pian", "piao", "pie", "pin",
+    ];
+    let mut rows: Vec<(String, String, i64)> = finals
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.to_string(), format!("声母{i}"), 1_000_000 + i as i64))
+        .collect();
+    // 韵母位：un/ün 系列
+    rows.push(("lun".to_string(), "论".to_string(), 10));
+    rows.push(("jun".to_string(), "军".to_string(), 9));
+
+    let db = tmp_db("quota");
+    let mut e = engine_with(&db, &rows);
+    type_str(&mut e, "p");
+    let got: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+    assert!(
+        got.contains(&"论") && got.contains(&"军"),
+        "声母位占满窗口时，韵母位必须有保底份额（论/军 应可见）：{got:?}"
+    );
+    // 且声母位仍在前
+    let first_final = got.iter().position(|t| *t == "论").expect("论应在列");
+    assert!(
+        first_final > 0,
+        "声母位意图应排在韵母位之前，论不该是首候选：{got:?}"
     );
 }
