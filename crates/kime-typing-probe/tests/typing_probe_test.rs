@@ -578,32 +578,36 @@ fn shipped_fixtures_parse() {
     assert_eq!(en.en_entries().len(), en.len());
 }
 
-/// 配置透传：`shuangpin: Some(Ziranma)` 下 `ui` 必须解码成 `shi`（中文精确命中「是」）。
+/// 配置透传：语料用**双拼键串**（自然码 `shi` = `ui`）时，`shuangpin: Some(Ziranma)`
+/// 必须解出「是」。
 ///
-/// 这条钉住「probe 能跑用户的实际方案」：写死 `shuangpin: None` 时 `ui` 会按全拼
-/// 解成 `u`+`i`，候选里根本没有「是」。
+/// 语料里的键是「按哪种方案敲出来的键」，必须和 `--mode` 一致。这条钉住 `Config`
+/// 真的透传到了引擎——写死 `shuangpin: None` 时 `ui` 会被当成全拼的 `u`+`i`，
+/// 候选里根本没有「是」。
 #[test]
-fn config_controls_shuangpin_decoding() {
+fn ziranma_config_decodes_ziranma_corpus() {
     let tmp = TempDir::new().expect("tmpdir");
     let db_path = build_test_dict(&tmp);
     let corpus_path = tmp.path().join("zh_articles.tsv");
-    std::fs::write(&corpus_path, "1\t是\tshi\n").expect("write corpus");
+    std::fs::write(&corpus_path, "1\t是\tui\n").expect("write corpus");
 
-    let mut config = kime_core::config::Config::default();
-    config.shuangpin = Some(kime_core::Scheme::Ziranma);
+    let config = kime_core::config::Config {
+        shuangpin: Some(kime_core::Scheme::Ziranma),
+        ..Default::default()
+    };
     let result = kime_typing_probe::run(&corpus_path, &db_path, config).expect("run probe");
 
     let sentence = &result.per_sentence[0];
     assert!(
         sentence.target_hit,
-        "双拼下 shi 应上屏「是」：{:?}",
+        "双拼音料 + 双拼配置应上屏「是」：{:?}",
         sentence.candidates_sample
     );
 }
 
-/// 全拼配置下同一份语料解不出「是」——证明上面那条的差异真的来自配置透传。
+/// 全拼音料 + 默认（全拼）配置同样命中：默认路径不能被双拼那条带坏。
 #[test]
-fn full_pinyin_config_decodes_differently() {
+fn full_config_decodes_full_pinyin_corpus() {
     let tmp = TempDir::new().expect("tmpdir");
     let db_path = build_test_dict(&tmp);
     let corpus_path = tmp.path().join("zh_articles.tsv");
@@ -613,8 +617,8 @@ fn full_pinyin_config_decodes_differently() {
         kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
     let sentence = &result.per_sentence[0];
     assert!(
-        !sentence.target_hit,
-        "全拼下 `shi` 是 s+h+i 三个键，不应等于「是」：{:?}",
+        sentence.target_hit,
+        "全拼音料 + 全拼配置应上屏「是」：{:?}",
         sentence.candidates_sample
     );
 }

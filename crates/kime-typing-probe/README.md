@@ -34,8 +34,12 @@ pinyin 里 `'` 分隔音节，空白是**显式上屏边界**：`wo'men jin'tian
 原因：kime 的实时上下文排序（`lm_prev_text` / `context_tail` / 实时 bigram）是跨条目
 累积的。每条新建引擎会让上下文加成恒为零，测不出「前一个词影响下一个词」的体验差异。
 
-`config` 由调用方给（CLI 传 `Config::load()` 并按 `--mode` 覆盖 `shuangpin`）：语料里的
-键是拼音字母，双拼用户必须让引擎按双拼解码，否则测的不是他实际敲的键。
+`config` 由调用方给（CLI 传 `Config::load()` 并按 `--mode` 覆盖 `shuangpin`）。
+
+**语料里的键是「按哪种方案敲出来的键」，必须和 `--mode` 一致。** 自带的
+`zh_articles.tsv` 用全拼（`shi`），所以默认 `--mode full` 就对；要模拟自然码双拼，
+把语料里的键换成双拼键串（自然码 `shi` = `ui`）并传 `--mode ziranma`，否则引擎会把
+全拼字母按双拼逐键解码，解出别的音节。
 
 ## 使用
 
@@ -43,13 +47,13 @@ pinyin 里 `'` 分隔音节，空白是**显式上屏边界**：`wo'men jin'tian
 # 1. 准备词库
 kime --dict /tmp/probe.sqlite3 --import <dict.yaml>
 
-# 2. 回放语料（--mode ziranma 走自然码双拼）
+# 2. 回放语料（默认 --mode full，与自带语料的编码一致）
 kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv \
-    --dict /tmp/probe.sqlite3 --mode ziranma --out /tmp/report.md
+    --dict /tmp/probe.sqlite3 --out /tmp/report.md
 
 # 3. 机读格式
 kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv \
-    --dict /tmp/probe.sqlite3 --mode ziranma --json
+    --dict /tmp/probe.sqlite3 --json
 ```
 
 作为库调用：
