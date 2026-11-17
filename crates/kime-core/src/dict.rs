@@ -1035,6 +1035,9 @@ impl Dict {
         let lines = dict_body_lines(dict_yaml.as_ref())?;
         let tx = self.conn.transaction()?;
         let mut count = 0usize;
+        // 全拼可达性守门：读音里的表外音节跨行去重、保首次出现序，循环后一次性告警。
+        // 必须存 owned String：`joined` 是循环内的局部变量，借 &str 活不过这一轮。
+        let mut missing: Vec<String> = Vec::new();
         for line in lines {
             if line.is_empty() {
                 continue;
@@ -1063,6 +1066,11 @@ impl Dict {
             }
             let syllables: Vec<&str> = pinyin.split_whitespace().collect();
             let joined = syllables.join("'");
+            for u in kime_pinyin::unknown_syllables(&joined) {
+                if !missing.iter().any(|m| m.as_str() == u) {
+                    missing.push(u.to_string());
+                }
+            }
             let abbrev: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
             let abbrev = abbrev.to_lowercase();
             let added = tx.execute(
@@ -1074,6 +1082,15 @@ impl Dict {
             count += added;
         }
         tx.commit()?;
+        // stderr 惯例（与 `warn_once` 同款）：写失败吞掉、绝不阻塞导入，条目照旧入库。
+        if !missing.is_empty() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[kime] 词库音节表缺口：{} 个读音不在音节表（{} 等），这些词全拼打不到 —— 同步 crates/kime-pinyin/src/lib.rs SYLLABLES",
+                missing.len(),
+                missing[0]
+            );
+        }
         // Rebuild memory index after import
         let mut stmt = self.conn.prepare(
             "SELECT pinyin, text, freq, abbrev, user FROM phrase ORDER BY pinyin ASC, freq DESC, text ASC",

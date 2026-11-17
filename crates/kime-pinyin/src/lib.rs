@@ -100,6 +100,21 @@ pub fn is_syllable(s: &str) -> bool {
     SYLLABLES.binary_search(&s).is_ok()
 }
 
+/// 读音串（音节以 `'` 连接，如 `"ni'zhei"`）里**不在音节表内**的音节，
+/// 去重并保留首次出现序；返回项借用输入串，零分配。
+///
+/// 用途：词库导入期做全拼可达性守门——词库有读音而音节表缺，这些词全拼永远打不到。
+/// 空段（`''`、`a''b`）跳过。
+pub fn unknown_syllables(pinyin: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for s in pinyin.split('\'') {
+        if !s.is_empty() && !is_syllable(s) && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// 一维可达性 DP：判断按键串能否被完整切分成合法音节（不产出任何切分、零分配）。
 ///
 /// 用途：纠错变体的廉价预筛——编辑距离 1 的变体绝大多数仍是非法串，先用它挡掉，
