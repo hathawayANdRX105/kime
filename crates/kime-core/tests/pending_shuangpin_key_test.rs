@@ -105,3 +105,89 @@ fn pending_key_completes_into_the_full_syllable() {
     });
     assert_eq!(out, Outcome::Commit("是".into()), "选词立即上屏");
 }
+
+/// 带指定词条的引擎：`rows` 是 `(拼音, 词, 频率)`。
+///
+/// 默认 `engine()` 的 fixture 只有 shi/wu/u，测不了 a 系与 un 系。
+fn engine_with(db: &std::path::Path, rows: &[(&str, &str, i64)]) -> Engine {
+    let _ = Dict::open(db).expect("create schema");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    for (pinyin, text, freq) in rows {
+        conn.execute(
+            "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![
+                pinyin,
+                text,
+                freq,
+                text.chars().next().unwrap_or(' ').to_string()
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let dict = Dict::open(db).expect("open dict");
+    Engine::new(
+        dict,
+        Config {
+            dict_path: db.to_string_lossy().to_string(),
+            shuangpin: Some(Scheme::Ziranma),
+            ..Config::default()
+        },
+    )
+}
+
+/// 孤立元音键：零声母 `a`（Ziranma 编码 `aa`）单独敲时**只走声母位**，
+/// 不得把 `a` 当韵母位展开出 ba/da 这类**带声母**的音节。
+///
+/// 回归的 bug：用户敲 `a` 首屏是「把/吧」，而 `吧` 是 b 开头的字。
+#[test]
+fn lone_vowel_key_does_not_expand_final_intent() {
+    let db = tmp_db("vowel");
+    let mut e = engine_with(
+        &db,
+        &[
+            ("a", "啊", 9000),
+            ("ba", "吧", 8000),
+            ("da", "大", 7000),
+            ("ma", "吗", 6000),
+        ],
+    );
+    type_str(&mut e, "a");
+    let got: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+    assert!(!got.is_empty(), "单敲 a 必须有候选，实际 {got:?}");
+    assert_eq!(got, vec!["啊"], "单敲 a 只应出 a 系，实际 {got:?}");
+    // preedit 展示原始键
+    assert_eq!(e.preedit(), "a", "preedit 应显示原始键 a");
+}
+
+/// 双拼 `aa` 仍是「啊」的编码：孤立元音键的韵母位意图没有被误删。
+#[test]
+fn double_a_completes_into_a() {
+    let db = tmp_db("vowel2");
+    let mut e = engine_with(&db, &[("a", "啊", 9000), ("ba", "吧", 8000)]);
+    type_str(&mut e, "aa");
+    assert_eq!(e.preedit(), "a", "aa 解码为 a");
+    let top = e.candidates().first().map(|c| c.text.clone());
+    assert_eq!(top.as_deref(), Some("啊"), "aa 首候选应是「啊」");
+}
+
+/// 孤立辅音键 `p` 的韵母位意图必须保留：单敲 `p` 要出 un/ün 系列
+/// （lun/jun/run…），这是「韵母位意图」的设计契约。
+#[test]
+fn lone_consonant_key_keeps_final_intent() {
+    let db = tmp_db("vowel3");
+    let mut e = engine_with(
+        &db,
+        &[
+            ("lun", "论", 9000),
+            ("jun", "军", 8000),
+            ("cun", "村", 7000),
+        ],
+    );
+    type_str(&mut e, "p");
+    let got: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
+    assert!(
+        got.contains(&"论") && got.contains(&"军"),
+        "单敲 p（Ziranma 韵母位 un/ün）应出 lun/jun 系列，实际 {got:?}"
+    );
+}
