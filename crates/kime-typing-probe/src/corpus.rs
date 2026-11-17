@@ -133,10 +133,13 @@ fn parse_entries(content: &str, source: &str) -> anyhow::Result<Vec<CorpusEntry>
 }
 
 /// 从内嵌字符串构造 Corpus（测试用，避免依赖真实文件系统）。
-pub fn corpus_from_tsv(content: &str) -> Corpus {
-    Corpus {
-        entries: parse_entries(content, "embedded").expect("embedded corpus must parse"),
-    }
+///
+/// 与 [`Corpus::load_tsv`] 走同一份 [`parse_entries`]，因此**也**返回 `Result`：
+/// 语料里的 `freq` 列写坏了就该让调用方看见，而不是静默变成空语料。
+pub fn corpus_from_tsv(content: &str) -> anyhow::Result<Corpus> {
+    Ok(Corpus {
+        entries: parse_entries(content, "embedded")?,
+    })
 }
 
 #[cfg(test)]
@@ -146,7 +149,7 @@ mod tests {
     #[test]
     fn load_tsv_parses_zh_en() {
         let content = "1\t我们\two'men\n2\thello\n3\t北京\tbei'jing\n";
-        let corpus = corpus_from_tsv(content);
+        let corpus = corpus_from_tsv(content).expect("corpus must parse");
         assert_eq!(corpus.len(), 3);
         assert_eq!(corpus.zh_entries().len(), 2);
         assert_eq!(corpus.en_entries().len(), 1);
@@ -159,7 +162,7 @@ mod tests {
     #[test]
     fn load_tsv_skips_comments_and_blank() {
         let content = "# comment\n\n1\t我们\two'men\n";
-        let corpus = corpus_from_tsv(content);
+        let corpus = corpus_from_tsv(content).expect("corpus must parse");
         assert_eq!(corpus.len(), 1);
     }
 }

@@ -207,7 +207,7 @@ fn lang_follows_entry_reading() {
 #[test]
 fn corpus_loads_zh_en() {
     let content = "1\t我们\two'men\n2\thello\n3\t北京\tbei'jing\n";
-    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content);
+    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content).expect("corpus must parse");
     assert_eq!(corpus.len(), 3);
     assert_eq!(corpus.zh_entries().len(), 2);
     assert_eq!(corpus.en_entries().len(), 1);
@@ -570,7 +570,7 @@ fn run_replays_corpus_end_to_end() {
 #[test]
 fn article_directive_groups_entries() {
     let content = "# article: 日常\n1\t我们\two'men\n# article: 校园\n1\t学校\txue'xiao\n";
-    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content);
+    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content).expect("corpus must parse");
     assert_eq!(corpus.len(), 2);
     assert_eq!(corpus.entries[0].id, "日常#2");
     assert_eq!(corpus.entries[1].id, "校园#4");
