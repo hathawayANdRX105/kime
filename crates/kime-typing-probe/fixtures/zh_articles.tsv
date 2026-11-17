@@ -10,9 +10,9 @@
 # pinyin 里用 `'` 分隔音节，空白是显式上屏边界（回放时展开成 Space 事件）。
 # 因此 `wo'men jin'tian` = 打完「我们」按空格上屏，再打「今天」。
 #
-# 运行：
+# 运行（pinyin 列是全拼，所以必须配 `--mode full`；传 ziranma 会把全拼字母逐键解码）：
 #   kime --dict <库> --import <dict.yaml>          # 先准备词库
-#   kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv --dict <库> --mode ziranma
+#   kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv --dict <库> --mode full
 #
 # 加用例：追加一行即可。断言/语料必须来自既有契约，不要写「当前行为」，
 # 否则语料会把 bug 钉成规范。

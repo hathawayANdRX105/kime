@@ -639,12 +639,47 @@ fn full_config_decodes_full_pinyin_corpus() {
     );
 }
 
-/// 整份语料共用一个引擎：连续回放时每条都能上屏目标，没有因为残留组合而错位。
+/// `Runner::begin` 换目标但**不重建引擎**。
 ///
-/// 每条新建引擎会让上下文加成恒为零（probe 就测不出「前一个词影响下一个词」），
-/// 所以这里用「两条语料连续回放」钉住引擎复用这条路径真的能跑通。
+/// 这条是「上下文跨条目累积」的机制前提：每条新建引擎会让 `lm_prev_text` /
+/// `context_tail` / 实时 bigram 从零开始，probe 就测不出「前一个词影响下一个词」。
+///
+/// 断言用引擎地址而不是候选内容：候选内容会随词库变化，而地址相等是
+/// 「同一个 Engine 实例」的**充分**证据——如果 `begin` 内部重建引擎，地址必变。
+/// 只断言「两条语料都上屏」是不够的：每条新建引擎也能过（旧实现的 bug 正是如此）。
 #[test]
-fn engine_is_shared_across_entries() {
+fn begin_keeps_the_same_engine() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let entry_a = CorpusEntry {
+        id: "a".to_string(),
+        freq: 1,
+        text: "我们".to_string(),
+        pinyin: "wo'men".to_string(),
+    };
+    let entry_b = CorpusEntry {
+        id: "b".to_string(),
+        freq: 1,
+        text: "我".to_string(),
+        pinyin: "wo".to_string(),
+    };
+
+    let mut runner = Runner::with_config(&db_path, Default::default()).expect("build runner");
+    let engine_addr = |r: &Runner| r.engine() as *const kime_core::Engine as usize;
+
+    let before = engine_addr(&runner);
+    runner.begin(&entry_a);
+    let after_a = engine_addr(&runner);
+    runner.begin(&entry_b);
+    let after_b = engine_addr(&runner);
+
+    assert_eq!(before, after_a, "begin 不得重建引擎");
+    assert_eq!(after_a, after_b, "连续 begin 仍须复用同一引擎");
+}
+
+/// 连续回放不产生错位：每条语料之间清组合缓冲后，各自都能上屏自己的目标。
+#[test]
+fn continuous_replay_keeps_entries_aligned() {
     let tmp = TempDir::new().expect("tmpdir");
     let db_path = build_test_dict(&tmp);
     let corpus_path = tmp.path().join("zh_articles.tsv");
