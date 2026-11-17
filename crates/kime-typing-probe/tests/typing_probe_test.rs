@@ -69,6 +69,19 @@ fn build_test_dict(tmp: &TempDir) -> PathBuf {
     db_path
 }
 
+/// 用调用方给的 YAML 建库（自造最小词库，避免依赖共享 `CN_DICT` 里恰好有哪些词）。
+fn build_dict(tmp: &TempDir, tag: &str, cn: &str, en: &str) -> PathBuf {
+    let db_path = tmp.path().join(format!("{tag}.sqlite3"));
+    let cn_yaml = tmp.path().join(format!("{tag}-cn.yaml"));
+    let en_yaml = tmp.path().join(format!("{tag}-en.yaml"));
+    std::fs::write(&cn_yaml, cn).expect("write cn yaml");
+    std::fs::write(&en_yaml, en).expect("write en yaml");
+    let mut dict = Dict::open(&db_path).expect("open dict");
+    dict.import(&cn_yaml).expect("import cn dict");
+    dict.import_english(&en_yaml).expect("import en dict");
+    db_path
+}
+
 /// 为单条语料构造 Runner 并回放给定按键脚本。
 fn run_one(dict_path: &Path, text: &str, pinyin: &str, lang: Lang, events: &[KeyEvent]) -> Runner {
     let entry = CorpusEntry {
@@ -578,18 +591,21 @@ fn shipped_fixtures_parse() {
     assert_eq!(en.en_entries().len(), en.len());
 }
 
-/// 配置透传：语料用**双拼键串**（自然码 `shi` = `ui`）时，`shuangpin: Some(Ziranma)`
-/// 必须解出「是」。
+/// 配置透传：语料用**双拼键串**（自然码 `ren` = `rf`）时，`shuangpin: Some(Ziranma)`
+/// 必须解出「人」。
 ///
 /// 语料里的键是「按哪种方案敲出来的键」，必须和 `--mode` 一致。这条钉住 `Config`
-/// 真的透传到了引擎——写死 `shuangpin: None` 时 `ui` 会被当成全拼的 `u`+`i`，
-/// 候选里根本没有「是」。
+/// 真的透传到了引擎——写死 `shuangpin: None` 时 `rf` 不是任何全拼音节，候选为空。
+///
+/// 选 `ren`/`rf` 而不是 `shi`/`ui`：后者在引擎里会同时触发「声母位 + 半截键」合批，
+/// 候选列表里混进别的音节的词，断言就不再只表达「解码对不对」。
 #[test]
 fn ziranma_config_decodes_ziranma_corpus() {
     let tmp = TempDir::new().expect("tmpdir");
-    let db_path = build_test_dict(&tmp);
+    // 自带最小词库：共享 CN_DICT 里没有「人」，借它会让候选恒为空、断言失去意义。
+    let db_path = build_dict(&tmp, "ren", "...\n人\tren\t9000000\n", "...\n");
     let corpus_path = tmp.path().join("zh_articles.tsv");
-    std::fs::write(&corpus_path, "1\t是\tui\n").expect("write corpus");
+    std::fs::write(&corpus_path, "1\t人\trf\n").expect("write corpus");
 
     let config = kime_core::config::Config {
         shuangpin: Some(kime_core::Scheme::Ziranma),
@@ -600,7 +616,7 @@ fn ziranma_config_decodes_ziranma_corpus() {
     let sentence = &result.per_sentence[0];
     assert!(
         sentence.target_hit,
-        "双拼音料 + 双拼配置应上屏「是」：{:?}",
+        "双拼音料 + 双拼配置应上屏「人」：{:?}",
         sentence.candidates_sample
     );
 }
@@ -609,16 +625,16 @@ fn ziranma_config_decodes_ziranma_corpus() {
 #[test]
 fn full_config_decodes_full_pinyin_corpus() {
     let tmp = TempDir::new().expect("tmpdir");
-    let db_path = build_test_dict(&tmp);
+    let db_path = build_dict(&tmp, "ren2", "...\n人\tren\t9000000\n", "...\n");
     let corpus_path = tmp.path().join("zh_articles.tsv");
-    std::fs::write(&corpus_path, "1\t是\tshi\n").expect("write corpus");
+    std::fs::write(&corpus_path, "1\t人\tren\n").expect("write corpus");
 
     let result =
         kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
     let sentence = &result.per_sentence[0];
     assert!(
         sentence.target_hit,
-        "全拼音料 + 全拼配置应上屏「是」：{:?}",
+        "全拼音料 + 全拼配置应上屏「人」：{:?}",
         sentence.candidates_sample
     );
 }
