@@ -41,6 +41,14 @@ const KEY_RIGHTBRACE: u32 = 27;
 /// 默认每页候选数（config.page_size = 0 时生效）
 const DEFAULT_PAGE_SIZE: usize = 10;
 
+/// 半截键合批时**另一个意图**的保底份额：`candidate_limit` 的这个分之一。
+///
+/// 半截键同时有「声母位」与「韵母位」两种解释（自然码 `p` 是 p 系声母 / un 系韵母）。
+/// 两者共享一个候选窗，而声母位查询自己就按 `candidate_limit` 截断；不单独留位置，
+/// 声母位读音一多就把韵母位整块挤出窗外——真实词库实测：敲 `p` 首 50 条里一条
+/// un/ün 系列都没有。取四分之一：足够看到几个候选，又不让另一个意图喧宾夺主。
+const OTHER_INTENT_DIV: usize = 4;
+
 /// 双拼里的**零声母键**（韵母键 `a`/`e`/`i`/`o`/`u`/`v`）。
 ///
 /// 这些键单独敲时是「零声母声母位」：自然码 `a`=aa、`o`=oo、`e`=ee，
@@ -1677,10 +1685,17 @@ impl Engine {
     /// 双拼末键的**韵母位补全**：末键作韵母位能拼出的完整音节，逐个作为已完成的
     /// 末音节补查，与「声母位 + 半截键」的查询结果合并。
     ///
-    /// 两种意图统一标成 [`Layer::Completion`]：它们来自两次不同查询，层号之间没有
-    /// 可比性；若各自保留原层，「韵母位查询的精确命中」会凭层号压过「声母位查询的
-    /// 补全命中」，而用户按 u（sh 声母键）要的恰恰是 sh 系。半截键本身就是「还没
-    /// 打完」的状态，两种解释都属于补全，因此同层才是正确语义。
+    /// 合并契约（两个意图共享一个候选窗）：
+    ///
+    /// 1. 统一压平成 [`Layer::Completion`]：半截键本身就是「还没打完」的状态，
+    ///    两种解释都属于补全。若各自保留原层，「韵母位查询的精确命中」会凭层号
+    ///    压过「声母位查询的补全命中」，而用户按 u（sh 声母键）要的恰恰是 sh 系。
+    /// 2. **声母位意图整体在前**：它才是用户按键的直接意图（`u` = sh 声母）。
+    /// 3. **韵母位意图保底 [`OTHER_INTENT_DIV`] 分之一**：不保底的话声母位读音
+    ///    一多就把它整块挤出窗外（真实词库实测：敲 `p` 首 50 条一条 un 系列都
+    ///    没有），韵母位意图等于不存在。
+    ///
+    /// 两者各自按分数排序，因此比较器可传递、结果可复现。
     fn merge_half_key_intents(
         &self,
         cands: &mut Vec<Candidate>,
@@ -1693,7 +1708,7 @@ impl Engine {
         // 跨批去重集合由排序内核提供（`rank::Seen`）：韵母位各音节共享同一份记录，
         // 先到先得。
         let mut seen = rank::Seen::of(cands.iter());
-        let mut completions: Vec<Candidate> = Vec::new();
+        let mut finals: Vec<Candidate> = Vec::new();
         // 每个音节只取少量候选：末键的韵母位音节有十几个（自然码 p 有 18 个），
         // 取太多会让第一个音节独占整页。
         //
@@ -1705,18 +1720,39 @@ impl Engine {
             let mut r = syllables.to_vec();
             r.push((*s).to_string());
             if let Ok(vc) = self.dict.lookup_prefix(&r, "", per_syllable) {
-                rank::append_unique(&mut completions, vc, &mut seen);
+                rank::append_unique(&mut finals, vc, &mut seen);
             }
         }
-        let ranker = self.dict.ranker();
-        let mut merged = completions;
-        merged.append(cands);
-        for c in &mut merged {
+        // 两个意图共享一个候选窗，统一压平成补全层：半截键本身就是「还没打完」
+        // 的状态，两种解释都属于补全。
+        for c in cands.iter_mut().chain(finals.iter_mut()) {
             c.layer = Layer::Completion;
         }
-        ranker.sort_within_batch(&mut merged);
-        merged.truncate(self.config.candidate_limit);
-        *cands = merged;
+
+        let ranker = self.dict.ranker();
+        let limit = self.config.candidate_limit.max(2);
+        // 各自按分数排序：跨意图合批时批内无序，不重排就变成「先查的意图恒在前」。
+        ranker.sort_within_batch(cands);
+        ranker.sort_within_batch(&mut finals);
+
+        if finals.is_empty() {
+            cands.truncate(limit);
+            return;
+        }
+        if cands.is_empty() {
+            // 声母位无候选（如小词库里只 seed 了韵母位音节）：窗口全给韵母位。
+            finals.truncate(limit);
+            *cands = finals;
+            return;
+        }
+        // 声母位意图整体在前；韵母位意图**保底** OTHER_INTENT_DIV 分之一。
+        // 不保底的话声母位读音一多就把它整块挤出窗外——真实词库实测：敲 `p`
+        // 首 50 条里一条 un/ün 系列都没有（配置/判断/评估…占满），韵母位意图
+        // 等于不存在。
+        let reserve = (limit / OTHER_INTENT_DIV).max(1).min(limit - 1);
+        finals.truncate(reserve);
+        cands.truncate(limit - reserve);
+        cands.append(&mut finals);
     }
 
     /// 缺陷 A：整串无词条、补全/缩写/Viterbi 全都拼不出候选时的最后一道回退——
