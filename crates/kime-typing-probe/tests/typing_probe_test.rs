@@ -69,6 +69,19 @@ fn build_test_dict(tmp: &TempDir) -> PathBuf {
     db_path
 }
 
+/// 用调用方给的 YAML 建库（自造最小词库，避免依赖共享 `CN_DICT` 里恰好有哪些词）。
+fn build_dict(tmp: &TempDir, tag: &str, cn: &str, en: &str) -> PathBuf {
+    let db_path = tmp.path().join(format!("{tag}.sqlite3"));
+    let cn_yaml = tmp.path().join(format!("{tag}-cn.yaml"));
+    let en_yaml = tmp.path().join(format!("{tag}-en.yaml"));
+    std::fs::write(&cn_yaml, cn).expect("write cn yaml");
+    std::fs::write(&en_yaml, en).expect("write en yaml");
+    let mut dict = Dict::open(&db_path).expect("open dict");
+    dict.import(&cn_yaml).expect("import cn dict");
+    dict.import_english(&en_yaml).expect("import en dict");
+    db_path
+}
+
 /// 为单条语料构造 Runner 并回放给定按键脚本。
 fn run_one(dict_path: &Path, text: &str, pinyin: &str, lang: Lang, events: &[KeyEvent]) -> Runner {
     let entry = CorpusEntry {
@@ -194,7 +207,7 @@ fn lang_follows_entry_reading() {
 #[test]
 fn corpus_loads_zh_en() {
     let content = "1\t我们\two'men\n2\thello\n3\t北京\tbei'jing\n";
-    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content);
+    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content).expect("corpus must parse");
     assert_eq!(corpus.len(), 3);
     assert_eq!(corpus.zh_entries().len(), 2);
     assert_eq!(corpus.en_entries().len(), 1);
@@ -530,7 +543,8 @@ fn run_replays_corpus_end_to_end() {
     let corpus_path = tmp.path().join("zh_articles.tsv");
     std::fs::write(&corpus_path, "1\t我们\two'men\n").expect("write corpus");
 
-    let result = kime_typing_probe::run(&corpus_path, &db_path).expect("run probe");
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
 
     assert_eq!(result.total_sentences, 1);
     let sentence = &result.per_sentence[0];
@@ -550,4 +564,137 @@ fn run_replays_corpus_end_to_end() {
     assert!(md.contains("## Summary"));
     let json = result.to_json();
     assert!(json.contains("target_hit_rate"));
+}
+
+/// 语料里的 `# article: <标题>` 把条目 id 变成 `<标题>#<行号>`，报告里能区分文章。
+#[test]
+fn article_directive_groups_entries() {
+    let content = "# article: 日常\n1\t我们\two'men\n# article: 校园\n1\t学校\txue'xiao\n";
+    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content).expect("corpus must parse");
+    assert_eq!(corpus.len(), 2);
+    assert_eq!(corpus.entries[0].id, "日常#2");
+    assert_eq!(corpus.entries[1].id, "校园#4");
+}
+
+/// 仓库自带的 fixture 必须能被同一份解析器读出来（防止手改 fixture 时改坏格式）。
+#[test]
+fn shipped_fixtures_parse() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let zh = kime_typing_probe::corpus::Corpus::load_tsv(&dir.join("zh_articles.tsv"))
+        .expect("zh fixture must parse");
+    let en = kime_typing_probe::corpus::Corpus::load_tsv(&dir.join("en_articles.tsv"))
+        .expect("en fixture must parse");
+    assert!(!zh.is_empty(), "中文 fixture 不应为空");
+    assert!(!en.is_empty(), "英文 fixture 不应为空");
+    // lang 判据是「读音是否为空」，与文件名无关。
+    assert_eq!(zh.zh_entries().len(), zh.len());
+    assert_eq!(en.en_entries().len(), en.len());
+}
+
+/// 配置透传：语料用**双拼键串**（自然码 `ren` = `rf`）时，`shuangpin: Some(Ziranma)`
+/// 必须解出「人」。
+///
+/// 语料里的键是「按哪种方案敲出来的键」，必须和 `--mode` 一致。这条钉住 `Config`
+/// 真的透传到了引擎——写死 `shuangpin: None` 时 `rf` 不是任何全拼音节，候选为空。
+///
+/// 选 `ren`/`rf` 而不是 `shi`/`ui`：后者在引擎里会同时触发「声母位 + 半截键」合批，
+/// 候选列表里混进别的音节的词，断言就不再只表达「解码对不对」。
+#[test]
+fn ziranma_config_decodes_ziranma_corpus() {
+    let tmp = TempDir::new().expect("tmpdir");
+    // 自带最小词库：共享 CN_DICT 里没有「人」，借它会让候选恒为空、断言失去意义。
+    let db_path = build_dict(&tmp, "ren", "...\n人\tren\t9000000\n", "...\n");
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t人\trf\n").expect("write corpus");
+
+    let config = kime_core::config::Config {
+        shuangpin: Some(kime_core::Scheme::Ziranma),
+        ..Default::default()
+    };
+    let result = kime_typing_probe::run(&corpus_path, &db_path, config).expect("run probe");
+
+    let sentence = &result.per_sentence[0];
+    assert!(
+        sentence.target_hit,
+        "双拼音料 + 双拼配置应上屏「人」：{:?}",
+        sentence.candidates_sample
+    );
+}
+
+/// 全拼音料 + 默认（全拼）配置同样命中：默认路径不能被双拼那条带坏。
+#[test]
+fn full_config_decodes_full_pinyin_corpus() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_dict(&tmp, "ren2", "...\n人\tren\t9000000\n", "...\n");
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t人\tren\n").expect("write corpus");
+
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
+    let sentence = &result.per_sentence[0];
+    assert!(
+        sentence.target_hit,
+        "全拼音料 + 全拼配置应上屏「人」：{:?}",
+        sentence.candidates_sample
+    );
+}
+
+/// `Runner::begin` 换目标但**不重建引擎**。
+///
+/// 这条是「上下文跨条目累积」的机制前提：每条新建引擎会让 `lm_prev_text` /
+/// `context_tail` / 实时 bigram 从零开始，probe 就测不出「前一个词影响下一个词」。
+///
+/// 断言用引擎地址而不是候选内容：候选内容会随词库变化，而地址相等是
+/// 「同一个 Engine 实例」的**充分**证据——如果 `begin` 内部重建引擎，地址必变。
+/// 只断言「两条语料都上屏」是不够的：每条新建引擎也能过（旧实现的 bug 正是如此）。
+#[test]
+fn begin_keeps_the_same_engine() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let entry_a = CorpusEntry {
+        id: "a".to_string(),
+        freq: 1,
+        text: "我们".to_string(),
+        pinyin: "wo'men".to_string(),
+    };
+    let entry_b = CorpusEntry {
+        id: "b".to_string(),
+        freq: 1,
+        text: "我".to_string(),
+        pinyin: "wo".to_string(),
+    };
+
+    let mut runner = Runner::with_config(&db_path, Default::default()).expect("build runner");
+    let engine_addr = |r: &Runner| r.engine() as *const kime_core::Engine as usize;
+
+    let before = engine_addr(&runner);
+    runner.begin(&entry_a);
+    let after_a = engine_addr(&runner);
+    runner.begin(&entry_b);
+    let after_b = engine_addr(&runner);
+
+    assert_eq!(before, after_a, "begin 不得重建引擎");
+    assert_eq!(after_a, after_b, "连续 begin 仍须复用同一引擎");
+}
+
+/// 连续回放不产生错位：每条语料之间清组合缓冲后，各自都能上屏自己的目标。
+#[test]
+fn continuous_replay_keeps_entries_aligned() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t我们\two'men\n2\t我\two\n").expect("write corpus");
+
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
+    assert_eq!(result.total_sentences, 2);
+    assert!(
+        result.per_sentence.iter().all(|s| s.target_hit),
+        "连续回放应每条都上屏目标：{:?}",
+        result
+            .per_sentence
+            .iter()
+            .map(|s| (s.text.as_str(), s.target_hit, s.keys))
+            .collect::<Vec<_>>()
+    );
 }

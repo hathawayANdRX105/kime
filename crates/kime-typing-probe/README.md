@@ -5,9 +5,74 @@
 ## 设计目标
 
 - 仅向下依赖 `kime-core` 与标准库（`serde` 用于报告序列化），不依赖 platform/render，不引入 `reqwest`（除非启用 `llm` feature）。
-- 读取 TSV 语料，模拟按键，采集命中率/候选位置/翻页/回删/延迟/上下文命中。
+- 读取 TSV 语料，**一个引擎连续回放整份语料**，采集命中率/候选位置/翻页/回删/延迟。
 - 输出 rules-only 或 LLM 可消费的 JSON/Markdown 报告。
 - 所有测试离线运行，不依赖网络或用户真实词库；CI 无需联网。
+
+## 语料格式
+
+TSV 三列：`freq`、`text`、可选 `pinyin`。`#` 开头是注释；`# article: <标题>` 开启一篇文章，
+其后的条目 id 变成 `<标题>#<行号>`，报告里靠 id 前缀区分文章。
+
+```
+# article: 日常问候
+1	我们	wo'men
+2	你好	ni'hao
+```
+
+**每条语料是一个词**，不是整句：指标（`top1_hit` / `first_screen_hit`）按词定义——
+「候选里有没有这个词、排第几」只有在目标是词时才有意义。整句目标永远不可能出现在
+候选首位，会把 `top1_hit_rate` 恒压成 0。
+
+pinyin 里 `'` 分隔音节，空白是**显式上屏边界**：`wo'men jin'tian` 展开成
+`w o m e n Space j i n t i a n Space`，即打完「我们」按空格上屏再打「今天」。
+
+## 一个引擎连续回放
+
+`run()` 只建**一个** `Engine`，按语料顺序逐条回放，条目之间只清组合缓冲、不重建引擎。
+
+原因：kime 的实时上下文排序（`lm_prev_text` / `context_tail` / 实时 bigram）是跨条目
+累积的。每条新建引擎会让上下文加成恒为零，测不出「前一个词影响下一个词」的体验差异。
+
+`config` 由调用方给（CLI 传 `Config::load()` 并按 `--mode` 覆盖 `shuangpin`）。
+
+**语料里的键是「按哪种方案敲出来的键」，必须和 `--mode` 一致。** 自带的
+`zh_articles.tsv` 用全拼（`shi`），所以默认 `--mode full` 就对；要模拟自然码双拼，
+把语料里的键换成双拼键串（自然码 `shi` = `ui`）并传 `--mode ziranma`，否则引擎会把
+全拼字母按双拼逐键解码，解出别的音节。
+
+## 使用
+
+```bash
+# 1. 准备词库
+kime --dict /tmp/probe.sqlite3 --import <dict.yaml>
+
+# 2. 回放语料（默认 --mode full，与自带语料的编码一致）
+kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv \
+    --dict /tmp/probe.sqlite3 --out /tmp/report.md
+
+# 3. 机读格式
+kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv \
+    --dict /tmp/probe.sqlite3 --json
+```
+
+作为库调用：
+
+```rust
+use kime_typing_probe::run;
+use std::path::Path;
+
+let result = run(Path::new("crates/kime-typing-probe/fixtures/zh_articles.tsv"),
+                 Path::new("/tmp/kime-probe-dict.sqlite3"),
+                 Default::default())?;
+let json = result.to_json();
+let md = result.to_markdown();
+```
+
+`run` 接受语料文件路径、**已存在的 sqlite dict 路径**与 `kime_core::Config`。
+缺文件会新建空库、报告全零——先 `kime --dict <db> --import <dict.yaml>` 准备好词库。
+按键序列由条目的读音生成（中文用 `pinyin`、英文用 `text`），逐字符输入，空白转成
+空格上屏，末尾自动补一个空格提交。
 
 ## 目录结构
 
@@ -15,9 +80,9 @@
 crates/kime-typing-probe/
   Cargo.toml
   src/
-    lib.rs        // 公共 API：run() -> ProbeResult
-    runner.rs     // 按键回放：Runner，逐键回放 KeyEvent，采样 Outcome/preedit/candidates/page/耗时
-    corpus.rs     // 语料加载：TSV 行 (freq,text,pinyin)，按 zh/en 分桶
+    lib.rs        // 公共 API：run() -> ProbeResult；语料 → 按键脚本（空白 = 上屏边界）
+    runner.rs     // 按键回放：Runner，逐键回放 KeyEvent，采样 Outcome/preedit/candidates/page/耗时；with_config + begin 支持跨条目复用引擎
+    corpus.rs     // 语料加载：TSV 行 (freq,text,pinyin)，# article: <标题> 分组，按 zh/en 分桶
     metrics.rs    // 指标：target_hit_rate/top1_hit_rate/first_screen_hit_rate/latency p50/p99/page_turns/backspace/reselect
     report.rs     // 报告：JSON/Markdown，summary/per_lang/per_sentence/suggestions，rules-only 建议
     llm.rs        // LLM 接入：缺省不发网络；KIME_LLM_ENDPOINT 设置且开 llm feature 时可用，失败静默降级
@@ -55,22 +120,6 @@ optional = true
 
 - 默认不启用 `llm` feature，`LlmClient::enabled()` 始终为 `false`，LLM 建议静默降级为 rules-only。
 - 启用 `llm` feature 后，设置 `KIME_LLM_ENDPOINT` 环境变量即可让评测报告通过 LLM 生成改进建议；请求失败或端点缺失时不报错、不阻断。
-
-## 使用
-
-```rust
-use kime_typing_probe::run;
-use std::path::Path;
-
-let result = run(Path::new("crates/kime-typing-probe/fixtures/zh_articles.tsv"),
-                 Path::new("/tmp/kime-probe-dict.sqlite3"))?;
-let json = result.to_json();
-let md = result.to_markdown();
-```
-
-`run` 接受语料文件路径与**已存在的 sqlite dict 路径**（缺文件会新建空库，报告全零——
-先 `kime --dict <db> --import <dict.yaml>` 准备好词库）。
-按键序列由条目的读音生成（中文用 `pinyin`、英文用 `text`），逐字符输入后补空格提交。
 
 ## 排序层契约
 

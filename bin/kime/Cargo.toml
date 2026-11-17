@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 kime-core = { path = "../../crates/kime-core" }
 kime-shuangpin = { path = "../../crates/kime-shuangpin" }
+kime-typing-probe = { path = "../../crates/kime-typing-probe" }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
