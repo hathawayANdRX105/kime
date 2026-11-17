@@ -115,7 +115,12 @@ fn engine_with(db: &std::path::Path, rows: &[(&str, &str, i64)]) -> Engine {
     for (pinyin, text, freq) in rows {
         conn.execute(
             "INSERT OR REPLACE INTO phrase(pinyin, text, freq, abbrev, user) VALUES (?1, ?2, ?3, ?4, 0)",
-            rusqlite::params![pinyin, text, freq, text.chars().next().unwrap_or(' ')],
+            rusqlite::params![
+                pinyin,
+                text,
+                freq,
+                text.chars().next().unwrap_or(' ').to_string()
+            ],
         )
         .unwrap();
     }
