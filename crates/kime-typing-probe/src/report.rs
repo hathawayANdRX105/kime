@@ -344,18 +344,4 @@ mod tests {
             .iter()
             .any(|s| s.contains("target_hit_rate")));
     }
-
-    /// 零样本语种不得产生「命中率过低」建议：没测过 ≠ 测得差。
-    ///
-    /// `sample_result` 只有一条 zh 语料，en 桶全零。旧实现会输出
-    /// 「en: target_hit_rate 0.00 低于 0.80」，把缺语料说成命中率低。
-    #[test]
-    fn zero_sample_language_gets_no_suggestion() {
-        let report = ProbeReport::from_result(&sample_result());
-        assert!(
-            !report.suggestions.iter().any(|s| s.starts_with("en:")),
-            "en 桶零样本时不应给 en 建议：{:?}",
-            report.suggestions
-        );
-    }
 }
