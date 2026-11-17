@@ -674,11 +674,12 @@ impl Dict {
         };
         let total_freq = Self::query_total_freq(&conn);
         let english = Self::load_english(&conn, &user_stats, today)?;
-        // 跨语言分数尺：各语言取最大有效频率做归一化基准。
+        // 每语言一个分数尺：取该语言自己的最大有效频率做归一化基准。
         //
         // 为什么必须分开取最大值：中文词条频率 10⁵~10⁷、英文词频 10³ 量级，
         // 直接比原始数值等于「中文恒赢」，退化成按语言分块。对数归一化后两边
-        // 都是「在本语言内部的相对位置」，才谈得上按分数竞争。
+        // 都是「在本语言内部的相对位置」——**仅限本语言内部**：跨语言的先后由
+        // 排序键里的 `lang` 决定，不再比分数（见 `rank::RankKey` 的注释）。
         // 基准 = 库内语料最大频 与 内存条目最大有效频率 取大者。
         // 语料最大值必须查库：FST 模式下 index 是空的，只看内存会把基准算成
         // 「用户词里最大的那条」，中文分数整体贴近上限、英文被系统性压住。
@@ -954,7 +955,7 @@ impl Dict {
         crate::rank::Ranker::new(self, crate::rank::ScoreScale::new(self.zh_max, self.en_max))
     }
 
-    /// 排序分数尺（跨语言可比）。见 [`crate::rank::ScoreScale`]。
+    /// 排序分数尺（每语言一把，仅同语言内可比）。见 [`crate::rank::ScoreScale`]。
     pub fn score_scale(&self) -> crate::rank::ScoreScale {
         crate::rank::ScoreScale::new(self.zh_max, self.en_max)
     }

@@ -1,5 +1,6 @@
-//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；跨语言候选按**分数**交错
-//! （不再有「中文整块在前」或「英文整块在前」的语言分块）。
+//! 缺陷 A/B 回归：整串无词条时候选退回最长前缀音节；跨语言候选按
+//! **`(层, 语言, 分数)`** 排序——同层内中文整体先于英文（用户裁定「保精确分块」），
+//! 校准分数只在同语言同层内决定次序。
 //! fixture 刻意只放单词且第二音节无字——Viterbi 拼不出全覆盖句，正是缺陷 A 的
 //! 触发条件（修复前列表为空）。preedit 语义单列断言钉住：回退只补候选，不改显示。
 
@@ -10,8 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 
 // 频率刻意拉开：你 = 中文表内最高频，打印/大约 居中，英文 day 是英文表内最高频、
-// dab 是长尾。跨语言只比校准分数，因此这四条能同时证明「英文能插到中文前面」
-// 与「中文也能压过英文长尾」。
+// dab 是长尾。输入 `da` 时两语言都落在补全层（中文 `da'yin` / 英文 `day` 的前缀），
+// 于是同层内中文恒先：打印 > 大约（分数）> day > dab（语言序把英文整段推到中文之后）。
+// 这正是「提频后的英文词不得压过中文词」那条修复的回归。
 const CN: &str =
     "...\n你\tni\t9000000\n泥\tni\t8000000\n打印\tda yin\t500000\n大约\tda yue\t400000\n";
 const EN: &str = "...\nday\tday\t500\ndab\tdab\t1\nhelp\thelp\t400\n";
@@ -102,13 +104,14 @@ fn single_syllable_input_needs_no_fallback() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 跨语言按分数交错：英文 day（英文表内最高频）排在中文 打印 之前，
-/// 中文 打印 又排在英文长尾 dab 之前。
+/// 跨语言同层内**语言优先于分数**：输入 `da` 时候选顺序是「中文补全 → 英文补全」。
 ///
-/// 这条断言同时否掉两种语言分块：若「中文整块在前」则 day 会在 打印 之后；
-/// 若「英文整块在前」则 dab 会在 打印 之前。
+/// 这条断言钉住用户裁定「保精确分块」：两种语言的有效频率来自不同统计空间
+/// （中文 10⁵~10⁷、英文词表 10³ 量级），归一化只保证本语言内部可比。若跨语言
+/// 比校准分数，英文 day 作为词表最高频会顶到中文 打印 之前——用户实测 `ui` 的
+/// 首候选因此变成 `UI` 而不是「是」。同层内中文恒先即可消除这类误比。
 #[test]
-fn cross_language_candidates_order_by_score() {
+fn cross_language_candidates_put_chinese_before_english_in_same_layer() {
     let (mut e, dir) = engine_at("cross_full", None);
     type_letters(&mut e, "da");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -118,15 +121,29 @@ fn cross_language_candidates_order_by_score() {
             .position(|x| x.eq_ignore_ascii_case(t))
             .unwrap_or_else(|| panic!("候选里缺少 {t}：{texts:?}"))
     };
-    let (day, da_yin, dab) = (pos("day"), pos("打印"), pos("dab"));
-    assert!(day < da_yin, "英文高分词应排在中文中频词之前：{texts:?}");
-    assert!(da_yin < dab, "中文中频词应排在英文长尾词之前：{texts:?}");
+    let (day, da_yin, da_yue, dab) = (pos("day"), pos("打印"), pos("大约"), pos("dab"));
+    assert!(
+        da_yin < day,
+        "同层内中文恒先：打印应排在英文 day 之前（哪怕 day 是英文表最高频）：{texts:?}"
+    );
+    assert!(
+        da_yue < day,
+        "同层内中文恒先：大约应排在英文 day 之前：{texts:?}"
+    );
+    assert!(
+        da_yin < da_yue,
+        "同语言同层内才比分数：打印(500k) 在 大约(400k) 之前：{texts:?}"
+    );
+    assert!(
+        day < dab,
+        "同语言同层内才比分数：day(500) 在 dab(1) 之前：{texts:?}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 双拼模式下同一结论：跨语言顺序只看分数，与解码方式无关。
+/// 双拼模式下同一结论：跨语言顺序只由语言序决定，与解码方式无关。
 #[test]
-fn shuangpin_cross_language_candidates_order_by_score() {
+fn shuangpin_cross_language_candidates_put_chinese_before_english() {
     let (mut e, dir) = engine_at("cross_sp", Some(kime_shuangpin::Scheme::Ziranma));
     type_letters(&mut e, "da");
     let texts: Vec<String> = e.candidates().iter().map(|c| c.text.clone()).collect();
@@ -136,14 +153,22 @@ fn shuangpin_cross_language_candidates_order_by_score() {
             .position(|x| x.eq_ignore_ascii_case(t))
             .unwrap_or_else(|| panic!("候选里缺少 {t}：{texts:?}"))
     };
-    let (day, da_yin, dab) = (pos("day"), pos("打印"), pos("dab"));
+    let (day, da_yin, da_yue, dab) = (pos("day"), pos("打印"), pos("大约"), pos("dab"));
     assert!(
-        day < da_yin,
-        "双拼下英文高分词仍应排在中文中频词之前：{texts:?}"
+        da_yin < day,
+        "双拼下同层内中文仍恒先：打印应在 day 之前：{texts:?}"
     );
     assert!(
-        da_yin < dab,
-        "双拼下中文中频词仍应排在英文长尾词之前：{texts:?}"
+        da_yue < day,
+        "双拼下同层内中文仍恒先：大约应在 day 之前：{texts:?}"
+    );
+    assert!(
+        da_yin < da_yue,
+        "双拼下同语言同层内按分数：打印 在 大约 之前：{texts:?}"
+    );
+    assert!(
+        day < dab,
+        "双拼下同语言同层内按分数：day 在 dab 之前：{texts:?}"
     );
     fs::remove_dir_all(dir).unwrap();
 }
