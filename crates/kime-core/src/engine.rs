@@ -41,6 +41,17 @@ const KEY_RIGHTBRACE: u32 = 27;
 /// 默认每页候选数（config.page_size = 0 时生效）
 const DEFAULT_PAGE_SIZE: usize = 10;
 
+/// 双拼里的**零声母键**（韵母键 `a`/`e`/`i`/`o`/`u`/`v`）。
+///
+/// 这些键单独敲时是「零声母声母位」：自然码 `a`=aa、`o`=oo、`e`=ee，
+/// `i`/`u`/`v` 同时是 ch/sh/zh 的声母键。它们**不是韵母位**——把孤立元音键当
+/// 韵母位展开，会带出 `ba`/`pa`/`ma` 这类**带声母**的音节，用户敲 `a` 想要
+/// 「啊」，首屏却是「把/吧」。辅音键（`p`/`b`/`d`…）的韵母位意图不受影响，
+/// 单键 `p` 仍然出 lun/jun/run 系列。
+fn is_zero_initial_key(key: char) -> bool {
+    matches!(key, 'a' | 'e' | 'i' | 'o' | 'u' | 'v')
+}
+
 /// 英文累积缓冲上限（字符）。英文模式字母键直通应用，长按自动重复逐条进缓冲；
 /// 上限防无界增长。取值远大于任何真实英文词长度，超长串本来也匹配不到词库词。
 const MAX_ENGLISH_BUFFER: usize = 64;
@@ -1163,20 +1174,24 @@ impl Engine {
                     // 直接拿它当拼音前缀去查，等于查 "u" 开头的词，半截状态必出垃圾。
                     let last = self.letters[len - 1..].chars().next();
                     let last = last.unwrap_or(' ');
-                    (
-                        table.to_syllables(&self.letters[..len - 1]),
-                        table.initial_of(last),
-                        // 末键的第二种意图：**韵母位**。同一键在两套码表里身兼
-                        // 声母位与韵母位（自然码 p 作韵母位是 un/ün 系列：小鹤 p
-                        // 是 ie 系列），只按声母前缀查时这批词永远查不到。
-                        //
-                        // 两类意图都查、都给候选，查完按频率统一重排（见下方补全
-                        // 路径）。「乌」(wu) 这类词因此会进候选——它的拼音是完整
-                        // 音节 wu（声母键 w 还没按），与「按字母 u 查」不是同一条
-                        // 路；但 u 是 sh 声母键，按 u 想要的是 sh 系，所以排序时
-                        // sh 系必须在前（既有测试钉住这条）。
-                        table.final_syllables_of(last),
-                    )
+                    let head = table.to_syllables(&self.letters[..len - 1]);
+                    // 末键的第二种意图：**韵母位**。同一键在两套码表里身兼
+                    // 声母位与韵母位（自然码 p 作韵母位是 un/ün 系列：小鹤 p
+                    // 是 ie 系列），只按声母前缀查时这批词永远查不到。
+                    //
+                    // **孤立元音键除外**（`a`/`e`/`i`/`o`/`u`/`v`）：自然码里
+                    // `a`=aa、`o`=oo、`e`=ee，元音键单独敲是**零声母声母位**，
+                    // 不是韵母位。把它当韵母位展开会带出 ba/pa/ma 这类**带声母**
+                    // 的音节——用户敲 `a` 想要「啊」，首屏却是「把/吧」。
+                    // 辅音键的韵母位意图保留（单键 `p` 仍出 lun/jun/run）。
+                    //
+                    // 两类意图都查、都给候选，查完按频率统一重排（见下方补全路径）。
+                    let finals = if len == 1 && is_zero_initial_key(last) {
+                        Vec::new()
+                    } else {
+                        table.final_syllables_of(last)
+                    };
+                    (head, table.initial_of(last), finals)
                 }
             };
             match decoded {
