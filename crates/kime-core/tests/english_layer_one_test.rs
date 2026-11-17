@@ -1,8 +1,9 @@
-//! 英文候选的层序、按键消耗与噪声闸。
+//! 英文候选的层序、语言优先级、按键消耗与噪声闸。
 //!
-//! 排序口径见 `crate::model::RankKey`：层（精确→补全）在分数之前，跨语言竞争发生在
-//! 同层之内；两字母门槛不变。
-//! `ok` / `an` 覆盖中英候选的层序；`skill` 覆盖英文候选在双拼下的按键消耗
+//! 排序口径见 `crate::model::RankKey`：`(层, 语言, 分数, 文本, 来源)`。层最优先，
+//! 同层之内**中文整体先于英文**（用户裁定「保精确分块」），校准分数只在同语言同层内
+//! 决定次序；两字母门槛不变。
+//! `ok` / `an` 覆盖中英文的层序与语言序；`skill` 覆盖英文候选在双拼下的按键消耗
 //!（空格选中必须整词上屏并关闭面板）。
 
 use std::fs;
@@ -140,13 +141,13 @@ fn texts(cands: &[Candidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
 
-/// 排序键是 `(层, 校准分数, 文本, 来源)`：**层在分数之前，跨语言竞争只发生在同层内**。
+/// 排序键是 `(层, 语言, 校准分数, 文本, 来源)`：**层在语言之前，语言在分数之前**。
 ///
 /// 输入 `ok`：中文只有补全（哦可 9M / 哦可哦可 8M，层二）；英文有精确词 OK（层一）
 /// 与补全词 okay（层二）。因此：
 ///
 /// - 英文精确 OK（层一）排在中文补全之前——层一整体在层二之前，与语言无关；
-/// - 英文补全 okay（500k）与中文补全 哦可（9M）同层比分，哦可更高，故在前。
+/// - 英文补全 okay（500k）与中文补全 哦可（9M）同层，但同层内中文恒先，哦可在前。
 #[test]
 fn layer_one_beats_layer_two_across_languages() {
     let (mut e, dir) = engine("ok");
@@ -171,8 +172,8 @@ fn layer_one_beats_layer_two_across_languages() {
 /// 中文层二 安排。
 ///
 /// 期望 `安 按 an 安排`：
-/// - 层一内部按分数：安 > 按 > an（an 在本语言分布里位置很低）；
-/// - 层二整体在层一之后：安排 排在 an 之后——**层序压制分数**，不是「谁分高谁在前」。
+/// - 层一内部：中文 安/按 先按分数序，英文 an 因语言序排在所有中文之后；
+/// - 层二整体在层一之后：安排 排在 an 之后——**层序压制语言与分数**。
 #[test]
 fn layer_order_beats_score_across_languages() {
     let (mut e, dir) = engine("an");
@@ -185,6 +186,43 @@ fn layer_order_beats_score_across_languages() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+/// 同层内**语言优先于分数**：`ui` 的中文精确候选「是」必须排在英文精确词 `UI` 之前。
+///
+/// 用户裁定「保精确分块」的回归。两语言的有效频率来自不同统计空间（中文 10⁵~10⁷，
+/// 英文词表 10³ 量级），各自归一化后**不可跨语言比较**：英文 `UI` 若被提频抬到
+/// 词表最大值，其校准分数是 1×10⁹，而中文低频词「是」只有 2×10⁸ 量级——按分数排
+/// 就会让 `UI` 顶掉「是」，正是用户实测「打 `ui` 出 `UI` 而不是「是」」的形态。
+///
+/// 双拼（自然码）下 `ui` 解码为 `shi`，英文查询用**原始按键串** `ui` 匹配，
+/// 于是两条候选同处层一，只能靠语言序分先后。
+#[test]
+fn same_layer_chinese_beats_english_regardless_of_score() {
+    let dir = tmp_dir("cross_lang");
+    let cn = dir.join("cn.yaml");
+    let en = dir.join("en.yaml");
+    // 中文刻意给低词频、英文给词表最大值：分数上英文恒胜，只剩语言序能决定先后。
+    fs::write(&cn, "是\tshi\t100\n").unwrap();
+    fs::write(&en, "UI\tui\t900000\n").unwrap();
+    let mut dict = Dict::open(dir.join("dict.sqlite3")).unwrap();
+    dict.import(&cn).unwrap();
+    dict.import_english(&en).unwrap();
+    let mut e = Engine::new(
+        dict,
+        Config {
+            shuangpin: Some(Scheme::Ziranma),
+            ..Config::default()
+        },
+    );
+    type_letters(&mut e, "ui");
+    let got = texts(e.candidates());
+    let pos = |t: &str| got.iter().position(|x| *x == t).unwrap();
+    assert!(
+        pos("是") < pos("UI"),
+        "同层内中文恒先，英文词频再高也不能顶掉中文：{got:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// 单字母不查英文（既有噪声闸不变）；两个字母起精确词才进候选。
 #[test]
 fn single_letter_still_skips_english() {
