@@ -20,6 +20,7 @@
 //! 主路延迟（P99 < 20ms）由这里的索引形状保证。
 
 use rusqlite::{params, Connection, Error as SqliteError, OptionalExtension, Result};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -163,6 +164,27 @@ pub struct Dict {
     db_path: PathBuf,
     /// 后台词库写线程句柄（懒 spawn；队满丢 job，键路径零 SQLite 写）。
     writer: LearnWriter,
+    /// 轻量上下文召回：最近 kime 提交过的片段/句子及其读音，LRU + hits，上限 64。
+    context_recall: ContextRecall,
+    /// 当前输入读音（transient）。lookup 前由引擎设置，供 lm_boost 的上下文召回匹配用。
+    /// 单线程所有，无并发顾虑。未设置时召回加成为 0。
+    current_input_reading: RefCell<Option<String>>,
+    /// 离线片段缓存：由 refresh_fragment_cache 填充，供 lm_boost 的片段召回加成用。
+    /// 引擎在 lookup 前按当前读音刷新；未刷新时片段加成为 0。
+    fragment_cache: RefCell<Vec<crate::lm::FragmentCandidate>>,
+    /// 实时 bigram：前词文本 → 后继读音 → 计数。仅 commit_context_sync 写入，
+    /// 绝不被 set_lm_context 清空，与离线 lm_counts 互补。
+    realtime_bigram: HashMap<String, HashMap<String, i64>>,
+    /// 上一次上屏词（实时 bigram 的外键）。`commit_context_sync` 写入本次词，
+    /// `set_lm_context` 按传入的 prev 覆盖；`lm_boost` 用它做「上一词 → 候选」查表。
+    ///
+    /// 没有它，实时 bigram 只能按「候选自己的文本」查——而 bigram 的语义是
+    /// 「上一词的后继里出现过这个读音」，按候选文本查等于永远查不到（历史 bug）。
+    lm_prev_text: Option<String>,
+    /// shell surrounding_text（光标前上文，汉字文本）。仅作召回线索：
+    /// 候选文本出现在这段上文里时给加成，用来恢复「刚打过的词」。
+    /// 与 `context_recall` 分开，因为后者按**读音**匹配，汉字永不命中。
+    context_tail: Option<String>,
 }
 
 /// 打开 rime `.dict.yaml`，交回 `...` 分隔线**之后**的正文行。中文/英文两条导入路径共用。
@@ -359,6 +381,110 @@ pub(crate) fn persist_commit_log(
     Ok(())
 }
 
+/// 上下文加成上限：必须是 tie-breaker / 有限加成，不压过裸频。
+/// USER_BOOST=300_000（首次使用提频），上下文加成取其一半=150_000：
+/// 足以让等频/近频候选中「上下文相关」者排前，但不足以让低频历史词
+/// 无脑压过高频语料词（150k < 300k < 500k 语料词）。
+pub const CONTEXT_BOOST_CAP: i64 = 150_000;
+
+/// 实时 bigram 的单位加成：`count × 该值`，封顶 [`CONTEXT_BOOST_CAP`]。
+///
+/// 取 30_000（= CAP / 5）是为了让**次数**可分辨：count=1 得 30k、
+/// count=5 得满 150k，于是「用了五次的连接」确实排在「用过一次的连接」之前。
+/// 若沿用 `lm::LM_BOOST_UNIT`（300_000），第一条证据就越过封顶，所有非零
+/// 计数并列在 150k —— 计数信息全丢，实时 bigram 退化成「出现过没有」的布尔标记。
+pub const CONTEXT_BIGRAM_UNIT: i64 = 30_000;
+
+/// 上下文召回条目上限：最近 64 条片段，内存占用极小（约数 KB）。
+/// 热路径在 `lm_boost` 内对条目做线性扫描（≤64 次 `&str` 比较，零分配），
+/// 对每键排序的 O(n log n) 比较来说属于常数级开销。
+pub const CONTEXT_RECALL_CAP: usize = 64;
+
+/// 轻量上下文召回条目：一条最近 kime 提交过的片段/句子及其读音。
+/// `hits` 记录被提交/召中的次数，用于给加成加权；被 CONTEXT_BOOST_CAP 封顶。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextEntry {
+    pub text: String,
+    /// 音节 `'` 连接（如 "gao'pin"）。
+    pub reading: String,
+    pub hits: u64,
+}
+
+/// 轻量上下文召回结构：记录最近 kime 提交过的片段/句子及其读音。
+/// 同一文本+读音命中则刷新 hits 并前移；未命中则追加到头部，
+/// 超过上限时丢弃尾部条目（LRU 风格）。
+#[derive(Clone, Debug, Default)]
+pub struct ContextRecall {
+    pub entries: Vec<ContextEntry>,
+}
+
+impl ContextRecall {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// 记录一条已提交的片段/句子。同一文本+读音命中则刷新 hits 并前移；
+    /// 未命中则追加到头部，超过上限时丢弃尾部条目（LRU 风格）。
+    pub fn record(&mut self, text: &str, reading: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.text == text && e.reading == reading)
+        {
+            self.entries[pos].hits += 1;
+            let entry = self.entries.remove(pos);
+            self.entries.insert(0, entry);
+            return;
+        }
+        if self.entries.len() >= CONTEXT_RECALL_CAP {
+            self.entries.pop();
+        }
+        self.entries.insert(
+            0,
+            ContextEntry {
+                text: text.to_string(),
+                reading: reading.to_string(),
+                hits: 1,
+            },
+        );
+    }
+
+    /// 为候选计算上下文召回加成。
+    /// 当前输入读音与条目读音匹配（精确相等或前缀/后缀关系）且条目文本等于
+    /// 候选文本时，给予与 hits 相关的加成，被 CONTEXT_BOOST_CAP 封顶。
+    pub fn boost_for(
+        &self,
+        candidate: &crate::model::Candidate,
+        current_reading: Option<&str>,
+    ) -> i64 {
+        let Some(current) = current_reading else {
+            return 0;
+        };
+        let mut best_hits: u64 = 0;
+        for entry in &self.entries {
+            if entry.text != candidate.text {
+                continue;
+            }
+            // 当前读音与条目读音：精确相等，或互为前缀
+            if entry.reading == current
+                || entry.reading.starts_with(current)
+                || current.starts_with(entry.reading.as_str())
+            {
+                best_hits = best_hits.max(entry.hits);
+            }
+        }
+        if best_hits > 0 {
+            (best_hits as i64 * 50_000).clamp(0, CONTEXT_BOOST_CAP)
+        } else {
+            0
+        }
+    }
+}
 impl Dict {
     /// 只读连接引用：离线挖掘工具与集成测试查 commit_log/bigram 用。
     /// 不暴露 &mut：写路径必须走 Dict 的方法，保证内存索引与库一致。
@@ -438,6 +564,18 @@ impl Dict {
              );
              CREATE INDEX IF NOT EXISTS idx_bigram_prev ON bigram(prev_id);
              CREATE INDEX IF NOT EXISTS idx_bigram_last ON bigram(count, last_seen);
+             -- 离线片段表：由 mine_fragments 挖掘，供在线片段召回加成用。
+             -- UNIQUE(text, reading) 保证同一片段只存一行；count 累积出现次数。
+             CREATE TABLE IF NOT EXISTS lm_fragment (
+               id        INTEGER PRIMARY KEY,
+               text      TEXT    NOT NULL,
+               reading   TEXT    NOT NULL,
+               count     INTEGER NOT NULL DEFAULT 1,
+               last_seen INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(text, reading)
+             );
+             CREATE INDEX IF NOT EXISTS idx_lm_fragment_reading ON lm_fragment(reading);
+             CREATE INDEX IF NOT EXISTS idx_lm_fragment_count ON lm_fragment(count, last_seen);
              ",
         )?;
         // 既有库缺列迁移（世代兼容）：旧 dict.sqlite3 的 commit_log 没有 tail_ctx，
@@ -574,6 +712,12 @@ impl Dict {
             lm_warned: false,
             db_path: path.to_path_buf(),
             writer: LearnWriter::default(),
+            context_recall: ContextRecall::new(),
+            current_input_reading: RefCell::new(None),
+            fragment_cache: RefCell::new(Vec::new()),
+            realtime_bigram: HashMap::new(),
+            lm_prev_text: None,
+            context_tail: None,
         })
     }
 
@@ -620,6 +764,7 @@ impl Dict {
         if raw.is_empty() || limit == 0 {
             return Vec::new();
         }
+        self.refresh_fragment_cache(raw);
         let key = raw.to_ascii_lowercase();
         let start = self
             .english
@@ -1134,18 +1279,17 @@ impl Dict {
         candidates
     }
 
-    /// 精确查询：读音序列 → 候选，freq 降序 LIMIT limit
     pub fn lookup(&self, reading: &[String], limit: usize) -> Result<Vec<Candidate>> {
         if reading.is_empty() {
             return Ok(Vec::new());
         }
+        let joined = reading.join("'");
+        self.refresh_fragment_cache(&joined);
         if let Some(store) = &self.store {
             let base = store.lookup_exact(reading, limit);
-            let joined = reading.join("'");
             let user_candidates = self.overlay_exact(&joined);
             return Ok(self.merge_overlay(base, user_candidates, limit));
         }
-        let joined = reading.join("'");
         let start = self.index.partition_point(|e| e.pinyin < joined);
         let mut candidates = Vec::new();
         for entry in &self.index[start..] {
@@ -1212,6 +1356,7 @@ impl Dict {
         if joined.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        self.refresh_fragment_cache(&joined);
         if let Some(store) = &self.store {
             let user_exact = self.overlay_exact(&joined);
             let mut user_comps = self.overlay_comps(&joined, tail);
@@ -1616,6 +1761,10 @@ impl Dict {
         text: &str,
         tail: Option<&str>,
     ) {
+        // 实时 bigram + 上下文召回（当帧生效，零 SQLite 写）。
+        // 持久化（commit_log）由下方 persist_commit_log 独立完成。
+        self.commit_context_sync(ctx, reading, text);
+
         // 失败不阻塞上屏（输入法优先级），但不能静默：日志是离线挖掘唯一
         // 原材料，连失败会掏空排序质量。一次性告警（lm_warned 哨兵防刷屏
         // ——每键都打印会淹掉终端），且绝不 panic（见 warn_once）。
@@ -1634,6 +1783,113 @@ impl Dict {
             );
         }
     }
+    /// Commit 同步路径：把本次上屏词写入实时 bigram（realtime_bigram）与上下文召回结构，
+    /// 供 lm_boost 当帧生效。持久化（commit_log）由 `log_commit` / `enqueue_log_commit`
+    /// 独立完成，此处只改内存，零 SQLite 写，不阻塞上屏。
+    ///
+    /// 仅中文→中文写入 realtime bigram（英文上下文不污染中文 bigram）；所有 kime 提交
+    /// 都记入上下文召回（中文参与 bigram 加成，英文只做历史片段召回）。
+    pub(crate) fn commit_context_sync(
+        &mut self,
+        prev: Option<(&str, &str)>,
+        reading: &[String],
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let current_reading = reading.join("'");
+
+        // 实时 bigram：prev_word → current_word，仅中文→中文。
+        // realtime_bigram 不被 set_lm_context 清空，与离线 lm_counts 互补。
+        let cur_is_cjk = text.chars().next().is_some_and(Self::is_cjk);
+        if !current_reading.is_empty() && cur_is_cjk {
+            if let Some((prev_text, _)) = prev {
+                if prev_text.chars().next().is_some_and(Self::is_cjk) {
+                    self.realtime_bigram
+                        .entry(prev_text.to_string())
+                        .or_default()
+                        .entry(current_reading.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                }
+            }
+        }
+        // 本次词成为下一次查询的「上一词」。非中文提交不建立中文 bigram 关系，
+        // 但要把外键清掉，否则英文词之后仍会按上上个中文词加成。
+        self.lm_prev_text = if cur_is_cjk {
+            Some(text.to_string())
+        } else {
+            None
+        };
+
+        // 上下文召回：所有 kime 提交都记录（文本 + 读音）。
+        self.context_recall.record(text, &current_reading);
+    }
+
+    /// 设置当前输入读音（transient），供 lm_boost 的上下文召回匹配用。
+    /// 引擎在 lookup 前调用；未设置时召回加成为 0。
+    pub(crate) fn set_current_input_reading(&self, reading: Option<&str>) {
+        *self.current_input_reading.borrow_mut() = reading.map(str::to_string);
+    }
+
+    /// 记录 shell surrounding_text（光标前上文）作为召回线索。
+    ///
+    /// 与 `context_recall` **分开存**：那套条目的读音是拼音，按读音前缀匹配；
+    /// 而 surrounding_text 是汉字文本，与拼音永不匹配。混在一起只会白占 64 条
+    /// LRU 名额、淘汰真正能命中的拼音条目（历史 bug）。
+    pub(crate) fn record_context_tail(&mut self, text: &str) {
+        if text.is_empty() {
+            // 空文本 = 上下文断裂（句首 / 光标位置非法）：必须清掉旧段文本，
+            // 否则 has_context 恒为真，上一段的 surrounding_text 会继续给新句子
+            // 的候选加分（跨段污染，违反「无上下文 = 裸频序」）。
+            self.context_tail = None;
+            return;
+        }
+        if self.context_tail.as_deref() == Some(text) {
+            return;
+        }
+        self.context_tail = Some(text.to_string());
+    }
+
+    /// 清空 surrounding_text 召回线索（上下文断裂时由引擎调用）。
+    pub(crate) fn clear_context_tail(&mut self) {
+        self.context_tail = None;
+    }
+
+    /// 刷新离线片段缓存：按当前输入读音查询 lm_fragment 表，供 `lm_boost` 的片段召回加成用。
+    ///
+    /// 两处省查询：
+    /// - 读音未变 → 直接返回（同一读音内重复按键不查库）；
+    /// - **无上下文** → 清空缓存直接返回。片段加成只在有上下文时才计分
+    ///   （见 `lm_boost` 的 `has_context` 门控），此时查库纯属白跑。
+    pub(crate) fn refresh_fragment_cache(&self, reading: &str) {
+        if !self.has_context() {
+            self.set_current_input_reading(Some(reading));
+            *self.fragment_cache.borrow_mut() = Vec::new();
+            return;
+        }
+        if self.current_input_reading.borrow().as_deref() == Some(reading) {
+            return;
+        }
+        self.set_current_input_reading(Some(reading));
+        *self.fragment_cache.borrow_mut() =
+            crate::lm::query_fragments_by_reading(&self.conn, reading, 16).unwrap_or_default();
+    }
+
+    /// 当前是否存在上下文（上一提交词或 surrounding_text）。
+    ///
+    /// 加成路径的统一门控：`lm_boost` 用它决定要不要计新增三路，
+    /// `refresh_fragment_cache` 用它决定要不要查库。
+    #[inline]
+    fn has_context(&self) -> bool {
+        self.lm_prev_text.is_some() || self.context_tail.is_some()
+    }
+
+    /// 单个字符是否为 CJK（用于判断中文上下文，避免英文污染中文 bigram）。
+    fn is_cjk(c: char) -> bool {
+        matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
+    }
 
     /// 设置 LM 上下文（= 上一次提交词）：装载该词的后继 bigram 计数。
     ///
@@ -1647,8 +1903,13 @@ impl Dict {
         let Some((text, reading)) = prev else {
             self.lm_ctx = None;
             self.lm_counts.clear();
+            // 上下文断裂（外部文本/光标编辑）：实时 bigram 外键也必须清，
+            // 否则下一条候选仍按上上个中文词加成。
+            self.lm_prev_text = None;
             return;
         };
+        // 实时 bigram 的外键 = 本次查询的「上一词」。
+        self.lm_prev_text = Some(text.to_string());
         // 只读解析（#101：键路径零 SQLite 写）：vocab 行还没被后台写线程落盘时
         // miss → 本次跳过 LM 上下文，行落盘后下一次选词自愈。
         let Some(ctx) = vocab_id_readonly(&self.conn, &mut self.vocab_ids, text, reading) else {
@@ -1684,18 +1945,80 @@ impl Dict {
         }
     }
 
-    /// 某 (text, reading) 的 LM 加成：上次提交词的后继计数 × LM_BOOST_UNIT。
+    /// 某候选的上下文加成。
+    ///
+    /// 拆成两段，因为两段的可信度与量级不同：
+    ///
+    /// 1. **离线 bigram**（`lm_counts`，`set_lm_context` 装载）：既有行为，
+    ///    `count × LM_BOOST_UNIT` **不封顶**——这是 main 已发版的排序语义，
+    ///    在候选层是主要信号之一，不能因为新增机制而被压掉。
+    /// 2. **本分支新增的三路**：实时 bigram、上下文召回、离线片段。它们是
+    ///    tie-breaker 性质的补充证据，合计封顶在 `CONTEXT_BOOST_CAP`：
+    ///    足以让等频/近频候选中「上下文相关」者排前，又不足以压过裸频与
+    ///    用户提频（`USER_BOOST = 300_000`）。
+    ///
     /// 加成只落排序比较（[`crate::rank::CtxBoost`]），不碰 `eff`/导出频率。
-    /// 热路径：两次 &str HashMap 查找，零分配。
     pub fn lm_boost(&self, c: &Candidate) -> i64 {
-        if self.lm_counts.is_empty() || c.pinyin.is_empty() {
-            return 0;
+        // 1. 离线 bigram：既有路径，量级由 LM_BOOST_UNIT 决定，不封顶。
+        let mut boost: i64 = 0;
+        if !self.lm_counts.is_empty() && !c.pinyin.is_empty() {
+            boost = boost.saturating_add(
+                self.lm_counts
+                    .get(c.text.as_str())
+                    .and_then(|m| m.get(c.pinyin.as_str()))
+                    .map(|&cnt| cnt.saturating_mul(crate::lm::LM_BOOST_UNIT))
+                    .unwrap_or(0),
+            );
         }
-        self.lm_counts
-            .get(c.text.as_str())
-            .and_then(|m| m.get(c.pinyin.as_str()))
-            .map(|&cnt| cnt * crate::lm::LM_BOOST_UNIT)
-            .unwrap_or(0)
+
+        // 2. 新增三路：合并后封顶，保持 tie-breaker 性质。
+        //
+        // 三路都**只在存在上下文时**才计分（`lm_prev_text` / `context_tail` 有值）。
+        // 没有上下文 = 用户刚开始一句新输入，此时必须退回裸频序——
+        // 否则「历史提交过的高频片段」会无条件压过语料频率，清上下文也不恢复
+        // （`lm_mine_test::lm_context_reorders_candidates` 钉的就是这条）。
+        let has_context = self.has_context();
+        let mut extra: i64 = 0;
+        if has_context {
+            self.push_context_boost(&mut extra, c);
+        }
+        boost.saturating_add(extra.min(CONTEXT_BOOST_CAP))
+    }
+
+    /// 三路上下文加成之和（调用方负责「有上下文」门控与封顶）。
+    fn push_context_boost(&self, extra: &mut i64, c: &Candidate) {
+        // 实时 bigram：上一词（lm_prev_text）→ 本候选读音。
+        // 查表方向必须是「上一词 → 候选」；按候选自己的文本查等于永远命中不了。
+        if let Some(m) = self
+            .lm_prev_text
+            .as_deref()
+            .and_then(|prev| self.realtime_bigram.get(prev))
+        {
+            *extra = extra.saturating_add(
+                m.get(c.pinyin.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_mul(CONTEXT_BIGRAM_UNIT),
+            );
+        }
+        // 上下文召回：历史提交文本与当前输入读音匹配。
+        *extra = extra.saturating_add(
+            self.context_recall
+                .boost_for(c, self.current_input_reading.borrow().as_deref()),
+        );
+        // 离线片段：历史片段读音与当前输入读音匹配。
+        *extra = extra.saturating_add(crate::lm::fragment_boost_for_reading(
+            &self.fragment_cache.borrow(),
+            self.current_input_reading.borrow().as_deref().unwrap_or(""),
+            c,
+        ));
+        // surrounding_text 召回：候选文本出现在光标前上文里 —— 恢复「刚打过的词」。
+        // 与读音类证据不同，这条按**文本**匹配，与 CJK 关键词同现即加分。
+        if let Some(tail) = self.context_tail.as_deref() {
+            if !tail.is_empty() && tail.contains(c.text.as_str()) {
+                *extra = extra.saturating_add(CONTEXT_BIGRAM_UNIT);
+            }
+        }
     }
 }
 

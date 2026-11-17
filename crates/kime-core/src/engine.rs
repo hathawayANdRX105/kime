@@ -329,6 +329,14 @@ impl Engine {
     /// `None` = 光标前无可用上下文。外部文本/光标编辑会终止 kime 提交词链，避免把
     /// 不相邻的输出学成 bigram；kime 自己的 Commit echo 由平台壳过滤，不影响连续输入。
     pub fn set_context(&mut self, tail: Option<String>) {
+        // surrounding_text 只做上下文召回线索，不写入 bigram（#2）；
+        // kime 自己的 Commit 才由 commit_context_sync 写 realtime bigram。
+        // `None` = 上下文断裂：必须同时清掉召回线索，否则上一段文本会继续
+        // 给新句子的候选加分（跨段污染）。
+        match tail.as_deref() {
+            Some(t) => self.dict.record_context_tail(t),
+            None => self.dict.clear_context_tail(),
+        }
         self.context = tail;
         self.last_commit = None;
         self.dict.set_lm_context(None);
@@ -1057,6 +1065,13 @@ impl Engine {
     fn learn_commit_word(&mut self, word: &str, reading: &[String], tail_ctx: Option<&str>) {
         let prev = self.last_commit.take();
         let tail = if prev.is_none() { tail_ctx } else { None };
+        // 实时 bigram + 上下文召回（当帧生效）。仅中文→中文写 bigram，
+        // 英文上下文不污染中文 bigram（#4）。
+        self.dict.commit_context_sync(
+            prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
+            reading,
+            word,
+        );
         self.dict.enqueue_log_commit(
             prev.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
             reading,
@@ -1064,11 +1079,14 @@ impl Engine {
             tail,
         );
         self.last_commit = Some((word.to_string(), reading.join("'")));
-        self.dict.set_lm_context(
-            self.last_commit
-                .as_ref()
-                .map(|(t, r)| (t.as_str(), r.as_str())),
-        );
+        // 仅中文提交设置 LM bigram 上下文，英文只做历史片段召回（#4）。
+        if word.chars().next().is_some_and(is_cjk) {
+            self.dict.set_lm_context(
+                self.last_commit
+                    .as_ref()
+                    .map(|(t, r)| (t.as_str(), r.as_str())),
+            );
+        }
         match self.dict.learn_mem(reading, word) {
             Ok(()) => self.dict.enqueue_learn(reading, word),
             Err(e) => {
