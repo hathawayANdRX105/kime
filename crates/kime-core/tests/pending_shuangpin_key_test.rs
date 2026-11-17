@@ -71,19 +71,18 @@ fn pending_shuangpin_key_queries_its_initial() {
         got.contains(&"是") && got.contains(&"事"),
         "半截键 u 应给出 sh 系的字，实际 {got:?}"
     );
-    // 末键 u 还有第二种意图：它作**韵母位**（自然码 wu = w+u，声母键还没按）。
-    // 这类词现在也会进候选（「乌」拼音是完整音节 wu，与「按字母 u 查」不是同一条
-    // 路），但 u 是 sh 声母键，用户按 u 想要的是 sh 系——sh 系必须排在前面。
+    // `u` 是**元音键**，孤立时只走声母位（sh 系），**不展开韵母位**——否则会带出
+    // bu/pu/mu/wu 这类带声母的音节（自然码 wu = w+u，声母键还没按），用户敲 `u`
+    // 想要的是 sh 系。见 `lone_vowel_key_does_not_expand_final_intent`。
     // （「优」的拼音是裸字母 u，不是合法音节，任何路径都不该带出它。）
-    let shi_pos = got.iter().position(|t| *t == "是");
-    let wu_pos = got.iter().position(|t| *t == "乌");
+    assert!(
+        !got.contains(&"乌"),
+        "孤立元音键 u 不展开韵母位，不该带出 wu 系的「乌」，实际 {got:?}"
+    );
     assert!(
         !got.contains(&"优"),
         "拼音是裸字母 u 的词不该进候选，实际 {got:?}"
     );
-    if let (Some(shi), Some(wu)) = (shi_pos, wu_pos) {
-        assert!(shi < wu, "sh 系词应排在韵母位意图的词之前，实际 {got:?}");
-    }
     // preedit 要显示用户正在拼的声母，而不是裸键
     assert_eq!(e.preedit(), "sh", "preedit 应展开成 sh");
 }
@@ -197,34 +196,35 @@ fn lone_consonant_key_keeps_final_intent() {
 /// 两个意图的**相对次序**：声母位意图整体在韵母位意图之前。
 ///
 /// 回归的契约矛盾：`merge_half_key_intents` 旧实现把两批压平后按分数统一排，
-/// 从未保证过「声母位优先」——`pending_shuangpin_key_queries_its_initial` 里
-/// `是 < 乌` 只是因为 fixture 中 是(9000) 恰比 乌(7000) 频高。
+/// 从未保证过「声母位优先」。
 ///
-/// 这里把两个意图的频率**反过来**（韵母位的 `乌` 更高），顺序仍须由意图决定：
-/// 声母位意图的词全部排在韵母位意图之前。
+/// 用辅音键 `p` 才有两种意图可测（`u` 是元音键，#137 起不展开韵母位）：
+/// 声母位 = p 系（`initial_of('p')` = "p"），韵母位 = un/ün 系（`final_syllables_of('p')`）。
+/// 把频率**反过来**（韵母位的 `论` 9,000,000 vs 声母位的 `派` 1,000），顺序仍须
+/// 由意图决定：声母位意图的词全部排在韵母位意图之前。
 #[test]
 fn initial_intent_sorts_before_final_intent_regardless_of_score() {
     let db = tmp_db("intent_order");
     let mut e = engine_with(
         &db,
         &[
-            ("shi", "事", 1_000),    // 声母位：sh 系（低频率）
-            ("wu", "乌", 9_000_000), // 韵母位：*u 系（高频率）
-            ("bu", "不", 8_000_000),
+            ("pai", "派", 1_000),     // 声母位：p 系（低频率）
+            ("lun", "论", 9_000_000), // 韵母位：un 系（高频率）
+            ("jun", "军", 8_000_000),
         ],
     );
-    type_str(&mut e, "u");
+    type_str(&mut e, "p");
     let got: Vec<&str> = e.candidates().iter().map(|c| c.text.as_str()).collect();
-    let shi = got
+    let pai = got
         .iter()
-        .position(|t| *t == "事")
-        .expect("声母位词「事」应在列");
-    let wu = got
+        .position(|t| *t == "派")
+        .expect("声母位词「派」应在列");
+    let lun = got
         .iter()
-        .position(|t| *t == "乌")
-        .expect("韵母位词「乌」应在列");
+        .position(|t| *t == "论")
+        .expect("韵母位词「论」应在列");
     assert!(
-        shi < wu,
+        pai < lun,
         "声母位意图必须整体在韵母位之前，即使韵母位词频高得多：{got:?}"
     );
 }
