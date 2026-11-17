@@ -24,7 +24,8 @@ pub struct ProbeReport {
 impl ProbeReport {
     /// 从 [`ProbeResult`] 构造报告，附加 rules-only 建议。
     pub fn from_result(result: &ProbeResult) -> Self {
-        let mut suggestions = rules_only_suggestions(&result.summary, &result.per_lang);
+        let mut suggestions =
+            rules_only_suggestions(&result.summary, &result.per_lang, &result.per_sentence);
         // LLM 可选：端点已配置且编译了 `llm` feature 时追加；未配置/失败静默降级。
         let summary_json =
             serde_json::to_string(&(&result.summary, &result.per_lang, result.total_sentences))
@@ -71,7 +72,11 @@ pub fn render_markdown(result: &ProbeResult) -> String {
 
 /// 规则兜底建议：基于 summary/per_lang 生成中英文建议。
 /// 缺省启用，LLM 失败/未配置时仅保留此部分，不报错、不阻断。
-fn rules_only_suggestions(summary: &Summary, per_lang: &PerLang) -> Vec<String> {
+fn rules_only_suggestions(
+    summary: &Summary,
+    per_lang: &PerLang,
+    per_sentence: &[SentenceMetric],
+) -> Vec<String> {
     let mut suggestions: Vec<String> = Vec::new();
 
     if summary.target_hit_rate < 0.8 {
@@ -111,8 +116,17 @@ fn rules_only_suggestions(summary: &Summary, per_lang: &PerLang) -> Vec<String> 
         ));
     }
 
-    // per-lang 兜底
+    // per-lang 兜底：**只对该语种真的有语料时**才建议。
+    // 纯中文语料会让 en 桶全零，旧实现据此输出「en: target_hit_rate 0.00 低于 0.80」，
+    // 把「没测过」说成「测得差」——建议必须区分「零样本」与「低命中」。
     for (lang, s) in [("zh", &per_lang.zh), ("en", &per_lang.en)] {
+        let samples = per_sentence
+            .iter()
+            .filter(|m| m.lang.as_str() == lang)
+            .count();
+        if samples == 0 {
+            continue;
+        }
         if s.target_hit_rate < 0.8 {
             suggestions.push(format!(
                 "{lang}: target_hit_rate {:.2} 低于 0.80，建议专项补强该语种语料。",
@@ -329,5 +343,19 @@ mod tests {
             .suggestions
             .iter()
             .any(|s| s.contains("target_hit_rate")));
+    }
+
+    /// 零样本语种不得产生「命中率过低」建议：没测过 ≠ 测得差。
+    ///
+    /// `sample_result` 只有一条 zh 语料，en 桶全零。旧实现会输出
+    /// 「en: target_hit_rate 0.00 低于 0.80」，把缺语料说成命中率低。
+    #[test]
+    fn zero_sample_language_gets_no_suggestion() {
+        let report = ProbeReport::from_result(&sample_result());
+        assert!(
+            !report.suggestions.iter().any(|s| s.starts_with("en:")),
+            "en 桶零样本时不应给 en 建议：{:?}",
+            report.suggestions
+        );
     }
 }
