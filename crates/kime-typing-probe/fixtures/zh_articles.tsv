@@ -1,22 +1,40 @@
-# zh_articles.tsv — 中文敲字评测语料（freq\ttext\tpinyin）
-# 供 kime-typing-probe 离线回放使用，CI 无网络也可直接读取。
+# zh_articles.tsv — 中文敲字评测语料（freq	text	pinyin）
+#
+# 每条一个词，按文章顺序排列；`# article: <标题>` 开启一篇文章，
+# 其后的条目 id 变成 `<标题>#<行号>`，报告里靠 id 前缀区分文章。
+#
+# 为什么每条是一个词而不是整句：指标（top1_hit / first_screen_hit）是按词定义的——
+# 「候选里有没有这个词、排第几」只有在目标是词时才有意义。整句目标永远不可能出现在
+# 候选首位，会把 top1_hit_rate 恒压成 0。
+#
+# pinyin 里用 `'` 分隔音节，空白是显式上屏边界（回放时展开成 Space 事件）。
+# 因此 `wo'men jin'tian` = 打完「我们」按空格上屏，再打「今天」。
+#
+# 运行：
+#   kime --dict <库> --import <dict.yaml>          # 先准备词库
+#   kime probe crates/kime-typing-probe/fixtures/zh_articles.tsv --dict <库> --mode ziranma
+#
+# 加用例：追加一行即可。断言/语料必须来自既有契约，不要写「当前行为」，
+# 否则语料会把 bug 钉成规范。
+
+# article: 日常问候
 1	我们	wo'men
 2	你好	ni'hao
-3	北京	bei'jing
-4	今天	jin'tian
-5	天气	tian'qi
-6	真的	zhen'de
-7	不错	bu'cuo
-8	我	wo
-9	在	zai
-10	说	shuo
-11	在说	zai'shuo
-12	中国	zhong'guo
-13	人	ren
-14	喜欢	xi'huan
-15	吃饭	chi'fan
-16	去	qu
-17	学校	xue'xiao
-18	学生	xue'sheng
-19	老师	lao'shi
-20	书	shu
+3	今天	jin'tian
+4	天气	tian'qi
+5	真的	zhen'de
+6	不错	bu'cuo
+7	我	wo
+8	在	zai
+9	说	shuo
+10	中国	zhong'guo
+11	人	ren
+12	喜欢	xi'huan
+
+# article: 校园
+1	学校	xue'xiao
+2	学生	xue'sheng
+3	老师	lao'shi
+4	吃饭	chi'fan
+5	去	qu
+6	书	shu

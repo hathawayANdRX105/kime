@@ -56,17 +56,17 @@ pub struct KeySample {
 }
 
 /// 一次会话的完整回放轨迹：句级 key samples 与汇总计数。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct SessionTrace {
-    /// 句子文本（目标）
+    /// 目标文本
     pub text: String,
-    /// 句子读音（拼音，中文；英文为空）
+    /// 读音（拼音，中文；英文为空）
     pub pinyin: String,
     /// 语言桶：zh / en
     pub lang: Lang,
     /// 逐键采样
     pub samples: Vec<KeySample>,
-    /// 该句实际上屏序列（Commit 拼接）
+    /// 实际上屏序列（Commit 拼接）
     pub committed: String,
     /// 每键耗时集合（毫秒）
     pub latencies_ms: Vec<f64>,
@@ -162,6 +162,9 @@ fn to_key(event: &KeyEvent) -> Key {
     }
 }
 
+/// `reset_input` 的 Esc 上限：足够清掉任何组合缓冲，又不会在引擎异常时死循环。
+const MAX_RESET_KEYS: usize = 16;
+
 /// Runner：按键回放器。持有一个 Engine 与累积的 SessionTrace。
 pub struct Runner {
     engine: Engine,
@@ -178,39 +181,74 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// 构造 runner：用已存在的 sqlite dict 路径 + 单条语料。
+    /// 构造 runner：用已存在的 sqlite dict 路径 + **调用方给的配置**，引擎可跨条目复用。
     ///
-    /// 默认配置（关闭纠错/双拼）：`Config { shuangpin: None, correction: false,
-    /// ..Default::default() }`，`dict_path` 指向 tempfile 或已有 sqlite 库，不依赖
-    /// 用户 ~/.config/kime。
-    pub fn new(dict_path: &Path, entry: &CorpusEntry) -> anyhow::Result<Self> {
+    /// 引擎必须复用才能让上下文参与：kime 的实时上下文排序（`lm_prev_text` /
+    /// `context_tail` / bigram）是**跨条目累积**的，每条语料新建引擎等于每次从零开始，
+    /// 上下文加成永远为空，测不出「前一个词影响下一个词」的体验差异。
+    ///
+    /// 配置由调用方给而不是写死：用户日常用双拼（Ziranma），把 `shuangpin` 写死成
+    /// `None` 会让 `ui` 这类双拼键串解成别的音节，测的就不是用户实际敲的键。
+    pub fn with_config(
+        dict_path: &Path,
+        config: kime_core::config::Config,
+    ) -> anyhow::Result<Self> {
         let dict = Dict::open(dict_path).map_err(|e| anyhow::anyhow!("dict open: {e}"))?;
-        let config = kime_core::config::Config {
-            shuangpin: None,
-            correction: false,
-            ..Default::default()
-        };
         let engine = Engine::new(dict, config);
-        let lang = Lang::of_entry(entry);
         Ok(Self {
             engine,
-            lang,
-            target_text: entry.text.clone(),
-            trace: SessionTrace {
-                text: entry.text.clone(),
-                pinyin: entry.pinyin.clone(),
-                lang,
-                samples: Vec::new(),
-                committed: String::new(),
-                latencies_ms: Vec::new(),
-                page_turns: 0,
-                reselections: 0,
-            },
+            lang: Lang::Zh,
+            target_text: String::new(),
+            trace: SessionTrace::default(),
             committed_parts: Vec::new(),
             reselect_count: 0,
             page_turns: 0,
             last_page_index: 0,
         })
+    }
+
+    /// 单条语料的便捷构造：默认配置（关闭纠错/双拼）+ 立刻指向该条目。
+    ///
+    /// 单条测试用这个就够了；需要双拼或跨条目连续回放时用
+    /// [`Runner::with_config`] + [`Runner::begin`]。
+    pub fn new(dict_path: &Path, entry: &CorpusEntry) -> anyhow::Result<Self> {
+        let config = kime_core::config::Config {
+            shuangpin: None,
+            correction: false,
+            ..Default::default()
+        };
+        let mut runner = Self::with_config(dict_path, config)?;
+        runner.begin(entry);
+        Ok(runner)
+    }
+
+    /// 指向新的目标条目，重置句级采样；**引擎状态保留**（上下文/学习跨条目累积）。
+    pub fn begin(&mut self, entry: &CorpusEntry) {
+        self.lang = Lang::of_entry(entry);
+        self.target_text = entry.text.clone();
+        self.trace = SessionTrace {
+            text: entry.text.clone(),
+            pinyin: entry.pinyin.clone(),
+            lang: self.lang,
+            ..SessionTrace::default()
+        };
+        self.committed_parts.clear();
+        self.reselect_count = 0;
+        self.page_turns = 0;
+        self.last_page_index = self.engine.page().0;
+    }
+
+    /// 清空组合缓冲：连续 Esc 直到 preedit 与候选都空。
+    ///
+    /// 在 [`Runner::begin`] **之前**调用，条目之间隔离彼此的残留组合，同时不污染
+    /// 下一条的逐键采样（Esc 不计入它的 `samples`）。引擎的学习与上下文不受影响。
+    pub fn reset_input(&mut self) {
+        for _ in 0..MAX_RESET_KEYS {
+            if self.engine.preedit().is_empty() && self.engine.candidates().is_empty() {
+                return;
+            }
+            self.engine.key(to_key(&KeyEvent::Esc));
+        }
     }
 
     /// 逐键回放 `events`，返回 `SessionTrace`（采样后可交给 `metrics` 汇总）。

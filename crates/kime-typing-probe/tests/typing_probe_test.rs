@@ -530,7 +530,8 @@ fn run_replays_corpus_end_to_end() {
     let corpus_path = tmp.path().join("zh_articles.tsv");
     std::fs::write(&corpus_path, "1\t我们\two'men\n").expect("write corpus");
 
-    let result = kime_typing_probe::run(&corpus_path, &db_path).expect("run probe");
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
 
     assert_eq!(result.total_sentences, 1);
     let sentence = &result.per_sentence[0];
@@ -550,4 +551,95 @@ fn run_replays_corpus_end_to_end() {
     assert!(md.contains("## Summary"));
     let json = result.to_json();
     assert!(json.contains("target_hit_rate"));
+}
+
+/// 语料里的 `# article: <标题>` 把条目 id 变成 `<标题>#<行号>`，报告里能区分文章。
+#[test]
+fn article_directive_groups_entries() {
+    let content = "# article: 日常\n1\t我们\two'men\n# article: 校园\n1\t学校\txue'xiao\n";
+    let corpus = kime_typing_probe::corpus::corpus_from_tsv(content);
+    assert_eq!(corpus.len(), 2);
+    assert_eq!(corpus.entries[0].id, "日常#2");
+    assert_eq!(corpus.entries[1].id, "校园#4");
+}
+
+/// 仓库自带的 fixture 必须能被同一份解析器读出来（防止手改 fixture 时改坏格式）。
+#[test]
+fn shipped_fixtures_parse() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let zh = kime_typing_probe::corpus::Corpus::load_tsv(&dir.join("zh_articles.tsv"))
+        .expect("zh fixture must parse");
+    let en = kime_typing_probe::corpus::Corpus::load_tsv(&dir.join("en_articles.tsv"))
+        .expect("en fixture must parse");
+    assert!(!zh.is_empty(), "中文 fixture 不应为空");
+    assert!(!en.is_empty(), "英文 fixture 不应为空");
+    // lang 判据是「读音是否为空」，与文件名无关。
+    assert_eq!(zh.zh_entries().len(), zh.len());
+    assert_eq!(en.en_entries().len(), en.len());
+}
+
+/// 配置透传：`shuangpin: Some(Ziranma)` 下 `ui` 必须解码成 `shi`（中文精确命中「是」）。
+///
+/// 这条钉住「probe 能跑用户的实际方案」：写死 `shuangpin: None` 时 `ui` 会按全拼
+/// 解成 `u`+`i`，候选里根本没有「是」。
+#[test]
+fn config_controls_shuangpin_decoding() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t是\tshi\n").expect("write corpus");
+
+    let mut config = kime_core::config::Config::default();
+    config.shuangpin = Some(kime_core::Scheme::Ziranma);
+    let result = kime_typing_probe::run(&corpus_path, &db_path, config).expect("run probe");
+
+    let sentence = &result.per_sentence[0];
+    assert!(
+        sentence.target_hit,
+        "双拼下 shi 应上屏「是」：{:?}",
+        sentence.candidates_sample
+    );
+}
+
+/// 全拼配置下同一份语料解不出「是」——证明上面那条的差异真的来自配置透传。
+#[test]
+fn full_pinyin_config_decodes_differently() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t是\tshi\n").expect("write corpus");
+
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
+    let sentence = &result.per_sentence[0];
+    assert!(
+        !sentence.target_hit,
+        "全拼下 `shi` 是 s+h+i 三个键，不应等于「是」：{:?}",
+        sentence.candidates_sample
+    );
+}
+
+/// 整份语料共用一个引擎：连续回放时每条都能上屏目标，没有因为残留组合而错位。
+///
+/// 每条新建引擎会让上下文加成恒为零（probe 就测不出「前一个词影响下一个词」），
+/// 所以这里用「两条语料连续回放」钉住引擎复用这条路径真的能跑通。
+#[test]
+fn engine_is_shared_across_entries() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let db_path = build_test_dict(&tmp);
+    let corpus_path = tmp.path().join("zh_articles.tsv");
+    std::fs::write(&corpus_path, "1\t我们\two'men\n2\t我\two\n").expect("write corpus");
+
+    let result =
+        kime_typing_probe::run(&corpus_path, &db_path, Default::default()).expect("run probe");
+    assert_eq!(result.total_sentences, 2);
+    assert!(
+        result.per_sentence.iter().all(|s| s.target_hit),
+        "连续回放应每条都上屏目标：{:?}",
+        result
+            .per_sentence
+            .iter()
+            .map(|s| (s.text.as_str(), s.target_hit, s.keys))
+            .collect::<Vec<_>>()
+    );
 }

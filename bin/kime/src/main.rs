@@ -7,6 +7,8 @@
 //!   kime english [--dict <path>] <字母串>...
 //!   kime debug [--scenario <commit-backspace|shift-mode|punct-idle-backspace>] [键 token ...]
 //!   kime mine-lm [--dict <path>] [--jev] [--jev-endpoint <url>] [--jev-key <key>]
+//!   kime typing <文本文件> [--dict <path>] [--out <报告.md>] [--limit N] [--json] [--mode full|ziranma|xiaohe]
+//!   kime probe <corpus.tsv> [--dict <path>] [--out <报告.md>] [--json] [--mode full|ziranma|xiaohe]
 //!   kime --dict <path> [--import <yaml>]... [--import-english <yaml>]... [--shuangpin <scheme>]
 //!   kime repl
 //!
@@ -753,6 +755,10 @@ fn legacy_main(argv: &[String]) -> ExitCode {
             let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
             return handle_typing_cmd(&sub_args);
         }
+        Some("probe") => {
+            let sub_args: Vec<String> = args_iter.map(|s| s.to_string()).collect();
+            return handle_probe_cmd(&sub_args);
+        }
         Some("mine-lm") => {
             let mut dict_path: Option<PathBuf> = None;
             let mut jev_enabled = false;
@@ -1110,6 +1116,82 @@ fn handle_typing_cmd(args: &[String]) -> ExitCode {
                         failures += 1;
                     }
                 }
+            }
+        }
+    }
+    if failures > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `kime probe <语料.tsv>` —— 敲字体验评测：一个引擎连续回放整份语料，出可对照的报告。
+///
+///   kime probe <corpus.tsv> [--dict <库>] [--out <报告.md>] [--json]
+///               [--mode full|ziranma|xiaohe]
+///
+/// 与 `kime typing` 的区别：`typing` 吃**自由文本**，用词典分词切词、每次提交首候选；
+/// `probe` 吃 **TSV 语料**（`freq\ttext\tpinyin`，`# article: <标题>` 分组），逐条按
+/// 给定读音回放，产出命中率/首屏率/翻页/回删/延迟分位，并可附 LLM 建议。两者都只用一个
+/// 引擎，上下文跨条目累积——这正是「打一整段话」与「打单个词」的差别所在。
+fn handle_probe_cmd(args: &[String]) -> ExitCode {
+    let mut dict_path: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut json = false;
+    // `None` = 全拼（语料里的键是拼音字母）；`Some(scheme)` = 双拼。
+    let mut mode: Option<kime_core::Scheme> = None;
+    let mut inputs: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dict" => dict_path = it.next().map(PathBuf::from),
+            "--out" => out = it.next().map(PathBuf::from),
+            "--json" => json = true,
+            "--mode" => match it.next().map(|m| m.to_ascii_lowercase()).as_deref() {
+                Some("full") | None => mode = None,
+                Some("ziranma") => mode = Some(kime_core::Scheme::Ziranma),
+                Some("xiaohe") => mode = Some(kime_core::Scheme::Xiaohe),
+                Some(other) => {
+                    eprintln!("--mode 只支持 full | ziranma | xiaohe（收到 {other:?}）");
+                    return ExitCode::from(2);
+                }
+            },
+            other => inputs.push(other.to_string()),
+        }
+    }
+    if inputs.is_empty() {
+        eprintln!("no corpus: kime probe <corpus.tsv> [--dict <库>] [--out <报告.md>] [--json]");
+        return ExitCode::from(2);
+    }
+    let path = dict_path.unwrap_or_else(default_dict_path);
+    let mut failures = 0usize;
+    for file in &inputs {
+        // 与 typing 同理：语料里的键是拼音字母，默认按全拼回放，不继承用户配置里的
+        // 双拼（同一份语料在双拼机器上会被解码成别的音节）。
+        let mut config = Config::load();
+        config.shuangpin = mode;
+        match kime_typing_probe::run(Path::new(file), &path, config) {
+            Ok(result) => {
+                let body = if json {
+                    result.to_json()
+                } else {
+                    result.to_markdown()
+                };
+                print!("{body}");
+                if let Some(p) = &out {
+                    match std::fs::write(p, body) {
+                        Ok(()) => println!("报告已写入 {}", p.display()),
+                        Err(e) => {
+                            eprintln!("failed to write {}: {e}", p.display());
+                            failures += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("probe {file} failed: {e}");
+                failures += 1;
             }
         }
     }

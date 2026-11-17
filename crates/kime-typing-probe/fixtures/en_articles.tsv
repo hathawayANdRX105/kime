@@ -1,5 +1,10 @@
-# en_articles.tsv — 英文敲字评测语料（freq\ttext\tpinyin）
-# 英文行的 pinyin 列留空，lang 由文件名前缀 en_ 承担。
+# en_articles.tsv — 英文敲字评测语料（freq	text	pinyin）
+#
+# 英文行的 pinyin 列留空，lang 由「读音为空」承担（见 corpus::CorpusEntry::is_zh）。
+# 格式与分组规则同 zh_articles.tsv：每条一个词，`# article: <标题>` 分组，
+# 空白是显式上屏边界。
+
+# article: greetings
 1	hello
 2	world
 3	good
@@ -10,13 +15,13 @@
 8	please
 9	thank
 10	you
-11	happy
-12	day
-13	time
-14	work
-15	home
-16	good
-17	morning
-18	night
-19	sleep
-20	eat
+
+# article: daily
+1	happy
+2	day
+3	time
+4	work
+5	home
+6	night
+7	sleep
+8	eat
