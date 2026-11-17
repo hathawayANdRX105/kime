@@ -201,8 +201,9 @@ fn same_layer_chinese_beats_english_regardless_of_score() {
     let cn = dir.join("cn.yaml");
     let en = dir.join("en.yaml");
     // 中文刻意给低词频、英文给词表最大值：分数上英文恒胜，只剩语言序能决定先后。
-    fs::write(&cn, "是\tshi\t100\n").unwrap();
-    fs::write(&en, "UI\tui\t900000\n").unwrap();
+    // YAML 文档头 `...` 与其余 fixture 保持一致（缺头会让 Rime 解析器整份丢弃）。
+    fs::write(&cn, "...\n是\tshi\t100\n").unwrap();
+    fs::write(&en, "...\nUI\tui\t900000\n").unwrap();
     let mut dict = Dict::open(dir.join("dict.sqlite3")).unwrap();
     dict.import(&cn).unwrap();
     dict.import_english(&en).unwrap();
