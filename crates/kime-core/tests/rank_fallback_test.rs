@@ -14,6 +14,9 @@ use std::path::PathBuf;
 // dab 是长尾。输入 `da` 时两语言都落在补全层（中文 `da'yin` / 英文 `day` 的前缀），
 // 于是同层内中文恒先：打印 > 大约（分数）> day > dab（语言序把英文整段推到中文之后）。
 // 这正是「提频后的英文词不得压过中文词」那条修复的回归。
+const CN: &str =
+    "...\n你\tni\t9000000\n泥\tni\t8000000\n打印\tda yin\t500000\n大约\tda yue\t400000\n";
+const EN: &str = "...\nday\tday\t500\ndab\tdab\t1\nhelp\thelp\t400\n";
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
